@@ -1,0 +1,50 @@
+# Primary hull: a generic 124 m frigate.
+#
+# Units: length_m / draft_m / beam_m metres, tn_s seconds (undamped natural period; the
+# physics uses wn = 2*pi/tn_s rad/s), zeta and gain dimensionless.
+#
+# These values mirror the `frigate` fixture in tests/conftest.py exactly. If one changes,
+# both change: Gate 1 is measured against the fixture and the corpus is generated from
+# this file.
+#
+# roll.zeta = 0.06, not 0.08. At 0.08 the SS5 beam-seas roll response spectrum is bimodal
+# -- the resonance peak at 0.541 rad/s stands only 9 % above a wave-driven peak at
+# 0.622 rad/s, because SS5 has wp = 0.648 rad/s well above wn_roll = 0.524 -- so the
+# spectral argmax flips between the two under estimator noise. Gate 1 criterion 6 asserts
+# that beam-seas roll is resonance-dominated, and at 0.08 this hull is not. At 0.06 the
+# resonance peak stands 69 % above the secondary one. 0.06 is mid-band for an unstabilised
+# frigate (plan range 0.05-0.12).
+#
+# gain = 1.0 on every DOF: no amplitude calibration was needed. With the wave-slope
+# excitation and the exp(-(k*L/(4*pi))^2) length rolloff, unit gain already puts SS5
+# beam-seas roll at ~3.5 deg RMS, inside the published 2-4 deg range for a frigate.
+
+name: frigate
+
+length_m: 124.0
+draft_m: 4.6
+beam_m: 14.0
+
+roll:
+  tn_s: 12.0
+  zeta: 0.06
+  gain: 1.0
+
+pitch:
+  tn_s: 7.0
+  zeta: 0.40
+  gain: 1.0
+
+heave:
+  tn_s: 8.5
+  zeta: 0.35
+  gain: 1.0
+
+# Dimensionless floors on the roll and pitch heading factors,
+# sqrt(sin(beta)^2 + eps^2) and sqrt(cos(beta)^2 + eps^2). Without them roll is
+# identically zero in head/following seas and pitch is identically zero in beam seas, so
+# those channels would be dead and their skill score against persistence would be 0/0.
+# They stand in for hull asymmetry and short-crested residual excitation. At 0.05 the
+# off-axis heading sits 26 dB below the on-axis one.
+roll_residual: 0.05
+pitch_residual: 0.05

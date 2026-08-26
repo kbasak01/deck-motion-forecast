@@ -1,0 +1,69 @@
+# Held-out hull: the ITTC S-175 containership.
+#
+# This is the `unseen_vessel` transfer-test hull. It must be a genuinely different ship,
+# not a relabelled frigate: it is 41 % longer, draws more than twice as much water, and
+# has a roll mode 2.5 s slower. The practical consequences in this model are that the
+# exp(-k*draft) Smith factor cuts heave excitation far harder, the
+# exp(-(k*L/(4*pi))^2) length rolloff cuts everything above w ~ 0.9 rad/s, and the roll
+# resonance at 0.433 rad/s sits below the SS3-SS5 spectral peaks, so this hull rolls
+# hardest in SS6 (4.8 deg RMS beam seas) and comparatively little in SS5 (1.3 deg) --
+# the opposite ordering to the frigate.
+#
+# Units: length_m / draft_m / beam_m metres, tn_s seconds, zeta and gain dimensionless.
+#
+# Sources and reasoning for each number:
+#
+#   length_m, beam_m, draft_m -- the published ITTC S-175 particulars used as the standard
+#   comparative seakeeping benchmark hull: Lpp = 175.0 m, B = 25.4 m, design draft
+#   T = 9.5 m, Cb = 0.572, displacement ~24,700 t.
+#
+#   roll.tn_s -- not tabulated with the hull form, because it depends on the loading
+#   condition. Derived from the standard roll-period relation
+#       T_roll = 2*pi*k_xx / sqrt(g*GM)
+#   with the usual containership roll radius of gyration k_xx = 0.35*B = 8.89 m and
+#   GM = 1.5 m, a representative laden metacentric height for this hull. That gives
+#   14.6 s; rounded to 14.5 s.
+#
+#   pitch.tn_s, heave.tn_s -- heave and pitch natural periods scale roughly as sqrt(L).
+#   Scaling the frigate's 7.0 s and 8.5 s by sqrt(175/124) = 1.188 gives 8.3 s and 10.1 s.
+#   Cross-checked against the wave period whose length matches the hull,
+#   T = sqrt(2*pi*L/g) = 10.6 s at lambda = L, which is where a ship of this size shows
+#   peak heave and pitch. Set to 8.5 s and 9.5 s.
+#
+#   zeta -- a containership with bilge keels but no active fins is lightly damped in roll;
+#   0.05 is the low end of the plan's 0.05-0.12 band and is what keeps the beam-seas roll
+#   spectrum resonance-dominated at SS5 rather than bimodal. Pitch and heave damping are
+#   taken slightly below the frigate's, consistent with a fuller, slower hull.
+#
+#   gain -- 1.0 throughout, as for the frigate. No amplitude calibration was applied to
+#   either hull; the amplitude differences between them come entirely from geometry
+#   (draft in the Smith factor, length in the rolloff) and from the modal parameters.
+#
+# Caveat for the README limitations: only the three modal parameter sets and the two
+# lengths differ between hulls. This is a reduced-order stand-in for a different ship, not
+# a strip-theory computation of the S-175's actual RAOs, so `unseen_vessel` measures
+# transfer across a parameter shift rather than across a genuinely different hull form.
+
+name: s175
+
+length_m: 175.0
+draft_m: 9.5
+beam_m: 25.4
+
+roll:
+  tn_s: 14.5
+  zeta: 0.05
+  gain: 1.0
+
+pitch:
+  tn_s: 8.5
+  zeta: 0.35
+  gain: 1.0
+
+heave:
+  tn_s: 9.5
+  zeta: 0.30
+  gain: 1.0
+
+roll_residual: 0.05
+pitch_residual: 0.05
