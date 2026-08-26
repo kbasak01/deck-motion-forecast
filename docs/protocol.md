@@ -226,3 +226,248 @@ curve.
 - **The worker pool uses the `spawn` start method**, not `fork`: forking a process that has already
   imported a threaded BLAS is a known source of intermittent hangs. `spawn` requires an importable
   `__main__`, so `generate_corpus` must be called from a script or a test, never from `python -`.
+
+---
+
+## Phase 2 — windowing, splits, normalization
+
+### Gate 2 thresholds
+
+**No Gate 2 threshold was changed.** All five criteria are asserted at the values stated in
+`docs/IMPLEMENTATION_PLAN.md` §Phase 2, in `tests/test_splits.py` and `tests/test_windows.py`,
+against both a generated small-corpus fixture and (marked `slow`) the real 2304-realization
+corpus.
+
+### The four regimes, with measured realization counts
+
+Built by `dmf.data.splits.build_split` from `artifacts/corpus/manifest.parquet`
+(2304 rows: frigate 1920, s175 384), at the default `val_frac = 0.15`:
+
+| Regime | Train | Val | Test | Total | Held-out axis |
+|---|---|---|---|---|---|
+| `id` | 1296 (seeds 0-26) | 240 (seeds 27-31) | 384 (seeds 32-39) | 1920 | seed ordinal |
+| `unseen_seastate` | 1224 (seeds 0-33) | 216 (seeds 34-39) | 480 (all seeds) | 1920 | `ss == SS6` |
+| `unseen_heading` | 1224 (seeds 0-33) | 216 (seeds 34-39) | 480 (all seeds) | 1920 | `heading == 90 deg` |
+| `unseen_vessel` | 1632 (seeds 0-33) | 288 (seeds 34-39) | 384 (all 8 seeds) | 2304 | `vessel == s175` |
+
+Every regime except `unseen_vessel` is confined to the frigate; `s175` is never trained on in
+any regime, which `tests/test_splits.py::test_no_regime_ever_trains_on_the_heldout_vessel`
+asserts across all four. The three generalization regimes train on **all** seeds of the cells
+they retain, minus validation: holding out a whole axis is what makes the regime hard, so the
+seed ordinal is irrelevant there.
+
+The counts above are asserted as literals in
+`tests/test_splits.py::test_real_corpus_regime_counts_and_disjointness` (marked `slow`), so
+the table cannot rot silently.
+
+### P2-D1 — The `id` test cut is a fraction of the seed ordinals, not the literal seed 32
+
+`docs/IMPLEMENTATION_PLAN.md` §2.2 states the `id` cut as "seeds 0-31 train, 32-39 test".
+It is implemented as `TEST_SEED_FRAC = 0.2` of the **distinct seed ordinals present**, taken
+from the top of the range.
+
+On the production corpus the two are identical: `ceil(0.2 * 40) = 8` gives seeds 32-39, and
+`tests/test_splits.py::test_real_corpus_id_cut_is_seeds_32_to_39` asserts exactly that,
+together with val = 27-31 and train = 0-26.
+
+The reason for the fraction is that a hard-coded 32 makes `build_split` raise "empty test set"
+on any corpus smaller than the production one. The Gate 2 test fixture is a generated 60-file,
+8-seeds-per-cell corpus built in `tmp_path` (so Gate 2 is verifiable on a clean checkout with
+no `artifacts/`), where the same rule yields `ceil(0.2 * 8) = 2` → seeds 6-7. Hard-coding the
+literal would have forced Gate 2 onto the 1.07 GB corpus, i.e. made the leakage guard
+unrunnable in CI.
+
+### P2-D2 — Validation is carved by seed ordinal, globally, with no RNG
+
+Validation takes the top `ceil(val_frac * n_distinct_ordinals)` seed ordinals of the
+development pool, rather than a random draw of realizations.
+
+Two consequences, both wanted:
+
+- **The bare seed-ordinal sets become disjoint**, not merely the full realization keys. The
+  tests can therefore assert disjointness at the weaker, coarser level too
+  (`test_validation_seed_ordinals_are_disjoint_from_train_and_test`), which catches a class of
+  bug that key-level disjointness would pass.
+- **`build_split` contains no RNG at all.** A split is a pure function of `(meta, regime,
+  val_frac)`; nothing has to be recorded to reproduce one.
+  `test_build_split_is_deterministic` shuffles the manifest rows and asserts an identical
+  `Split`.
+
+`ceil` rather than `round` guarantees a non-empty validation partition on a fixture-scale
+corpus. `build_split` raises `ValueError` if any of the three partitions ends up empty:
+`unseen_vessel` on a single-vessel corpus is an error, never a silently returned empty
+frozenset.
+
+### P2-D3 — `load_data` and `configs/data/default.yaml` added; the YAML key is `fs_hz`, not `fs`
+
+`DataConfig` existed in Phase 0 but had no loader and no config file. `dmf.config.load_data`
+follows the `load_sim` pattern: explicit missing-key check, hand-built frozen dataclass, tuples
+rather than lists. `load_experiment` is deliberately left unimplemented — it needs `ModelConfig`
+and `TrainConfig` wiring, which is Phase 3/4 work.
+
+`docs/IMPLEMENTATION_PLAN.md` §2.1 spells the sampling-rate key `fs`. The config file uses
+**`fs_hz`**, matching `SimConfig.fs_hz` and `configs/sim/corpus.yaml`. One spelling for one
+quantity; the unit is in the name, which is the convention the rest of the project follows.
+
+`load_data` rejects: non-positive `fs_hz`/`lookback`/`stride`; empty, non-positive, or
+non-ascending `horizons`; an `observation_mode` outside `{ideal, imu}`; and `target_dofs` that
+is not a **prefix** of `input_channels` (P2-D4).
+
+### P2-D4 — `target_dofs` must be a prefix of `input_channels`, checked at config load
+
+`dmf.models.persistence.Persistence.forward` is documented to return
+`x[:, -1, :C_out]` — it forecasts by slicing the *first* `C_out` input channels. That is only
+correct if the target channels are the leading channels of the input, in the same order. Any
+other ordering makes every baseline silently forecast the wrong DOF, and the resulting skill
+scores would be wrong without being obviously wrong.
+
+It is validated in `load_data` rather than discovered later.
+`tests/test_windows.py::test_pipeline_sanity_fails_on_a_channel_order_swap` is the converse
+check: a deliberately swapped target column order must make the Gate 2 criterion-5 control
+raise.
+
+### P2-D5 — `window_spec_from_config` added
+
+`WindowSpec` is consumed by the dataset, by the split integrity checks, and by
+`dmf.train.registry.build_model`. Constructing it in three places is how a lookback and a
+receptive field drift apart. One constructor, `dmf.data.windows.window_spec_from_config(cfg)`.
+
+Arithmetic now asserted rather than commented
+(`tests/test_windows.py::test_production_window_count_arithmetic`):
+`n_windows(6000, WindowSpec(200, (10,20,30,50), 5)) == 1151`, first start 0, last start 5750,
+and `5750 + 250 == 6000` exactly.
+
+### P2-D6 — `NormStats.subset`, `build_norm_stats`, `is_train_partition` added
+
+- **`NormStats.subset(channels)`** returns statistics over a channel subset, carrying
+  `fitted_on` and `n_realizations` through unchanged. The dataset scales its **inputs** with the
+  full `C_in` statistics but inverts its **targets** with the `C_out` subset, so `invert_norm`
+  can keep a strict shape check instead of silently slicing whatever it is handed. A silent
+  slice is exactly how a channel-order bug survives.
+- **`build_norm_stats`** applies the same provenance and zero-variance validation to a
+  pre-computed scale. `DeckMotionDataset` accumulates first and second moments per realization
+  in float64 rather than materialising a float64 copy of the training split (`id/train` is
+  1296 × 6000 × 6, i.e. 373 MB in float64), and it must not bypass the guard to do so.
+- **`is_train_partition(label)`** is the single definition of "was this fitted on train": the
+  label must be exactly `"train"` or end in `"/train"`. It is checked at fit time *and* again in
+  `apply_norm`, so a `NormStats` smuggled in from a checkpoint is refused even though it was
+  never fitted in this process. `test_apply_norm_refuses_statistics_not_fitted_on_train`
+  constructs exactly that case with `dataclasses.replace`.
+
+**Positive control for the leak this guards against.** A guard is only worth having if the leak
+would have moved a number. `test_train_only_statistics_differ_measurably_from_whole_corpus_statistics`
+fits the scale on `unseen_seastate/train` and again over train+test, and asserts the per-channel
+ratio departs from 1 by more than 10%. It does: pulling SS6 into the scale is a large,
+directional change, and `unseen_seastate` is precisely the regime that holds SS6 out.
+
+Measured train-only scales on `id/train` (1296 realizations, corpus units):
+`roll 3.64641 deg`, `pitch 1.24605 deg`, `heave 0.75672 m`, `roll_rate 1.95083 deg/s`,
+`pitch_rate 0.92899 deg/s`, `heave_rate 0.44896 m/s`.
+
+### P2-D7 — `DeckMotionDataset.describe_window` and five read-only properties added
+
+`describe_window(index) -> (RealizationKey, start_sample)` exposes a window's provenance. It is
+what makes two Gate 2 criteria checkable rather than assertable:
+
+- criterion 3 opens *that* realization's Parquet file and compares the slice;
+- "windows never span a realization boundary" becomes an assertion over concrete
+  `(key, start)` pairs, not a claim in a docstring.
+
+It is also the hook any later per-cell breakdown of results will use.
+
+The properties `realization_keys`, `window_spec`, `target_columns`, `input_columns`,
+`corpus_root`, `windows_per_realization` and `training_series` are added so that
+`persistence_pipeline_sanity` can rebuild the raw-array path **without** reaching into the
+dataset's internals, and so the raw path can recompute start indices from
+`window_start_indices` rather than trusting the dataset's own index arithmetic. If it trusted
+it, an off-by-one would cancel and the control would pass.
+`test_pipeline_sanity_fails_on_an_off_by_one` shifts the dataset's starts by one sample and
+asserts the control raises.
+
+### P2-D8 — `resolve_columns` added; observation mode remaps inputs and targets together
+
+`resolve_columns(names, mode)` maps logical channel names to corpus columns, appending `_imu`
+in `imu` mode. `heave_acc` has no `_imu` twin and passes through — it *is* the accelerometer
+channel.
+
+The dataset calls it once for `input_channels` and once for `target_dofs`, from the same call
+site with the same `mode`, so **an `imu`-input / `ideal`-target task is not constructible**.
+Per P1-D6 this is not a tidiness point: `heave_imu` leads the truth by about 1.3 s at the SS5
+spectral peak, so persistence on an `imu` input scored against an `ideal` target is roughly
+twice as strong at a 1 s horizon (0.218 m vs 0.437 m on the stored realization measured in
+P1-D6). That silently changes the denominator of every skill score and is invisible in a loss
+curve. Making the mix structurally impossible is cheaper than remembering not to do it.
+
+### P2-D9 — `src/dmf/eval/controls.py` added, and why the control does not import `Persistence`
+
+New module holding the integrity controls. Phase 2 implements one; the shuffle control and the
+untrained-model control arrive in Phase 4 and get the same home.
+
+`persistence_pipeline_sanity(dataset, corpus_root, rtol=1e-6)` runs two paths that share
+nothing but the realization key list and the window geometry:
+
+- **through the pipeline** — iterate `make_dataloader(..., shuffle=False)`, forecast
+  `x[:, -1:, :C_out].expand(-1, H, -1)` in normalized space, map back with
+  `invert_norm(pred, stats.subset(target_dofs), window_mean)`;
+- **on raw arrays** — re-read each Parquet file with pandas, recompute starts, take
+  `series[start + L - 1]` as the forecast and `series[start+L : start+L+H]` as the target. No
+  dataset, no normalization, no torch.
+
+The forecast is computed **inline from tensor ops rather than by importing
+`dmf.models.persistence.Persistence`**, because `Persistence.forward` and
+`BaseForecaster.__init__` are unimplemented Phase 3 work and `src/dmf/models/` is read-only to
+the agent that owns evaluation. Phase 3 must re-run this control against the real model once it
+exists; until then the control tests the *pipeline*, not the model.
+
+`rtol = 1e-6` is stated rather than assumed. The two paths are not bitwise identical by
+construction: the dataset stores its de-meaned, scaled input as float32, so the recovered
+forecast carries a relative rounding error of order `2**-24 ≈ 6e-8`.
+
+**Measured on the full `id/test` partition of the real corpus** (384 realizations,
+441 984 windows, production geometry `L = 200`, `H = 50`, `stride = 5`):
+`max_rel_diff = 5.006e-08`, i.e. the float32 storage floor and nothing else. Persistence RMSE,
+identical to six decimal places on both paths:
+
+| Horizon | roll (deg) | pitch (deg) | heave (m) |
+|---|---|---|---|
+| 10 samples (1 s) | 1.946806 | 0.896462 | 0.441620 |
+| 20 samples (2 s) | 3.748621 | 1.639730 | 0.837991 |
+| 30 samples (3 s) | 5.273611 | 2.122079 | 1.151041 |
+| 50 samples (5 s) | 7.098060 | 2.233934 | 1.442000 |
+
+These are the denominators of every skill score this project will report on `id`.
+
+### P2-D10 — `assert_no_shared_time_index` is vacuous, and is tested with a corrupted split
+
+Under realization-level splitting the intersection of any two partitions' key sets is empty, so
+the guard-band loop never executes. That is the point — it is the check that would catch a
+future refactor introducing within-realization splitting — but it also means a passing run
+proves nothing on its own.
+
+`test_a_corrupted_split_makes_the_time_index_check_raise` therefore forces one test realization
+into the training set and asserts both `assert_no_shared_time_index` and `assert_seed_disjoint`
+raise. `test_seed_disjointness_catches_a_heldout_axis_leak` covers the subtler case: a split
+that is perfectly key-disjoint but carries an `SS6` realization in training must still fail,
+because key disjointness alone does not mean the held-out axis was held out.
+
+### P2-D11 — One canonical realization-key constructor, because the dtypes differ
+
+`manifest.parquet` stores `heading`/`speed` as **float64** and `seed` as **int64**; the
+per-realization Parquet files store **float32** and **int32**. Keys built from the two sources
+would never compare equal, and every set intersection in the leakage guards would be silently
+empty — i.e. every disjointness assertion would pass unconditionally.
+
+`dmf.data.splits.realization_key` is the single cast site (`str, float, float, str, int`), and
+`test_realization_key_is_dtype_canonical` asserts a key built from a manifest row equals the key
+built from the corresponding file's first row, after checking that the file's dtypes really are
+float32/int32.
+
+### Gate 2 evidence
+
+| Criterion | Where | Evidence |
+|---|---|---|
+| 1. Zero seed overlap, all four regimes | `test_split_partitions_are_seed_disjoint`, `test_heldout_axis_never_appears_in_train_or_val` | Pairwise-empty key intersections plus held-out-axis absence, parametrized over all four regimes; repeated on the real corpus with the exact counts above |
+| 2. No shared time index | `test_no_time_index_is_shared_between_partitions` + `test_a_corrupted_split_makes_the_time_index_check_raise` | Passes on real splits, raises on a split with one realization forced into both train and test |
+| 3. Reconstructed window matches the raw Parquet slice | `test_dataset_window_matches_the_raw_parquet_slice` | `y` and `window_mean` exact (`np.array_equal` on stored float32); input reconstructed to `atol = 1e-6` in degrees/metres through the divide-then-multiply round trip |
+| 4. Train-only normalization statistics | `test_fit_norm_stats_refuses_a_non_training_partition`, `test_test_partition_without_train_stats_raises`, `test_train_only_statistics_differ_measurably_from_whole_corpus_statistics` | Refused at fit and at use; `val`/`test` without stats raises; positive control shows the leak would move the scale by > 10% |
+| 5. Persistence through the pipeline == persistence on raw arrays | `test_persistence_pipeline_sanity` (`id` and `unseen_seastate`), plus the real-corpus run above | `max_rel_diff = 5.006e-08` over 441 984 windows |

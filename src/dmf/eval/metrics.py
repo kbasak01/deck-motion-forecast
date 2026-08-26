@@ -9,6 +9,7 @@ so that 0 means "no better than repeating the last sample" and 1 means perfect. 
 values are possible, are meaningful, and are reported rather than clipped.
 """
 
+import numpy as np
 import pandas as pd
 
 from dmf.typedefs import FloatArray
@@ -33,7 +34,12 @@ def rmse(
     Raises:
         ValueError: If ``pred`` and ``target`` differ in shape.
     """
-    raise NotImplementedError
+    if pred.shape != target.shape:
+        raise ValueError(f"pred has shape {pred.shape} but target has shape {target.shape}")
+    if pred.size == 0:
+        raise ValueError("cannot compute RMSE over an empty array")
+    squared_error = np.square(np.asarray(pred, dtype=np.float64) - np.asarray(target, np.float64))
+    return np.sqrt(squared_error.mean(axis=axis))
 
 
 def mae(

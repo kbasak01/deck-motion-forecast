@@ -1,0 +1,20 @@
+# Task definition for the supervised forecasting problem.
+#
+# Units: fs_hz hertz; lookback, horizons and stride in samples. Channel names are corpus
+# column names in `ideal` mode; `imu` mode maps each of them onto its `*_imu` twin (see
+# dmf.data.dataset.resolve_columns).
+#
+# `target_dofs` must be a prefix of `input_channels`: dmf.models.persistence.Persistence
+# forecasts by slicing the first C_out input channels, so any other ordering would make it
+# forecast the wrong channel silently. dmf.config.load_data enforces this.
+#
+# The key is `fs_hz`, not the `fs` of docs/IMPLEMENTATION_PLAN.md 2.1, so that it matches
+# SimConfig.fs_hz and configs/sim/corpus.yaml (docs/protocol.md P2-D7).
+fs_hz: 10.0
+lookback: 200                 # 20 s at 10 Hz
+horizons: [10, 20, 30, 50]    # 1, 2, 3, 5 s
+target_dofs: [roll, pitch, heave]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: ideal       # or `imu`; never mix an imu input with an ideal target (P1-D6)
+revin: false

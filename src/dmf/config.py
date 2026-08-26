@@ -19,6 +19,7 @@ __all__ = [
     "SeaState",
     "SimConfig",
     "TrainConfig",
+    "load_data",
     "load_experiment",
     "load_sim",
     "load_yaml",
@@ -320,6 +321,89 @@ def load_sim(path: Path) -> SimConfig:
         w_max_rad_s=float(raw["w_max_rad_s"]),
         jitter_frequencies=bool(raw["jitter_frequencies"]),
         seeds_per_cell_by_vessel=overrides,
+    )
+
+
+def load_data(path: Path) -> DataConfig:
+    """Load a task-definition config into a :class:`DataConfig`.
+
+    Units are those documented on :class:`DataConfig`: hertz for ``fs_hz``, samples for
+    ``lookback``, ``horizons`` and ``stride``. Channel names are corpus column names in
+    ``ideal`` mode; :func:`dmf.data.dataset.resolve_columns` maps them onto their ``*_imu``
+    twins in ``imu`` mode.
+
+    ``target_dofs`` is required to be a **prefix** of ``input_channels``.
+    :class:`dmf.models.persistence.Persistence` forecasts by slicing the first ``C_out``
+    input channels, so any other ordering would make every baseline silently forecast the
+    wrong channel. It is checked here rather than discovered later as a channel-order bug.
+
+    Args:
+        path: Path to a file under ``configs/data/``.
+
+    Returns:
+        The assembled task configuration.
+
+    Raises:
+        FileNotFoundError: If ``path`` does not exist.
+        ValueError: If a required key is missing, if ``fs_hz``, ``lookback`` or ``stride``
+            is not positive, if ``horizons`` is empty or not strictly ascending positive
+            integers, if ``observation_mode`` is not ``"ideal"`` or ``"imu"``, or if
+            ``target_dofs`` is not a prefix of ``input_channels``.
+    """
+    raw = load_yaml(path)
+    missing = {
+        "fs_hz",
+        "lookback",
+        "horizons",
+        "target_dofs",
+        "input_channels",
+        "stride",
+        "observation_mode",
+        "revin",
+    } - set(raw)
+    if missing:
+        raise ValueError(f"{path}: missing required keys {sorted(missing)}")
+
+    fs_hz = float(raw["fs_hz"])
+    lookback = int(raw["lookback"])
+    stride = int(raw["stride"])
+    for name, value in (("fs_hz", fs_hz), ("lookback", lookback), ("stride", stride)):
+        if value <= 0:
+            raise ValueError(f"{path}: {name!r} must be positive, got {value}")
+
+    horizons = tuple(int(h) for h in raw["horizons"])
+    if not horizons:
+        raise ValueError(f"{path}: 'horizons' must be non-empty")
+    if horizons[0] <= 0:
+        raise ValueError(f"{path}: horizons must be positive, got {horizons}")
+    if any(b <= a for a, b in zip(horizons, horizons[1:], strict=False)):
+        raise ValueError(f"{path}: horizons must be strictly ascending and unique, got {horizons}")
+
+    mode = str(raw["observation_mode"])
+    if mode not in ("ideal", "imu"):
+        raise ValueError(f"{path}: 'observation_mode' must be 'ideal' or 'imu', got {mode!r}")
+
+    target_dofs = tuple(str(c) for c in raw["target_dofs"])
+    input_channels = tuple(str(c) for c in raw["input_channels"])
+    if not target_dofs or not input_channels:
+        raise ValueError(f"{path}: 'target_dofs' and 'input_channels' must be non-empty")
+    if input_channels[: len(target_dofs)] != target_dofs:
+        raise ValueError(
+            f"{path}: 'target_dofs' must be a prefix of 'input_channels' "
+            f"(persistence slices the first C_out input channels); "
+            f"got target_dofs={list(target_dofs)}, input_channels={list(input_channels)}"
+        )
+
+    observation_mode: ObservationMode = "imu" if mode == "imu" else "ideal"
+    return DataConfig(
+        fs_hz=fs_hz,
+        lookback=lookback,
+        horizons=horizons,
+        target_dofs=target_dofs,
+        input_channels=input_channels,
+        stride=stride,
+        observation_mode=observation_mode,
+        revin=bool(raw["revin"]),
     )
 
 
