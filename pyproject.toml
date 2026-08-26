@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deck-motion-forecast"
+version = "0.1.0"
+description = "Short-horizon 6-DOF deck-motion forecasting from JONSWAP-driven vessel simulation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "K. Basak", email = "kbasak@umd.edu" }]
+keywords = ["seakeeping", "time-series-forecasting", "jonswap", "gnc", "onnx"]
+
+# Pinned exactly, per the implementation plan's reproducibility requirement. This set
+# was resolved and verified on the reference machine (Python 3.12.3, Ubuntu/WSL2,
+# RTX A4000, driver 595.61): torch resolved to 2.13.0+cu130 from the default PyPI
+# index with CUDA available, and onnxruntime-gpu exposes the TensorRT, CUDA and CPU
+# execution providers. If a CPU-only torch wheel is resolved elsewhere, reinstall with
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+dependencies = [
+  "numpy==2.5.2",
+  "scipy==1.18.1",
+  "pandas==3.0.5",
+  "pyarrow==25.0.1",
+  "pyyaml==6.0.3",
+  "torch==2.13.0",
+  "onnx==1.22.0",
+  "onnxruntime-gpu==1.29.0",
+  "matplotlib==3.11.1",
+  "rich==15.0.0",
+  "tqdm==4.70.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.4",
+  "mypy==2.3.1",
+  "types-PyYAML==6.0.12.20260815",
+  "pandas-stubs==3.0.5.260730",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dmf = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RET", "ARG", "PTH", "N", "D"]
+# D203/D213 conflict with the google convention's D211/D212.
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests carry module docstrings but not per-function ones, and fixtures shadow args.
+"tests/*" = ["D103", "ARG001"]
+"scripts/*" = ["D103"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+strict = true
+warn_unreachable = true
+warn_no_return = true
+show_error_codes = true
+
+# Packages that ship no type information.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "matplotlib.*", "onnx.*", "onnxruntime.*", "scipy.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+  "slow: takes more than a few seconds (long simulation records, training runs)",
+  "gpu: requires a CUDA device",
+]

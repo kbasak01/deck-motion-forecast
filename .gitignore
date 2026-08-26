@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+artifacts/
+*.parquet
+*.onnx
+*.ckpt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# WSL download artifacts
+*:Zone.Identifier
+
+# build output
+*.egg-info/
