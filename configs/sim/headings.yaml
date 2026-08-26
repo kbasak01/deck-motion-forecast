@@ -1,0 +1,26 @@
+# Corpus encounter angles and forward speeds.
+#
+# Units: headings_deg degrees, speeds_kn knots. The convention is
+#   180 deg = head seas (waves from ahead)
+#   135 deg = bow-quartering
+#    90 deg = beam seas
+#    45 deg = stern-quartering
+#     0 deg = following seas (waves from astern)
+# Speeds are converted to m/s at the physics boundary by
+# dmf.sim.encounter.knots_to_m_s; nothing downstream of that boundary sees knots.
+#
+# 0 deg following seas is deliberately NOT in the grid. It is the worst cell for the
+# encounter-frequency map: w_e = w - w^2*U*cos(beta)/g goes negative over most of the
+# synthesis band at 12 kn. 45 deg is kept instead, which still exercises the
+# non-monotonic regime (dw_e/dw changes sign at w_crit = g/(2*U*cos beta), which is
+# 2.247 rad/s at 6 kn and 1.124 rad/s at 12 kn -- both inside [0.2, 2.5] rad/s) without
+# the sign inversion dominating the record. Those two cells are labelled explicitly by
+# dmf.sim.encounter.is_encounter_monotonic rather than being silently included.
+#
+# Split policy note: 90 deg beam seas is the held-out heading for the `unseen_heading`
+# evaluation regime. Because that regime's entire test set is beam seas, both the roll
+# and the pitch heading factors carry a residual floor -- see Vessel.pitch_residual.
+
+headings_deg: [180.0, 135.0, 90.0, 45.0]
+
+speeds_kn: [0.0, 6.0, 12.0]

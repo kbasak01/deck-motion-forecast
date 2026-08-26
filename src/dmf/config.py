@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import yaml
+
 __all__ = [
     "DataConfig",
     "ExperimentConfig",
@@ -18,6 +20,7 @@ __all__ = [
     "SimConfig",
     "TrainConfig",
     "load_experiment",
+    "load_sim",
     "load_yaml",
 ]
 
@@ -55,8 +58,14 @@ class SimConfig:
             and 0 following seas.
         speeds_kn: Forward speeds, knots.
         vessels: Vessel config file stems under ``configs/sim/vessels/``.
-        seeds_per_cell: Number of independent realizations per
+        seeds_per_cell: Default number of independent realizations per
             (sea state, heading, speed, vessel) cell.
+        seeds_per_cell_by_vessel: Per-vessel overrides of ``seeds_per_cell``, as
+            ``(vessel_stem, n_seeds)`` pairs. A tuple rather than a mapping so that the
+            dataclass stays frozen and hashable. The corpus uses 40 seeds per cell for the
+            primary ``frigate`` hull and 8 for ``s175``: ``s175`` is the held-out
+            ``unseen_vessel`` test hull, is never trained on, and so needs only enough
+            realizations to make its test-set mean stable.
         duration_s: Retained record length per realization, seconds, after spin-up.
         spinup_s: Leading transient discarded from each record, seconds.
         fs_hz: Sampling rate of the stored record, hertz.
@@ -81,6 +90,22 @@ class SimConfig:
     w_min_rad_s: float
     w_max_rad_s: float
     jitter_frequencies: bool
+    seeds_per_cell_by_vessel: tuple[tuple[str, int], ...] = ()
+
+    def seeds_for(self, vessel: str) -> int:
+        """Return the number of realizations per grid cell for one vessel.
+
+        Args:
+            vessel: Vessel config stem, e.g. ``"frigate"``.
+
+        Returns:
+            The override from :attr:`seeds_per_cell_by_vessel` if one is present for
+            ``vessel``, otherwise :attr:`seeds_per_cell`. Dimensionless count.
+        """
+        for name, count in self.seeds_per_cell_by_vessel:
+            if name == vessel:
+                return count
+        return self.seeds_per_cell
 
 
 @dataclass(frozen=True)
@@ -195,7 +220,107 @@ def load_yaml(path: Path) -> dict[str, Any]:
         FileNotFoundError: If ``path`` does not exist.
         ValueError: If the document's top level is not a mapping.
     """
-    raise NotImplementedError
+    if not path.exists():
+        raise FileNotFoundError(f"config not found: {path}")
+    raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: top level of a config file must be a mapping")
+    return {str(key): value for key, value in raw.items()}
+
+
+def load_sim(path: Path) -> SimConfig:
+    """Load a corpus-generation config into a :class:`SimConfig`.
+
+    The ``sea_states`` and ``headings`` entries may each be either an inline mapping or a
+    path to another YAML file, resolved relative to ``path``'s directory, so that the sea
+    state and heading tables stay in one place and are shared by every corpus variant.
+
+    Units are those documented on :class:`SimConfig` and :class:`SeaState`: metres,
+    seconds, hertz, knots, degrees, and radians per second for the synthesis band. No unit
+    conversion happens here; knots reach metres per second only at the physics boundary in
+    :func:`dmf.sim.encounter.knots_to_m_s`.
+
+    Args:
+        path: Path to a file under ``configs/sim/``.
+
+    Returns:
+        The assembled simulation configuration.
+
+    Raises:
+        FileNotFoundError: If ``path`` or a referenced sub-config does not exist.
+        ValueError: If a required key is missing, if a referenced sub-config does not
+            contain the key it is supposed to supply, or if a seed count is not positive.
+    """
+    raw = load_yaml(path)
+
+    def _resolve(key: str) -> dict[str, Any]:
+        """Return the mapping for ``key``, following a file reference if given one."""
+        if key not in raw:
+            raise ValueError(f"{path}: missing required key {key!r}")
+        entry = raw[key]
+        if isinstance(entry, str):
+            return load_yaml(path.parent / entry)
+        if isinstance(entry, dict):
+            return {str(k): v for k, v in entry.items()}
+        raise ValueError(f"{path}: {key!r} must be a mapping or a path to one")
+
+    sea_raw = _resolve("sea_states").get("sea_states")
+    if not isinstance(sea_raw, list) or not sea_raw:
+        raise ValueError(f"{path}: 'sea_states' must resolve to a non-empty list")
+    sea_states = tuple(
+        SeaState(
+            name=str(entry["name"]),
+            hs_m=float(entry["hs_m"]),
+            tp_s=float(entry["tp_s"]),
+            gamma=float(entry.get("gamma", 3.3)),
+        )
+        for entry in sea_raw
+    )
+
+    headings_raw = _resolve("headings")
+    for key in ("headings_deg", "speeds_kn"):
+        if key not in headings_raw:
+            raise ValueError(f"{path}: heading config supplies no {key!r}")
+    headings_deg = tuple(float(v) for v in headings_raw["headings_deg"])
+    speeds_kn = tuple(float(v) for v in headings_raw["speeds_kn"])
+
+    missing = {
+        "vessels",
+        "seeds_per_cell",
+        "duration_s",
+        "spinup_s",
+        "fs_hz",
+        "n_components",
+        "w_min_rad_s",
+        "w_max_rad_s",
+        "jitter_frequencies",
+    } - set(raw)
+    if missing:
+        raise ValueError(f"{path}: missing required keys {sorted(missing)}")
+
+    overrides_raw = raw.get("seeds_per_cell_by_vessel", {}) or {}
+    if not isinstance(overrides_raw, dict):
+        raise ValueError(f"{path}: 'seeds_per_cell_by_vessel' must be a mapping")
+    overrides = tuple((str(k), int(v)) for k, v in sorted(overrides_raw.items()))
+    for name, count in ((("<default>"), int(raw["seeds_per_cell"])), *overrides):
+        if count < 1:
+            raise ValueError(f"{path}: seeds per cell for {name} must be >= 1, got {count}")
+
+    return SimConfig(
+        sea_states=sea_states,
+        headings_deg=headings_deg,
+        speeds_kn=speeds_kn,
+        vessels=tuple(str(v) for v in raw["vessels"]),
+        seeds_per_cell=int(raw["seeds_per_cell"]),
+        duration_s=float(raw["duration_s"]),
+        spinup_s=float(raw["spinup_s"]),
+        fs_hz=float(raw["fs_hz"]),
+        n_components=int(raw["n_components"]),
+        w_min_rad_s=float(raw["w_min_rad_s"]),
+        w_max_rad_s=float(raw["w_max_rad_s"]),
+        jitter_frequencies=bool(raw["jitter_frequencies"]),
+        seeds_per_cell_by_vessel=overrides,
+    )
 
 
 def load_experiment(path: Path) -> ExperimentConfig:

@@ -1,100 +1,113 @@
-"""Encounter-frequency transformation and heading conventions.
+"""Encounter kinematics: deep-water wave number and Doppler-shifted encounter frequency.
 
-Heading convention, used consistently across the package: ``beta_deg`` is the encounter
-angle in degrees, where **180 is head seas** (vessel steaming into the waves), 90 is beam
-seas, and 0 is following seas.
-
-The encounter frequency for deep water is::
-
-    w_e = w - (w^2 * U / g) * cos(beta)
-
-Note the sign convention this implies: with ``beta = 180`` (head seas) ``cos(beta) = -1``
-and ``w_e > w``, which is the physically correct Doppler up-shift.
+Frequencies are **radians per second**, wave numbers **radians per metre**, speeds
+**metres per second** (knots are converted at the config boundary only), and headings
+**degrees** at the public boundary with the convention 180 = head seas, 90 = beam seas,
+0 = following seas. ``g = 9.80665 m/s^2``.
 """
 
-from dmf.typedefs import BoolArray, FloatArray
+import numpy as np
+
+from dmf.typedefs import FloatArray
 
 __all__ = [
     "GRAVITY_M_S2",
-    "deep_water_wavenumber",
+    "KNOT_M_S",
     "encounter_frequency",
-    "encounter_frequency_is_monotonic",
-    "knots_to_mps",
+    "is_encounter_monotonic",
+    "knots_to_m_s",
+    "wave_number",
 ]
 
-#: Standard gravitational acceleration, metres per second squared.
+#: Standard gravity, metres per second squared.
 GRAVITY_M_S2: float = 9.80665
 
+#: One international knot in metres per second.
+KNOT_M_S: float = 0.514444
 
-def knots_to_mps(u_kn: float) -> float:
-    """Convert forward speed from knots to metres per second.
+
+def knots_to_m_s(kn: float) -> float:
+    """Convert a speed from knots to metres per second.
 
     Args:
-        u_kn: Speed, knots.
+        kn: Speed, knots.
 
     Returns:
         Speed, metres per second.
     """
-    raise NotImplementedError
+    return kn * KNOT_M_S
 
 
-def deep_water_wavenumber(w_rad_s: FloatArray) -> FloatArray:
-    """Compute the deep-water wavenumber from angular frequency.
+def wave_number(w: FloatArray) -> FloatArray:
+    """Deep-water wave number from angular frequency.
 
-    Uses the deep-water dispersion relation ``k = w^2/g``, valid when the water depth
-    exceeds roughly half the wavelength. The corpus assumes deep water throughout; no
-    finite-depth correction is applied.
+    Uses the deep-water dispersion relation ``k = w**2/g``. The corpus band
+    ``[0.2, 2.5] rad/s`` corresponds to wavelengths from about 10 m to 1500 m; deep water
+    is assumed throughout and no finite-depth correction is applied.
 
     Args:
-        w_rad_s: Angular frequencies, radians per second.
+        w: Angular frequencies, radians per second.
 
     Returns:
-        Wavenumbers, radians per metre, same shape as ``w_rad_s``.
+        Wave numbers, radians per metre, same shape as ``w``.
     """
-    raise NotImplementedError
+    w_arr = np.asarray(w, dtype=np.float64)
+    return np.asarray(w_arr**2 / GRAVITY_M_S2, dtype=np.float64)
 
 
-def encounter_frequency(w_rad_s: FloatArray, speed_mps: float, beta_deg: float) -> FloatArray:
-    """Transform absolute wave frequencies into encounter frequencies.
+def encounter_frequency(w: FloatArray, speed_m_s: float, heading_deg: float) -> FloatArray:
+    """Doppler-shifted frequency at which the vessel meets the waves.
 
-    ``w_e = w - (w^2 * U / g) * cos(beta)``, with ``beta`` measured per the module
-    convention (180 = head seas).
+    Computes ``w_e = w - (w**2 * U / g) * cos(beta)`` with ``beta`` in radians internally.
+    Head seas (``beta = 180 deg``, ``cos beta = -1``) raise the encounter frequency;
+    following seas (``beta = 0``) lower it and can drive ``w_e`` negative, which
+    physically means the waves overtake the ship. The **signed** value is returned and
+    must be kept in the cosine argument of the response synthesis; only the response
+    transfer function is evaluated at ``abs(w_e)``, so that damping stays dissipative.
 
     Args:
-        w_rad_s: Absolute wave angular frequencies, radians per second.
-        speed_mps: Vessel forward speed, metres per second.
-        beta_deg: Encounter angle, degrees. Converted to radians internally.
+        w: Wave angular frequencies in the earth frame, radians per second.
+        speed_m_s: Forward speed, metres per second, non-negative.
+        heading_deg: Encounter angle, degrees. 180 head, 90 beam, 0 following.
 
     Returns:
-        Encounter angular frequencies, radians per second, same shape as ``w_rad_s``.
-        May contain negative values in following seas, which correspond to waves
-        overtaking the vessel.
+        Signed encounter frequencies, radians per second, same shape as ``w``.
 
     Raises:
-        ValueError: If ``speed_mps`` is negative.
+        ValueError: If ``speed_m_s`` is negative.
     """
-    raise NotImplementedError
+    if speed_m_s < 0.0:
+        raise ValueError(f"speed_m_s must be non-negative, got {speed_m_s}")
+    w_arr = np.asarray(w, dtype=np.float64)
+    cos_beta = float(np.cos(np.radians(heading_deg)))
+    return np.asarray(w_arr - w_arr**2 * speed_m_s * cos_beta / GRAVITY_M_S2, dtype=np.float64)
 
 
-def encounter_frequency_is_monotonic(
-    w_rad_s: FloatArray, speed_mps: float, beta_deg: float
-) -> BoolArray:
-    """Flag components for which the encounter-frequency map is locally invertible.
+def is_encounter_monotonic(w: FloatArray, speed_m_s: float, heading_deg: float) -> bool:
+    """Report whether ``w -> w_e`` is one-to-one across the supplied band.
 
-    ``dw_e/dw = 1 - 2*w*U*cos(beta)/g`` changes sign in following and quartering seas
-    (``cos(beta) > 0``), so distinct absolute frequencies can map to the same encounter
-    frequency. Where that happens, a response computed by naive per-component lookup is
-    wrong, and the regime must either be excluded from the corpus or handled explicitly.
-    This project excludes it: :func:`dmf.sim.generate.realization_grid` rejects any
-    (speed, heading) cell for which this predicate is not True across the whole synthesis
-    band, and records the rejection in the corpus card.
+    The derivative is ``dw_e/dw = 1 - 2*w*U*cos(beta)/g``, which is positive for every
+    ``w`` when ``cos(beta) <= 0`` (head and bow-quartering seas) and changes sign at
+    ``w_crit = g / (2*U*cos(beta))`` when ``cos(beta) > 0`` (following and stern-quartering
+    seas). Two distinct wave frequencies then arrive at the same encounter frequency, so an
+    encounter-frequency response spectrum is not a simple change of variable of the wave
+    spectrum.
+
+    The corpus keeps those cells rather than excluding them. Time-domain superposition
+    stays valid because each component is propagated independently with its own signed
+    ``w_e``; what breaks is only the frequency-domain change of variable, which this
+    project never relies on. This predicate exists so that the non-monotonic cells are
+    labelled explicitly instead of passing silently.
 
     Args:
-        w_rad_s: Absolute wave angular frequencies, radians per second.
-        speed_mps: Vessel forward speed, metres per second.
-        beta_deg: Encounter angle, degrees.
+        w: Wave angular frequencies, radians per second, covering the band of interest.
+        speed_m_s: Forward speed, metres per second.
+        heading_deg: Encounter angle, degrees.
 
     Returns:
-        Boolean mask, same shape as ``w_rad_s``, True where ``dw_e/dw > 0``.
+        True if ``dw_e/dw`` has one sign across the whole of ``w``, False otherwise.
     """
-    raise NotImplementedError
+    w_arr = np.asarray(w, dtype=np.float64)
+    cos_beta = float(np.cos(np.radians(heading_deg)))
+    derivative = 1.0 - 2.0 * w_arr * speed_m_s * cos_beta / GRAVITY_M_S2
+    return bool(np.all(derivative > 0.0) or np.all(derivative < 0.0))

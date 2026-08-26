@@ -1,0 +1,43 @@
+# Corpus generation settings -- the config `make data` runs.
+#
+# Units: duration_s / spinup_s seconds, fs_hz hertz (the only Hz quantity in the
+# simulator), w_min_rad_s / w_max_rad_s radians per second, seeds and n_components
+# dimensionless counts. Sea states (metres, seconds) and the heading/speed grid (degrees,
+# knots) are pulled from the two frozen tables next to this file rather than duplicated.
+#
+# Grid: 4 sea states x 4 headings x 3 speeds x (40 frigate + 8 s175) seeds
+#       = 1920 + 384 = 2304 realizations x 6000 rows = 13.82 M rows.
+#
+# n_components = 299, not 300, and jitter_frequencies must stay true. 299 puts
+# w_min/dw = 26.000 exactly, which is the configuration the anti-periodicity invariant in
+# tests/test_spectra.py is validated at (docs/protocol.md P1-D4). A uniform (un-jittered)
+# frequency comb makes every record repeat with period 2*pi/dw = 817 s and a forecaster
+# memorises the loop instead of learning the dynamics.
+#
+# 720 s is synthesised and the leading 120 s discarded, leaving the 600 s that is stored.
+# The synthesis is a steady-state superposition with no transient of its own, so the
+# discard exists to decorrelate the t = 0 phase alignment across realizations and to let
+# the causal IMU high-pass filters settle before the retained window starts.
+#
+# s175 gets 8 seeds per cell rather than 40 because it is the held-out `unseen_vessel`
+# test hull: it is never trained on, so it needs only enough realizations for a stable
+# test-set mean, not enough to fit on.
+
+sea_states: sea_states.yaml
+headings: headings.yaml
+
+vessels: [frigate, s175]
+
+seeds_per_cell: 40
+seeds_per_cell_by_vessel:
+  frigate: 40
+  s175: 8
+
+duration_s: 600.0
+spinup_s: 120.0
+fs_hz: 10.0
+
+n_components: 299
+w_min_rad_s: 0.2
+w_max_rad_s: 2.5
+jitter_frequencies: true

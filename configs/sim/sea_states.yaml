@@ -1,0 +1,31 @@
+# Corpus sea states, JONSWAP.
+#
+# Units: hs_m metres (significant wave height), tp_s seconds (spectral peak period),
+# gamma dimensionless (peak-enhancement factor; 1.0 is Pierson-Moskowitz, 3.3 the
+# standard North Sea value). Frequencies never appear here -- the simulator derives
+# wp = 2*pi/tp_s in rad/s internally.
+#
+# Hs/Tp pairs are the representative values of the WMO sea-state code as tabulated in the
+# implementation plan. At gamma = 3.3 these give Tz/Tp = 0.778, i.e. Tp/Tz = 1.286.
+#
+# Split policy note: SS6 is the held-out sea state for the `unseen_seastate` evaluation
+# regime. It is the most severe cell, so that regime measures extrapolation, not
+# interpolation.
+
+sea_states:
+  - name: SS3
+    hs_m: 1.0
+    tp_s: 7.5
+    gamma: 3.3
+  - name: SS4
+    hs_m: 1.9
+    tp_s: 8.8
+    gamma: 3.3
+  - name: SS5
+    hs_m: 3.3
+    tp_s: 9.7
+    gamma: 3.3
+  - name: SS6
+    hs_m: 5.0
+    tp_s: 12.4
+    gamma: 3.3
