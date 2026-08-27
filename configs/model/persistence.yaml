@@ -1,0 +1,11 @@
+# Persistence -- the skill-score denominator. Zero parameters, no fitting, no seed.
+#
+# `head: point` and the empty `quantiles` list are carried by every model config so that
+# dmf.train.registry.build_model has one uniform shape to read. `params` is empty: the
+# model's only inputs are the window geometry and the channel counts, which build_model
+# supplies from the WindowSpec.
+name: persistence
+label: persistence
+head: point
+quantiles: []
+params: {}

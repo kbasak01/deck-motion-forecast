@@ -1,0 +1,23 @@
+# DLinear -- canonical, channel-independent (Zeng et al.). Roll is forecast from roll
+# history alone, pitch from pitch, and so on. Since P3 the target set is all six channels,
+# so the model is handed every channel; what it cannot do is let one output read another
+# channel's history.
+#
+# `kernel_size` is in **samples**: 25 samples at 10 Hz is 2.5 s, comfortably shorter than
+# the ~12 s roll period, so the moving average separates a slow drift from the wave-band
+# oscillation rather than removing the oscillation itself.
+#
+# That channel independence is exactly what AR(p) does not have, so a DLinear-vs-AR gap
+# confounds architecture with per-output information set. The separation is made on the AR
+# side instead -- `ar_attitude_only` vs `ar20`, same architecture, same order, same ridge,
+# same solver, one input set apart. The multi-channel DLinear that used to serve that
+# purpose was removed: at the P3 geometry it needed 2 161 800 fitted parameters against
+# this model's 60 300, so it answered "does the model mix channels?" and "does the model
+# have 36x the capacity?" in one number (docs/protocol.md P3).
+name: dlinear
+label: dlinear
+head: point
+quantiles: []
+params:
+  kernel_size: 25
+  individual: false

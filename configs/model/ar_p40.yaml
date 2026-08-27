@@ -1,0 +1,16 @@
+# Multivariate least-squares AR(40), direct multi-horizon.
+#
+# `order` is in **samples** of history: 40 samples at 10 Hz is 4.0 s. The feature map is
+# lag-major, most-recent-lag-first, so the three orders are prefix-nested and one pass of
+# streaming normal equations at p=40 fits all three exactly (docs/protocol.md P3).
+#
+# `ridge` is dimensionless: the normal equations are solved centred and **whitened**, so
+# the penalty is added to a correlation matrix whose diagonal is exactly 1. The headline
+# Gate 3 number is reported at both ridge=0 and ridge=1e-6.
+name: ar
+label: ar40
+head: point
+quantiles: []
+params:
+  order: 40
+  ridge: 1.0e-6

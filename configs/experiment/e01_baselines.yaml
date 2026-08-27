@@ -1,0 +1,39 @@
+# Gate 3 -- the baselines table.
+#
+# One experiment, one table, six models sharing one data pipeline, one normalisation,
+# one horizon definition and one early-stopping rule. Splitting them across runs is how
+# those four silently drift apart, which is the failure mode Gate 4's fairness requirement
+# exists to prevent.
+#
+# Model order here is the table order. persistence is first because it is the skill-score
+# denominator, and `dmf.eval.runner.evaluate_models` requires it to be present.
+#
+# `ar_attitude_only` is read as a paired difference against `ar20`, not on its own: same
+# order, same ridge, same solver, same moments -- only the input information set differs,
+# so the two rows isolate the value of the rate channels with no capacity confound.
+name: baselines
+data: ../data/default.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p10.yaml
+  - ../model/ar_p20.yaml
+  - ../model/ar_p40.yaml
+  - ../model/ar_attitude_only.yaml
+  - ../model/dlinear.yaml
+
+# Applies to the SGD models only. The closed-form models (persistence, damped persistence,
+# AR) ignore it: they are deterministic and emit one row each with skill_std = NaN.
+train:
+  epochs: 60
+  batch_size: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 8
+
+seeds: [0, 1, 2]
+regimes: [id, unseen_seastate, unseen_heading, unseen_vessel]

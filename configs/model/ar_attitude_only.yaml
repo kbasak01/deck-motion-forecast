@@ -1,0 +1,27 @@
+# AR(20) on the three attitude channels only -- an information-set ablation of `ar20`.
+#
+# Identical to configs/model/ar_p20.yaml in `name`, `order` and `ridge`, so the two rows of
+# the baselines table differ in exactly one thing: which input channels the regression is
+# allowed to read. That is the comparison the deleted `dlinear_mc` was meant to supply and
+# could not -- at the P3 geometry it carried 2 161 800 fitted parameters against DLinear's
+# 60 300, so its "does the model see the rates?" contrast came bundled with a 36x capacity
+# contrast (docs/protocol.md P3).
+#
+# `n_input_used` is in **channels**, counted from the front of `input_channels`. Under the
+# P2-D4 prefix rule the first three are roll, pitch and heave, so 3 is exactly the attitude
+# set and 6 would recover `ar20`. The **targets** are untouched: this model still forecasts
+# all six channels, including the three rates it cannot see. Fewer inputs, same task.
+#
+# This costs no extra pass over the training split. dmf.models.ar.lag_features is lag-major
+# with the channels ordered within each lag block, so the three-channel design matrix is a
+# column subset of the six-channel one and the Gram and cross moments cached per regime by
+# dmf.train.experiment are sliced (dmf.train.closed_form.subset_columns) rather than
+# re-accumulated -- the same trick that already fits p=10, 20 and 40 from one pass at p=40.
+name: ar
+label: ar_attitude_only
+head: point
+quantiles: []
+params:
+  order: 20
+  ridge: 1.0e-6
+  n_input_used: 3

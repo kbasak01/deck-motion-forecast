@@ -333,7 +333,9 @@ raise.
 receptive field drift apart. One constructor, `dmf.data.windows.window_spec_from_config(cfg)`.
 
 Arithmetic now asserted rather than commented
-(`tests/test_windows.py::test_production_window_count_arithmetic`):
+(`tests/test_windows.py::test_window_count_arithmetic_on_a_fixed_geometry`, renamed from
+`test_production_window_count_arithmetic` when the P3 task revision made this geometry a
+deliberately pinned arithmetic case rather than the production one):
 `n_windows(6000, WindowSpec(200, (10,20,30,50), 5)) == 1151`, first start 0, last start 5750,
 and `5750 + 250 == 6000` exactly.
 
@@ -471,3 +473,370 @@ float32/int32.
 | 3. Reconstructed window matches the raw Parquet slice | `test_dataset_window_matches_the_raw_parquet_slice` | `y` and `window_mean` exact (`np.array_equal` on stored float32); input reconstructed to `atol = 1e-6` in degrees/metres through the divide-then-multiply round trip |
 | 4. Train-only normalization statistics | `test_fit_norm_stats_refuses_a_non_training_partition`, `test_test_partition_without_train_stats_raises`, `test_train_only_statistics_differ_measurably_from_whole_corpus_statistics` | Refused at fit and at use; `val`/`test` without stats raises; positive control shows the leak would move the scale by > 10% |
 | 5. Persistence through the pipeline == persistence on raw arrays | `test_persistence_pipeline_sanity` (`id` and `unseen_seastate`), plus the real-corpus run above | `max_rel_diff = 5.006e-08` over 441 984 windows |
+
+---
+
+## Phase 3 — baselines
+
+### Gate 3 outcome
+
+**Gate 3 as written does not pass, and cannot.** The criterion (`docs/IMPLEMENTATION_PLAN.md`
+§Phase 3) is: if AR(p) reaches 0.8 skill vs persistence at 3 s on roll in `id`, the task is too
+easy. Measured on the real corpus, `id`/test, closed-form fit on `id`/train:
+
+| model | skill @ 3 s, roll, `id`, `ideal` | same, `imu` |
+|---|---|---|
+| persistence | 0.000000 | 0.000000 |
+| damped persistence | 0.385034 | 0.385033 |
+| AR(10) | 0.998261 | 0.992559 |
+| **AR(20)** | **0.998692** | **0.995756** |
+| AR(40) | 0.999107 | 0.996176 |
+
+AR(20) forecasts roll 3 s ahead to 0.19 deg RMSE (`ideal`) against a persistence denominator of
+5.27 deg. The threshold is 0.8; the measurement is 0.9987.
+
+**No threshold was relaxed.** The gate is recorded as failed. Two remedies the plan offers were
+tried and are documented below. The gate is **restated** in P3-D12 — same 0.8 threshold, read at
+the decision horizon on the binding DOF — and that restatement is applied.
+
+### P3-D1 — Why the task is easy, and why it is not leakage
+
+The shuffle control settles the leakage question. AR(20) refitted on time-shuffled training
+targets scores 0.3705 on `id`/test roll at 3 s against a window-mean null of 0.3699 —
+`excess = 0.001` against a 2% tolerance. All 36 control rows pass in both observation modes
+(`|excess| <= 0.0043`). Destroying the temporal relationship destroys the model's advantage
+entirely, which is what a clean pipeline looks like.
+
+The cause is structural. The vessel RAO is a narrowband filter, so deck motion is close to a
+modulated sinusoid with a ~12 s roll period, and there is no process noise anywhere in the
+generator. A sum of sinusoids satisfies an exact linear recursion, so least-squares AR over 200
+lags x 6 channels is not approximating the system, it is identifying it. A 3 s horizon is a
+quarter of the roll period. **The gate's chosen cell — roll, 3 s, in-distribution — is the single
+easiest cell in the corpus.**
+
+Consequence for every result this project will report: with no process noise the achievable-skill
+ceiling is unrealistically high, so absolute numbers flatter every model. Only *relative* model
+comparisons and *OOD degradation* should be read as findings. This belongs in the README.
+
+### P3-D2 — `imu` observation mode does not rescue the gate
+
+Tried as the plan's second remedy. AR(20) skill at 3 s on roll moved only from 0.9987 to 0.9958.
+
+The reason is already in P1-D6 and was missed when the remedy was proposed: the `heave_imu`
+discrepancy "is almost entirely phase" — the two RMS values agree to 1%. Phase distortion from a
+causal high-pass is deterministic and linear, so a linear model absorbs it for free; `heave` skill
+is unchanged at 0.997 despite an error/signal power ratio of 0.67. The only genuinely
+unpredictable component the IMU model adds is white noise (0.02 deg attitude, 0.02 deg/s gyro),
+which against a 3.5 deg roll signal is ~45 dB SNR — below the error AR was already making.
+
+Measured observation-error/signal power, median over sea states and headings: roll 0.001, pitch
+0.0008, heave 0.666. The IMU model meaningfully corrupts **heave only**; the high ratios for roll
+and pitch occur exactly where that DOF already sits on its P1-D2 residual floor.
+
+`configs/data/imu.yaml` is kept as the `ideal` config's twin, differing in `observation_mode` and
+nothing else, so the Phase 6.3 observability ablation is a controlled comparison.
+
+### P3-D3 — Lengthening the horizon alone does not rescue it either
+
+Measured out to 30 s, `imu`, `id`, AR(20) roll: 0.996 @ 3 s, 0.989 @ 5 s, 0.894 @ 10 s,
+0.872 @ 15 s, 0.849 @ 20 s, 0.794 @ 30 s. Roll does not cross 0.8 until **30 s**, which is 2.5
+roll periods and far outside any touchdown-decision timeline.
+
+But the horizon sweep showed the difficulty is strongly DOF-dependent, and **roll is the most
+predictable DOF, not the least**. Lightly damped roll resonance (`Tn = 12 s`, `zeta = 0.06`) is the
+most narrowband channel in the corpus; pitch is stiffer and more damped, therefore broader-band,
+therefore genuinely hard. Normalised RMSE (RMSE / signal std; 1.0 = no better than the mean),
+AR(20), `imu`, `id`: pitch 0.34 @ 3 s and 0.50 @ 5 s where roll is 0.09 and 0.20.
+
+**Pitch is the binding DOF.** The gate measured roll.
+
+### P3-D4 — Task definition revised: six targets, horizons to 15 s
+
+`configs/data/default.yaml` and `configs/data/imu.yaml` changed together:
+
+    target_dofs: [roll, pitch, heave]            ->  [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+    horizons:    [10, 20, 30, 50]                ->  [10, 20, 30, 50, 100, 150]
+
+**Six targets, for correctness — and it fixes an inconsistency the three-target task carried.**
+`dmf.eval.quiescence.detect_quiescent_mask` thresholds `|roll|`, `|pitch|` **and `|heave_rate|`**,
+but `heave_rate` was an input channel and never a forecast target. The operational metric could
+not supply its own decision variable; it would have had to differentiate a forecast `heave`,
+amplifying exactly the high-frequency error the forecast is worst at. The wider framing requires
+it independently: a full-scale manned or unmanned helicopter deck landing requires attitudes *and*
+their rates to stay bounded through the window, not attitudes alone.
+
+**This does not make the task harder, and it was not adopted for that.** Measured, `id`/`imu`,
+AR(20): rate channels sit within 0.03 of their position channels in normalised RMSE at every
+horizon. Relative spectral width barely moves (0.11-0.17 across all six), because differentiation
+multiplies by omega on a signal that is already narrowband.
+
+**Horizons to 15 s, for difficulty and for operational realism.** 10 s and 15 s are where the
+problem stops being trivial, and a full-scale rotorcraft's commit-to-land lead time is longer than
+a quadrotor's. The 1-5 s horizons are retained as the operational set. Post-revision, AR(20) skill
+on `id` (`ideal`) falls below 0.8 in **four of six channels** at both 10 s and 15 s:
+
+| | 1 s | 2 s | 3 s | 5 s | 10 s | 15 s |
+|---|---|---|---|---|---|---|
+| roll | 1.000 | 1.000 | 0.999 | 0.992 | 0.926 | 0.909 |
+| pitch | 1.000 | 0.998 | 0.984 | 0.928 | **0.545** | **0.530** |
+| heave | 1.000 | 1.000 | 0.997 | 0.976 | **0.676** | **0.675** |
+| roll_rate | 1.000 | 0.998 | 0.996 | 0.995 | 0.883 | 0.879 |
+| pitch_rate | 0.999 | 0.990 | 0.978 | 0.924 | **0.585** | **0.517** |
+| heave_rate | 1.000 | 0.998 | 0.993 | 0.983 | **0.636** | **0.651** |
+
+At 15 s pitch and pitch_rate are at 0.985/0.984 normalised RMSE, i.e. effectively unpredictable,
+while roll still has headroom at 0.43. The useful design band is **10-15 s and differs per DOF**.
+
+### P3-D5 — Skill vs persistence is not comparable across horizons on this signal
+
+The denominator oscillates with the signal's own period, because persistence error tracks the
+autocorrelation. Persistence RMSE for roll on `id`/test does not increase monotonically with lead
+time — it *falls* from 7.088 deg at 50 samples to 3.794 deg at 100 samples, because 100 samples
+(10 s) is close to one roll period and the signal has come back around. Measured autocorrelation
+of roll: -0.89 at 5 s, +0.62 at 10 s.
+
+A skill-vs-horizon curve on this data therefore shows dips that are properties of the reference,
+not of the model. **Report normalised RMSE (RMSE / signal std) alongside skill whenever the
+horizon varies.** This is not a presentational preference; P3-D7 records a case where reading skill
+alone would produce a false conclusion about a model.
+
+### P3-D6 — P2-D9 denominators superseded (the Phase 2 record stands as history)
+
+Raising `max_horizon` from 50 to 150 samples drops the last 20 window starts of every realization:
+**1131 windows per realization, not 1151**, and 434 304 windows on `id`/test rather than 441 984.
+Every persistence denominator moves in the fifth significant figure. The P2-D9 table remains
+accurate *as a Phase 2 record* and is not edited; it is superseded here.
+
+Persistence RMSE, `id`/test, `ideal`, 384 realizations / 434 304 windows. Attitudes in **degrees**,
+heave in **metres**, rates in **deg/s** and **m/s**:
+
+| horizon (samples) | roll | pitch | heave | roll_rate | pitch_rate | heave_rate |
+|---|---|---|---|---|---|---|
+| 10 | 1.944663 | 0.896319 | 0.441743 | 1.067514 | 0.752844 | 0.285223 |
+| 20 | 3.744455 | 1.639687 | 0.838214 | 2.048398 | 1.341412 | 0.535198 |
+| 30 | 5.267361 | 2.122358 | 1.151318 | 2.865996 | 1.664056 | 0.721625 |
+| 50 | 7.087561 | 2.234325 | 1.442156 | 3.798346 | 1.549273 | 0.852486 |
+| 100 | 3.793711 | 1.559155 | 0.833518 | 1.958739 | 1.273090 | 0.478612 |
+| 150 | 5.251935 | 1.785132 | 1.106453 | 2.898094 | 1.307998 | 0.681423 |
+
+(Roll before the revision, for the record: 1.946806 / 3.748621 / 5.273611 / 7.098060.)
+
+Verified two independent ways: a standalone pandas/numpy pass over the raw Parquet sharing no code
+with the dataset pipeline (max abs difference 4.98e-07, the rounding of the pinned literals), and
+through `persistence_pipeline_sanity` with the real `Persistence` model to `abs = 5e-6`. All six
+DOFs are pinned in `tests/test_models.py::PERSISTENCE_RMSE_ID_TEST`, together with the window count
+and an explicit assertion that roll at 100 samples is *below* roll at 50, so the non-monotonicity
+of P3-D5 is recorded as intended behaviour rather than rediscovered as a bug.
+
+**No `imu` denominator table is pinned anywhere yet.** Worth adding when someone measures it.
+
+### P3-D7 — Where AR(20) loses to persistence, recorded rather than dropped
+
+144 cells (4 regimes x 6 DOFs x 6 horizons). 12 are losses, and
+`tests/test_models.py::AR20_NEGATIVE_SKILL_CELLS` asserts the measured loss set **equals** the
+recorded set, so a new loss fails the suite and a silent repair fails it too (CLAUDE.md
+non-negotiable 6).
+
+`id` and `unseen_seastate` are clean: all 72 cells positive, minima 0.517 (`pitch_rate` @ 150) and
+0.158 (`pitch` @ 100).
+
+**`unseen_heading` / pitch and pitch_rate, 20-150 samples.** The P1-D2 residual floor: the
+`unseen_heading` test set *is* beam seas, where the pitch heading factor is clamped at
+`eps = 0.05`, ~26 dB down. The test-set pitch signal is the engineering stand-in for hull
+asymmetry, not the pitch physics the model trained on. `pitch_rate` is new at this task definition
+and is worse than `pitch` — it is the derivative of the clamped signal, inheriting the floor with
+the noise differentiated up: -6.9 at 2 s where `pitch` is only -0.52, falling to -57 at 15 s. Only
+the 1 s horizon survives for either.
+
+**`unseen_vessel` / roll and roll_rate at 150 samples, and this one is not AR degrading.** AR's own
+roll RMSE grows smoothly with lead time (0.007, 0.054, 0.19, 0.76, 1.85, 2.03 deg). The
+*denominator* collapses: 150 samples is 15 s and the held-out S-175 has `tn_s = 14.5`, so at that
+lead the hull has returned almost exactly one roll period and persistence is nearly free — its roll
+RMSE *falls* from 3.91 deg at 5 s to 1.68 deg at 15 s. AR's coefficients encode the frigate's 12 s
+roll mode and extrapolate at the wrong period. Realization bootstrap CI [-0.639, -0.265] for roll
+and [-0.782, -0.329] for roll_rate: transfer failure, not resampling noise.
+
+This is P3-D5 biting in the regime the project most cares about. **Report normalised RMSE for
+`unseen_vessel` specifically**, not merely across horizons — skill alone would attribute a
+denominator artefact to the model.
+
+### P3-D8 — The shuffle control's null is the window mean, not zero skill
+
+`docs/IMPLEMENTATION_PLAN.md` §5.2 states the null as "skill collapses to ~0". That is wrong for
+this task. A least-squares fit on time-shuffled targets degenerates to the conditional mean of the
+target, which after `invert_norm` is the **window-mean forecast** — and on a narrowband signal the
+window mean *beats* persistence beyond about 2 s (measured on `id`/test: +0.37 skill at 3 s, +0.71
+at 5 s). A "skill must be ~0" test would report leakage on a clean pipeline.
+
+`dmf.eval.controls.shuffle_control` therefore scores the shuffled model against
+`DampedPersistence(tau -> 0+)` and reports `excess = 1 - MSE_subject/MSE_null`, a variance ratio
+rather than a skill difference. Tolerance 2%; measured worst case 0.53% at the pre-revision
+geometry, 0.43% after. `strict=True` is retained — a failed integrity control invalidates the
+headline table, so it stops the run loudly.
+
+### P3-D9 — The untrained control's stated criterion is wrong, and is reported rather than enforced
+
+The plan's criterion is that a random-init model "must score worse than persistence"
+(`skill < 0`). On the real corpus it does not, for the same reason as P3-D8: a small-weight random
+projection of a de-meaned window emits something close to zero, which after `invert_norm` is the
+window-mean forecast, and the window mean beats persistence past ~2 s. Measured untrained DLinear
+on `id`/test: +0.32 skill at 2 s, +0.70 at 5 s.
+
+`untrained_control` is therefore called with `strict=False` and the outcome recorded in
+`results/baselines_controls.csv`. A window-mean null does not rescue it either — the same untrained
+DLinear still removes 17.5% of that null's error at 2 s on roll — because a random linear map of
+the lookback is a bad *filter of genuine past data*, not a null model. The only initialisation
+guaranteed to pass is one that emits the window mean exactly, which passes by construction. The
+literal criterion is kept and its failures reported, rather than tuning the null or the tolerance
+until the control agrees.
+
+### P3-D10 — Deterministic models are exempt from the three-seed rule
+
+CLAUDE.md non-negotiable 5 requires >= 3 seeds for any model-vs-model comparison. Persistence,
+damped persistence and AR(p) have no stochastic component: `tests/test_models.py` asserts AR
+coefficient recovery is **bitwise** identical across seeds. They emit one row each with
+`n_seeds = 1` and `skill_std = NaN`, rendered `n/a`. `dmf.eval.report.build_baselines_table` routes
+deterministic and stochastic rows separately and refuses a stochastic group carrying fewer than
+three seeds. The exemption is for models proven deterministic, not for single-seed comparisons.
+
+### P3-D11 — Normalisation provenance is now asserted at scoring time
+
+`evaluate_models` documented a provenance guarantee it never checked. `dmf.eval.runner` now calls
+`_check_norm_provenance` before reading any window: the statistics must be labelled
+`<regime>/train`, and that regime must equal the dataset's own.
+
+The sharp case is **not** the one initially proposed. `dmf.data.splits` confines every regime's
+development pool to `PRIMARY_VESSEL`, so `id/train` contains no S-175 and pairing `id` statistics
+with `unseen_vessel/test` is a scale *mismatch*, not a leak. The genuine leak is
+`id/train` applied to `unseen_seastate/test` or `unseen_heading/test`: `id/train` spans all four
+sea states and all four headings, **including the SS6 and 90 deg beam realizations those two
+regimes exist to withhold**, so a cross-regime scale is fitted over the very variance the regime
+is testing generalisation to.
+
+The check fails closed: a label that does not parse as `<regime>/train` is refused rather than
+skipped, because a guard that a relabelling can switch off is not a guard. Note what is still *not*
+verified — that `stats.scale` was actually computed from the realizations `fitted_on` names. The
+label is an assertion by the fitter, not a checksum.
+
+### P3-D12 — Gate 3 restated: APPLIED 2026-08-27
+
+The gate's cell is saturated by construction (P3-D1), and no change to the task definition makes
+roll at 3 s hard: roll is the *most* predictable DOF in the corpus, not a representative one. The
+gate is therefore restated, not relaxed — the threshold value 0.8 is unchanged; the cell it is read
+at moves to the horizon the decision is actually taken at and the DOF that actually binds.
+
+**Gate 3, as of this entry:**
+
+> AR(p) must not exceed 0.8 skill vs persistence **at the decision horizon (10 s) on the binding
+> DOF (pitch)** in the `id` regime.
+
+Measured: **0.545 (`ideal`) / 0.513 (`imu`) — passes.**
+
+Justification for each of the two moves, both measured in P3-D3 and P3-D4:
+
+- **3 s -> 10 s.** 3 s is a quarter of the 12 s roll period; a linear predictor extrapolating a
+  narrowband oscillation a quarter period ahead is not being tested. 10 s is where four of six
+  channels fall below 0.8 skill, and it is the lead time a full-scale rotorcraft's commit-to-land
+  decision needs. 15 s was rejected as the gate cell because pitch is saturated there (normalised
+  RMSE 0.985), so it measures an impossible task rather than a hard one.
+- **roll -> pitch.** Roll is lightly damped resonance (`Tn = 12 s`, `zeta = 0.06`), the most
+  narrowband channel in the corpus. Pitch is stiffer and more damped, hence broader-band: normalised
+  RMSE 0.50 at 5 s where roll is 0.20. Gating on the easiest channel measures the corpus, not the
+  model.
+
+The original criterion is preserved verbatim in the *Gate 3 outcome* section above and is recorded
+there as **failed**; this entry does not retroactively make it pass. Recorded per CLAUDE.md §Gates,
+which requires a gate change to be explicit rather than absorbed.
+
+**Phase 4 is unblocked by this entry.**
+
+### P3-D13 — `dlinear_mc` added, then removed; replaced by `ar_attitude_only`
+
+`src/dmf/models/dlinear_mc.py` was added outside the plan's four baseline families to separate
+"DLinear loses to AR because it sees fewer channels" from "DLinear loses because it is a worse
+architecture": canonical DLinear is channel-independent and sees only the target channels, while
+AR(p) sees all six.
+
+The intent was sound; the instrument was not. At the revised geometry (P3-D4) its output layer
+scales with both `H` (50 -> 150) and `C_out` (3 -> 6), giving DLinear **60 300**, AR(20)
+**108 900**, AR(40) **216 900**, DLinear-MC **2 161 800**. A 36x capacity gap does not isolate the
+information set, it confounds it with capacity — which is precisely the confound the control was
+built to remove.
+
+**Removed.** The same question is answered instead by `configs/model/ar_attitude_only.yaml`: AR(20)
+fitted on the three attitude channels only, against the existing six-channel `ar20`. Same
+architecture, same solver, same fit procedure — the only difference is the input information set,
+so the comparison is clean. It costs no extra pass over the training split: `lag_features` is
+lag-major with channels within each lag, so the three-channel design is a column subset of the
+six-channel one and its moments slice out of the cached six-channel accumulation, the same trick
+that already lets one pass at `p = 40` fit every order.
+
+Side effect worth recording: DLinear is now the only SGD-fitted model in `e01_baselines`, which
+halves the full sweep — 12 SGD runs (1 model x 3 seeds x 4 regimes) instead of 24.
+
+**Measured on `id` (closed-form slice, 1 465 776 training windows).** Dropping the three rate
+channels costs 0.002-0.09 skill: largest on `heave` at 10 s (0.086) and `pitch_rate` at 5 s
+(0.049), smallest on `roll` at every horizon (<= 0.031). So the rate channels carry real
+information, concentrated in heave and in the rate targets themselves, and almost none in roll —
+consistent with roll being the most narrowband channel and therefore the most self-predictable.
+
+A free second reading fell out of it. `ar_attitude_only` (20 lags x 3 channels) lands on exactly
+`ar10`'s parameter count (10 lags x 6 channels) — 54 900 either way — giving a budget-matched pair
+that was not designed for. `ar_attitude_only` loses to `ar10` on every DOF and horizon: **at fixed
+capacity the rate channels buy more than the extra lags do.**
+
+### P3-D16 — AR normal equations are severely ill-conditioned; forecasts are usable, coefficients are not
+
+Measured on `id`/train: `cond(R)` for `ar20` is **1.45e19**, and 2.45e18 for `ar_attitude_only`.
+Both are past float64 resolution for an unregularised solve — `ridge = 1e-6` on the whitened
+correlation matrix is what makes the Cholesky succeed at all, and the coefficients it returns are
+substantially determined by that regularisation rather than by the data alone.
+
+This is expected for a 240-feature design built from 200 samples of a narrowband, heavily
+oversampled signal: adjacent lags are nearly collinear. It does not invalidate the forecasts —
+those are measured directly on held-out realizations and are what every table in this project
+reports — but it does mean **AR coefficient values must not be read structurally**. No claim of the
+form "the model learned the roll period" or "lag k dominates" is supportable from these
+coefficients. Recorded because the temptation to interpret a linear model's weights is exactly
+where this would go wrong.
+
+### P3-D14 — `src/dmf/data/channels.py` added
+
+The `ideal` <-> `imu` channel correspondence was private to `dmf/data/dataset.py`, which imports
+torch. `dmf/eval/report.py` needs it to resolve the gate cell's DOF across observation modes and is
+a pandas-only rendering layer. Re-deriving the mapping there would have put the same fact in two
+places — the failure mode that broke the test suite at this revision (below). `channels.py` is
+torch-free, derives from `dmf.sim.imu.IDEAL_COLUMNS`/`IMU_COLUMNS`, and is now the single
+definition; `dataset.py` imports it and its private copy is deleted.
+
+The gate DOF is resolved by explicit alias pairing, never by an `endswith("_imu")` rule:
+`roll_rate_imu` is the near-miss that a substring rule would mis-resolve to roll, and a test
+asserts it does not.
+
+### P3-D15 — Test suite no longer mirrors the production geometry
+
+`tests/test_models.py` and `tests/test_windows.py` hand-mirrored the task geometry as module
+constants — one comment read "mirrored from `configs/data/default.yaml`". The P3-D4 revision
+silently broke 14 tests, which is the duplication failing exactly as designed to.
+
+Both modules now derive from the config (`PRODUCTION_CFG = load_data(...)`,
+`PRODUCTION_SPEC = window_spec_from_config(...)`, `N_IN`/`N_OUT` from its channel lists), and
+`PRODUCTION_SAMPLES` derives from `configs/sim/corpus.yaml` rather than the literal 6000. Tests
+whose subject is a *fixed* arithmetic invariant declare their own local spec (`ARITHMETIC_SPEC`,
+`SYNTH_C_IN`/`SYNTH_C_OUT`) so they stay pinned and are immune to future task changes.
+
+One consequence worth recording: `C_out < C_in` was load-bearing in the DLinear
+channel-independence tests, which perturb `x[:, :, N_OUT:]`. Since P3-D4 makes
+`target_dofs == input_channels`, that became an empty slice — one test silently vacuous, the other
+silently failing. Both now run against an explicit proper-prefix geometry.
+
+### Gate 3 evidence
+
+| Criterion | Where | Evidence |
+|---|---|---|
+| `results/baselines.csv` exists with skill vs persistence for every baseline / horizon / DOF / regime | `dmf.train.experiment.run_experiment` | Closed-form subset measured on `id` in both observation modes; **the full 7-model x 4-regime sweep has not been run** |
+| Gate cell read and acted on | P3-D1 .. P3-D4 | AR(20) 0.9987 (`ideal`) / 0.9958 (`imu`) at 3 s roll `id`, against a 0.8 threshold; task revised (P3-D4); gate restated and applied in P3-D12, measured 0.545 / 0.513 against 0.8 |
+| Result not attributable to leakage | `baselines_controls.csv`, P3-D1 | Shuffle control: 36/36 rows pass in both modes, `|excess| <= 0.0043` against a 2% tolerance |
+| Persistence denominator correct | P3-D6 | Re-measured on 434 304 windows, verified two independent ways, all six DOFs pinned in tests |
+| Underperforming cells reported, not dropped | P3-D7 | 12 of 144 cells negative, pinned as an exact set that fails on both a new loss and a silent repair |
+| Normalisation provenance | P3-D11 | Asserted at scoring time, fails closed |

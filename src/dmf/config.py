@@ -21,6 +21,7 @@ __all__ = [
     "TrainConfig",
     "load_data",
     "load_experiment",
+    "load_model",
     "load_sim",
     "load_yaml",
 ]
@@ -29,6 +30,11 @@ __all__ = [
 #: ``ideal`` exposes clean roll/pitch/heave; ``imu`` exposes noisy attitude plus heave
 #: reconstructed from vertical acceleration through a high-pass filter.
 ObservationMode = Literal["ideal", "imu"]
+
+#: The four evaluation regimes, duplicated here rather than imported from
+#: :mod:`dmf.data.splits` so that ``dmf.config`` keeps no dependency on the data layer.
+#: ``tests/test_models.py`` asserts the two lists agree.
+_REGIME_NAMES: tuple[str, ...] = ("id", "unseen_seastate", "unseen_heading", "unseen_vessel")
 
 
 @dataclass(frozen=True)
@@ -149,12 +155,18 @@ class ModelConfig:
             Ignored for other head types.
         params: Architecture keyword arguments passed to the model constructor. Units are
             model-specific and documented on each model class.
+        label: Results-table identifier, unique within an experiment. Defaults to ``name``
+            at load time. It exists because ``name`` is the *registry* key and three AR
+            configs legitimately share ``name: ar`` while differing only in ``order``; a
+            CSV keyed on ``name`` would silently collapse ar10, ar20 and ar40 into one row
+            and report whichever was written last.
     """
 
     name: str
     head: Literal["point", "quantile", "gaussian"]
     quantiles: tuple[float, ...]
     params: dict[str, Any]
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,7 +203,10 @@ class ExperimentConfig:
     Attributes:
         name: Experiment identifier, used as the results subdirectory name.
         data: Windowing and observation settings.
-        model: Model and head settings.
+        models: Every model the experiment scores, in table order. One experiment produces
+            **one** table over all of them: they share a data pipeline, a normalisation, a
+            horizon definition and an early-stopping rule, and scoring them in separate
+            runs is how those silently drift apart.
         train: Optimisation settings.
         seeds: Training seeds. Must contain at least three entries: any model-vs-model
             comparison is reported as mean +/- std over these seeds.
@@ -201,7 +216,7 @@ class ExperimentConfig:
 
     name: str
     data: DataConfig
-    model: ModelConfig
+    models: tuple[ModelConfig, ...]
     train: TrainConfig
     seeds: tuple[int, ...]
     regimes: tuple[str, ...]
@@ -407,11 +422,63 @@ def load_data(path: Path) -> DataConfig:
     )
 
 
+def load_model(path: Path) -> ModelConfig:
+    """Load a model config into a :class:`ModelConfig`.
+
+    Args:
+        path: Path to a file under ``configs/model/``.
+
+    Returns:
+        The model configuration. ``label`` defaults to ``name`` when absent.
+
+    Raises:
+        FileNotFoundError: If ``path`` does not exist.
+        ValueError: If a required key is missing, if ``head`` is not one of ``point``,
+            ``quantile`` or ``gaussian``, if ``params`` is not a mapping, or if a
+            ``quantile`` head carries quantile levels that are not strictly ascending
+            inside ``(0, 1)``.
+    """
+    raw = load_yaml(path)
+    missing = {"name", "head", "quantiles", "params"} - set(raw)
+    if missing:
+        raise ValueError(f"{path}: missing required keys {sorted(missing)}")
+
+    head = str(raw["head"])
+    if head not in ("point", "quantile", "gaussian"):
+        raise ValueError(f"{path}: 'head' must be point, quantile or gaussian, got {head!r}")
+    quantiles = tuple(float(q) for q in (raw["quantiles"] or ()))
+    if head == "quantile":
+        if not quantiles:
+            raise ValueError(f"{path}: a quantile head needs at least one quantile level")
+        if any(not 0.0 < q < 1.0 for q in quantiles):
+            raise ValueError(f"{path}: quantile levels must lie in (0, 1), got {list(quantiles)}")
+        if any(b <= a for a, b in zip(quantiles, quantiles[1:], strict=False)):
+            raise ValueError(f"{path}: quantile levels must be ascending, got {list(quantiles)}")
+
+    params_raw = raw["params"] or {}
+    if not isinstance(params_raw, dict):
+        raise ValueError(f"{path}: 'params' must be a mapping, got {type(params_raw).__name__}")
+
+    name = str(raw["name"])
+    head_typed: Literal["point", "quantile", "gaussian"] = (
+        "quantile" if head == "quantile" else "gaussian" if head == "gaussian" else "point"
+    )
+    return ModelConfig(
+        name=name,
+        head=head_typed,
+        quantiles=quantiles,
+        params={str(k): v for k, v in params_raw.items()},
+        label=str(raw.get("label") or name),
+    )
+
+
 def load_experiment(path: Path) -> ExperimentConfig:
     """Load an experiment YAML into a fully populated :class:`ExperimentConfig`.
 
-    Resolves any ``data:``, ``model:`` and ``train:`` entries that are given as paths to
-    other config files, so that experiment files stay small.
+    Resolves the ``data:``, ``models:`` and ``train:`` entries. ``data`` and each entry of
+    ``models`` may be given either inline or as a path to another config file, resolved
+    relative to ``path``'s directory, so that experiment files stay small and the model
+    definitions stay in one place.
 
     Args:
         path: Path to a file under ``configs/experiment/``.
@@ -420,7 +487,116 @@ def load_experiment(path: Path) -> ExperimentConfig:
         The assembled experiment configuration.
 
     Raises:
-        ValueError: If fewer than three training seeds are specified, or if a referenced
-            sub-config cannot be resolved.
+        FileNotFoundError: If ``path`` or a referenced sub-config does not exist.
+        ValueError: If a required key is missing, if fewer than three training seeds are
+            specified, if ``models`` is empty or carries duplicate labels, or if a regime
+            is not one of the four defined ones.
     """
-    raise NotImplementedError
+    raw = load_yaml(path)
+    missing = {"name", "data", "models", "train", "seeds", "regimes"} - set(raw)
+    if missing:
+        raise ValueError(f"{path}: missing required keys {sorted(missing)}")
+
+    data_entry = raw["data"]
+    if isinstance(data_entry, str):
+        data = load_data(path.parent / data_entry)
+    elif isinstance(data_entry, dict):
+        raise ValueError(
+            f"{path}: 'data' must be a path to a file under configs/data/, not an inline "
+            f"mapping; one task definition shared by every experiment is what keeps the "
+            f"horizon and channel set comparable across them"
+        )
+    else:
+        raise ValueError(f"{path}: 'data' must be a path to a config file")
+
+    models_raw = raw["models"]
+    if not isinstance(models_raw, list) or not models_raw:
+        raise ValueError(f"{path}: 'models' must be a non-empty list")
+    models: list[ModelConfig] = []
+    for entry in models_raw:
+        if isinstance(entry, str):
+            models.append(load_model(path.parent / entry))
+        elif isinstance(entry, dict):
+            models.append(
+                ModelConfig(
+                    name=str(entry["name"]),
+                    head=entry.get("head", "point"),
+                    quantiles=tuple(float(q) for q in (entry.get("quantiles") or ())),
+                    params={str(k): v for k, v in (entry.get("params") or {}).items()},
+                    label=str(entry.get("label") or entry["name"]),
+                )
+            )
+        else:
+            raise ValueError(f"{path}: each 'models' entry must be a path or a mapping")
+    labels = [m.label for m in models]
+    duplicates = sorted({label for label in labels if labels.count(label) > 1})
+    if duplicates:
+        raise ValueError(
+            f"{path}: duplicate model labels {duplicates}; each row of the results table "
+            f"is keyed on the label, so duplicates silently overwrite one another"
+        )
+
+    train_entry = raw["train"]
+    if not isinstance(train_entry, dict):
+        raise ValueError(f"{path}: 'train' must be an inline mapping")
+    train_missing = {
+        "epochs",
+        "batch_size",
+        "lr",
+        "weight_decay",
+        "warmup_frac",
+        "grad_clip",
+        "patience",
+        "amp_dtype",
+        "num_workers",
+    } - set(train_entry)
+    if train_missing:
+        raise ValueError(f"{path}: 'train' is missing keys {sorted(train_missing)}")
+    amp = str(train_entry["amp_dtype"])
+    if amp not in ("bf16", "fp16", "off"):
+        raise ValueError(f"{path}: 'amp_dtype' must be bf16, fp16 or off, got {amp!r}")
+    amp_typed: Literal["bf16", "fp16", "off"] = (
+        "bf16" if amp == "bf16" else "fp16" if amp == "fp16" else "off"
+    )
+    train = TrainConfig(
+        epochs=int(train_entry["epochs"]),
+        batch_size=int(train_entry["batch_size"]),
+        lr=float(train_entry["lr"]),
+        weight_decay=float(train_entry["weight_decay"]),
+        warmup_frac=float(train_entry["warmup_frac"]),
+        grad_clip=float(train_entry["grad_clip"]),
+        patience=int(train_entry["patience"]),
+        amp_dtype=amp_typed,
+        num_workers=int(train_entry["num_workers"]),
+    )
+    if train.epochs < 1 or train.batch_size < 1:
+        raise ValueError(f"{path}: 'epochs' and 'batch_size' must be positive")
+    if not 0.0 <= train.warmup_frac < 1.0:
+        raise ValueError(f"{path}: 'warmup_frac' must lie in [0, 1), got {train.warmup_frac}")
+
+    seeds = tuple(int(s) for s in raw["seeds"])
+    if len(seeds) < 3:
+        raise ValueError(
+            f"{path}: at least three training seeds are required, got {list(seeds)}. Every "
+            f"model-vs-model comparison in this project is reported as mean +/- std over "
+            f"seeds; a single-seed comparison between models this small measures "
+            f"initialisation noise (CLAUDE.md non-negotiable 5)."
+        )
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"{path}: 'seeds' contains duplicates: {list(seeds)}")
+
+    regimes = tuple(str(r) for r in raw["regimes"])
+    if not regimes:
+        raise ValueError(f"{path}: 'regimes' must be non-empty")
+    unknown = [r for r in regimes if r not in _REGIME_NAMES]
+    if unknown:
+        raise ValueError(f"{path}: unknown regime(s) {unknown}; expected {list(_REGIME_NAMES)}")
+
+    return ExperimentConfig(
+        name=str(raw["name"]),
+        data=data,
+        models=tuple(models),
+        train=train,
+        seeds=seeds,
+        regimes=regimes,
+    )

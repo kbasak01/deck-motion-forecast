@@ -1,0 +1,12 @@
+# Damped persistence -- decay from the last sample toward the window mean.
+#
+# `tau` is fitted per target channel on the training split by
+# dmf.train.closed_form.fit_damped_persistence, in **samples**, so nothing is set here.
+# Included so the comparison cannot be called a straw man: on a narrowband, mean-reverting
+# signal, decaying toward the window mean is a strong zero-hyperparameter forecast, and it
+# is the baseline Gate 4 requires the deep models to beat.
+name: damped_persistence
+label: damped_persistence
+head: point
+quantiles: []
+params: {}

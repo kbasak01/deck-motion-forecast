@@ -1,0 +1,32 @@
+# Task definition for the supervised forecasting problem -- `imu` observation mode.
+#
+# Identical to `default.yaml` except `observation_mode`. Keeping the pair in lockstep is
+# what makes the Phase 6.3 observability ablation a controlled comparison; if you change a
+# horizon, a channel or the lookback here, change it there too.
+#
+# `observation_mode: imu` remaps `input_channels` AND `target_dofs` together onto their
+# `*_imu` twins via dmf.data.dataset.resolve_columns. The corpus already carries both modes'
+# columns in every Parquet file, so this needs no regeneration.
+#
+# P1-D6 is the rule that must not be broken: forecast `imu` channels against `imu` targets,
+# as a shipboard system would, and never mix an `imu` input with an `ideal` target. The
+# reconstructed `heave_imu` channel leads the truth by about 1.3 s at the SS5 spectral peak
+# (two causal high-pass stages, positive phase response, no leakage), so a mixed task would
+# roughly halve persistence RMSE at 1 s and silently change the denominator of every skill
+# score in the project.
+#
+# Consequence for any comparison: the persistence denominators here are NOT the `ideal`
+# denominators pinned in docs/protocol.md P2-D9. Skill is measured against persistence on
+# the same observation mode, so `ideal` and `imu` skill scores are each internally valid but
+# are not the same yardstick. Measured: switching to `imu` moved AR(20) roll skill at 3 s on
+# `id` only from 0.9987 to 0.9958, because the IMU model's dominant effect on heave is a
+# deterministic phase shift that a linear model absorbs for free, and its attitude white
+# noise sits ~45 dB below the roll signal (docs/protocol.md P3).
+fs_hz: 10.0
+lookback: 200                      # 20 s at 10 Hz
+horizons: [10, 20, 30, 50, 100, 150]   # 1, 2, 3, 5, 10, 15 s
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: imu              # never mix an imu input with an ideal target (P1-D6)
+revin: false

@@ -30,6 +30,7 @@ __all__ = [
     "fit_norm_stats",
     "invert_norm",
     "is_train_partition",
+    "normalize_target",
 ]
 
 
@@ -283,6 +284,45 @@ def invert_norm(y: Tensor, stats: NormStats, window_mean: Tensor) -> Tensor:
     if y.ndim == 4:
         return y * scale[:, None] + mean[..., None]
     return y * scale + mean
+
+
+def normalize_target(y: Tensor, stats: NormStats, window_mean: Tensor) -> Tensor:
+    """Map a target from corpus units into the model's dimensionless space.
+
+    The exact inverse of :func:`invert_norm`: ``(y - window_mean) / scale``. It exists
+    because :class:`dmf.data.dataset.DeckMotionDataset` yields ``y`` in corpus units while
+    every loss and every closed-form normal equation is written in normalised space. Doing
+    the conversion in one shared function -- rather than inline at each of the four call
+    sites -- is what keeps the forward and inverse transforms from drifting apart, which is
+    a bug that shows up only as a slightly worse number.
+
+    Args:
+        y: Targets, shape ``(B, H, C)``, in corpus units (degrees for roll and pitch,
+            metres for heave).
+        stats: The statistics used in the forward direction, over the target channels.
+        window_mean: Per-window means, shape ``(B, 1, C)``, in corpus units.
+
+    Returns:
+        Targets, shape ``(B, H, C)``, dimensionless.
+
+    Raises:
+        ValueError: If the shapes of ``y``, ``stats`` and ``window_mean`` are inconsistent.
+    """
+    if y.ndim != 3:
+        raise ValueError(f"y must have shape (B, H, C), got {tuple(y.shape)}")
+    n_channels = len(stats.channels)
+    if y.shape[2] != n_channels:
+        raise ValueError(
+            f"y has {y.shape[2]} channels but stats cover {n_channels}: {list(stats.channels)}"
+        )
+    if window_mean.ndim != 3 or window_mean.shape[1] != 1:
+        raise ValueError(f"window_mean must have shape (B, 1, C), got {tuple(window_mean.shape)}")
+    if window_mean.shape[0] != y.shape[0] or window_mean.shape[2] != n_channels:
+        raise ValueError(
+            f"window_mean {tuple(window_mean.shape)} is inconsistent with y "
+            f"{tuple(y.shape)} and {n_channels} channels"
+        )
+    return (y - window_mean.to(dtype=y.dtype)) / _scale_tensor(stats, y)
 
 
 class RevIN(nn.Module):

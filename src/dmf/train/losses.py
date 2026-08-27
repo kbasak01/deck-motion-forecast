@@ -5,6 +5,7 @@ other way round -- always computed in corpus units, so that an RMSE can be compa
 against an operational threshold in degrees or metres.
 """
 
+import torch
 from torch import Tensor
 
 __all__ = ["gaussian_nll_loss", "mae_loss", "mse_loss", "pinball_loss"]
@@ -23,7 +24,11 @@ def mse_loss(pred: Tensor, target: Tensor) -> Tensor:
     Raises:
         ValueError: If ``pred`` and ``target`` differ in shape.
     """
-    raise NotImplementedError
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"pred {tuple(pred.shape)} and target {tuple(target.shape)} must have the same shape"
+        )
+    return torch.mean(torch.square(pred - target))
 
 
 def mae_loss(pred: Tensor, target: Tensor) -> Tensor:

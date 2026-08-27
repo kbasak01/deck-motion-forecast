@@ -15,22 +15,18 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from dmf.config import DataConfig, ObservationMode
+from dmf.data.channels import IMU_BY_IDEAL
 from dmf.data.normalize import NormStats, build_norm_stats
 from dmf.data.splits import RealizationKey, Split
 from dmf.data.windows import WindowSpec, n_windows, window_start_indices
 from dmf.sim.generate import RealizationSpec, realization_path
-from dmf.sim.imu import IDEAL_COLUMNS, IMU_COLUMNS
+from dmf.sim.imu import IDEAL_COLUMNS
 from dmf.typedefs import FloatArray
 
 __all__ = ["DeckMotionDataset", "PARTITIONS", "make_dataloader", "resolve_columns"]
 
 #: Valid partition names. ``val`` and ``test`` always require training statistics.
 PARTITIONS: tuple[str, ...] = ("train", "val", "test")
-
-#: Logical channel name -> ``imu`` corpus column, for the six channels that have a noisy
-#: twin. ``heave_acc`` is deliberately absent: it is the raw accelerometer channel and is
-#: shared by both observation modes (``dmf.sim.imu``).
-_IMU_BY_IDEAL: dict[str, str] = dict(zip(IDEAL_COLUMNS[:6], IMU_COLUMNS, strict=True))
 
 
 def resolve_columns(names: tuple[str, ...], mode: ObservationMode) -> tuple[str, ...]:
@@ -62,7 +58,7 @@ def resolve_columns(names: tuple[str, ...], mode: ObservationMode) -> tuple[str,
         raise ValueError(f"unknown channel(s) {unknown}; corpus channels are {list(IDEAL_COLUMNS)}")
     if mode == "ideal":
         return tuple(names)
-    return tuple(_IMU_BY_IDEAL.get(n, n) for n in names)
+    return tuple(IMU_BY_IDEAL.get(n, n) for n in names)
 
 
 def _key_to_path(key: RealizationKey) -> Path:
@@ -286,6 +282,23 @@ class DeckMotionDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     def norm_stats(self) -> NormStats:
         """Normalisation statistics in use, for propagation to val and test sets."""
         return self._stats
+
+    @property
+    def partition(self) -> str:
+        """Which partition this dataset holds: ``"train"``, ``"val"`` or ``"test"``.
+
+        Exposed so that a fitter can refuse anything but training data. ``norm_stats``
+        already carries a ``fitted_on`` label, but that proves only that the *statistics*
+        are train-only -- it says nothing about the windows the caller is about to fit
+        coefficients on, and a val or test dataset built with train statistics carries a
+        perfectly valid label. The two guards check different things and both are needed.
+        """
+        return self._partition
+
+    @property
+    def regime(self) -> str:
+        """The evaluation regime this partition was cut from, e.g. ``"id"``."""
+        return self._regime
 
     @property
     def realization_keys(self) -> tuple[RealizationKey, ...]:

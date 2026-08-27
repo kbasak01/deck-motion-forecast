@@ -13,6 +13,13 @@ Also covered here:
 - Windows never span a realization boundary.
 - The window-count arithmetic, asserted rather than restated in a comment:
   ``n_windows(6000, WindowSpec(200, (10, 20, 30, 50), 5)) == 1151`` with last start 5750.
+  That spec is declared **locally**, in :data:`ARITHMETIC_SPEC`, and is deliberately not the
+  shipped task: the identity under test is ``(n - total) // stride + 1``, which must keep
+  being checked on a geometry whose answer is known by hand no matter how the task
+  definition moves. Everything that means *the task as currently configured* instead reads
+  ``configs/data/default.yaml`` through :data:`PRODUCTION_SPEC`. Mirroring the task geometry
+  into module constants is what let the Gate 3 revision of ``horizons`` and ``target_dofs``
+  break this file silently (``docs/protocol.md`` P3).
 
 Deferred to Phase 4, per the plan: the **TCN receptive field** check
 (``receptive_field(3, (1, 2, 4, 8, 16, 32)) == 253 >= lookback``), which needs
@@ -29,8 +36,8 @@ import pandas as pd
 import pytest
 import torch
 
-from conftest import SMALL_N_SAMPLES
-from dmf.config import DataConfig
+from conftest import CORPUS_CONFIG_PATH, DATA_CONFIG_PATH, SMALL_N_SAMPLES
+from dmf.config import DataConfig, load_data, load_sim
 from dmf.data.dataset import DeckMotionDataset, make_dataloader, resolve_columns
 from dmf.data.splits import Regime, build_split
 from dmf.data.windows import (
@@ -42,11 +49,27 @@ from dmf.data.windows import (
 )
 from dmf.eval.controls import persistence_pipeline_sanity
 
-#: The production geometry: 20 s lookback at 10 Hz, horizons 1/2/3/5 s, 0.5 s stride.
-PRODUCTION_SPEC = WindowSpec(lookback=200, horizons=(10, 20, 30, 50), stride=5)
+#: The current task definition, read from ``configs/data/default.yaml`` rather than restated
+#: here. A test that means "the shipped task" must load the shipped task.
+PRODUCTION_CFG = load_data(DATA_CONFIG_PATH)
 
-#: Realization length of the production corpus, samples (600 s at 10 Hz).
-PRODUCTION_SAMPLES = 6000
+#: The production window geometry, derived from :data:`PRODUCTION_CFG`.
+PRODUCTION_SPEC = window_spec_from_config(PRODUCTION_CFG)
+
+#: Realization length of the production corpus, samples, derived from
+#: ``configs/sim/corpus.yaml`` the same way the generator derives it (``duration_s * fs_hz``;
+#: the spin-up is discarded before writing). 600 s at 10 Hz = 6000 rows, which the manifest's
+#: ``n_rows`` column confirms.
+CORPUS_CFG = load_sim(CORPUS_CONFIG_PATH)
+PRODUCTION_SAMPLES = int(round(CORPUS_CFG.duration_s * CORPUS_CFG.fs_hz))
+
+#: A fixed geometry with a hand-checkable window count, independent of the task definition.
+#: ``(6000 - 250) // 5 + 1 = 1151``, last start 5750. This was the production geometry before
+#: the Gate 3 revision; it is kept as a pinned arithmetic case, not as a mirror of the task.
+ARITHMETIC_SPEC = WindowSpec(lookback=200, horizons=(10, 20, 30, 50), stride=5)
+
+#: Record length used with :data:`ARITHMETIC_SPEC`, samples.
+ARITHMETIC_SAMPLES = 6000
 
 
 # ---------------------------------------------------------------------------
@@ -54,29 +77,62 @@ PRODUCTION_SAMPLES = 6000
 # ---------------------------------------------------------------------------
 
 
-def test_window_spec_geometry() -> None:
-    assert PRODUCTION_SPEC.max_horizon == 50
-    assert PRODUCTION_SPEC.total_length == 250
+def test_production_window_spec_tracks_the_task_config() -> None:
+    """The shipped geometry is whatever ``configs/data/default.yaml`` says it is.
+
+    Asserted as a derivation, not as literals: ``total_length`` is the quantity the corpus
+    must be long enough to supply, and it must follow the config's horizons wherever they
+    move.
+    """
+    assert PRODUCTION_SPEC.lookback == PRODUCTION_CFG.lookback
+    assert PRODUCTION_SPEC.horizons == tuple(PRODUCTION_CFG.horizons)
+    assert PRODUCTION_SPEC.stride == PRODUCTION_CFG.stride
+    assert PRODUCTION_SPEC.max_horizon == max(PRODUCTION_CFG.horizons)
+    assert PRODUCTION_SPEC.total_length == PRODUCTION_CFG.lookback + max(PRODUCTION_CFG.horizons)
+    assert PRODUCTION_SPEC.total_length < PRODUCTION_SAMPLES
 
 
-def test_production_window_count_arithmetic() -> None:
-    """(6000 - 250) // 5 + 1 = 1151, last start 5750. Asserted, not commented."""
-    assert n_windows(PRODUCTION_SAMPLES, PRODUCTION_SPEC) == 1151
-    starts = window_start_indices(PRODUCTION_SAMPLES, PRODUCTION_SPEC)
+def test_window_count_arithmetic_on_a_fixed_geometry() -> None:
+    """(6000 - 250) // 5 + 1 = 1151, last start 5750. Asserted, not commented.
+
+    Deliberately pinned to :data:`ARITHMETIC_SPEC` rather than to the shipped task: the
+    invariant is the arithmetic, and a hand-computable case keeps testing it across task
+    revisions.
+    """
+    assert n_windows(ARITHMETIC_SAMPLES, ARITHMETIC_SPEC) == 1151
+    starts = window_start_indices(ARITHMETIC_SAMPLES, ARITHMETIC_SPEC)
     assert starts.shape == (1151,)
     assert starts[0] == 0
     assert starts[-1] == 5750
-    assert int(starts[-1]) + PRODUCTION_SPEC.total_length == PRODUCTION_SAMPLES
-    assert np.all(np.diff(starts) == PRODUCTION_SPEC.stride)
+    assert int(starts[-1]) + ARITHMETIC_SPEC.total_length == ARITHMETIC_SAMPLES
+    assert np.all(np.diff(starts) == ARITHMETIC_SPEC.stride)
+
+
+def test_production_window_count_is_maximal() -> None:
+    """The shipped geometry's own count, tied to the arithmetic rather than to a literal.
+
+    At the Gate 3 geometry this is 1131 windows per 6000-sample realization (down from 1151,
+    because ``max_horizon`` moved from 50 to 150 samples); the assertion is written so that
+    it states the relationship instead of the number.
+    """
+    count = n_windows(PRODUCTION_SAMPLES, PRODUCTION_SPEC)
+    starts = window_start_indices(PRODUCTION_SAMPLES, PRODUCTION_SPEC)
+    assert starts.shape == (count,)
+    assert int(starts[-1]) + PRODUCTION_SPEC.total_length <= PRODUCTION_SAMPLES
+    assert int(starts[-1]) + PRODUCTION_SPEC.stride + PRODUCTION_SPEC.total_length > (
+        PRODUCTION_SAMPLES
+    )
 
 
 @pytest.mark.parametrize("n_samples", [0, 1, 249])
 def test_short_realizations_yield_no_windows(n_samples: int) -> None:
-    assert n_windows(n_samples, PRODUCTION_SPEC) == 0
-    assert window_start_indices(n_samples, PRODUCTION_SPEC).size == 0
+    """One sample short of ``ARITHMETIC_SPEC.total_length`` (250) must yield nothing."""
+    assert n_windows(n_samples, ARITHMETIC_SPEC) == 0
+    assert window_start_indices(n_samples, ARITHMETIC_SPEC).size == 0
 
 
 def test_exactly_one_window_when_the_record_is_exactly_long_enough() -> None:
+    assert n_windows(ARITHMETIC_SPEC.total_length, ARITHMETIC_SPEC) == 1
     assert n_windows(PRODUCTION_SPEC.total_length, PRODUCTION_SPEC) == 1
 
 
@@ -387,11 +443,9 @@ def test_real_corpus_window_matches_the_raw_parquet_slice(
     real_corpus: Path, real_manifest: pd.DataFrame
 ) -> None:
     """Criterion 3 at the production geometry, on the real corpus."""
-    from dmf.config import load_data
-
-    cfg = load_data(Path(__file__).resolve().parents[1] / "configs" / "data" / "default.yaml")
+    cfg = PRODUCTION_CFG
     split = build_split(real_manifest, "id")
-    spec = window_spec_from_config(cfg)
+    spec = PRODUCTION_SPEC
     # A small, fixed subset of the test partition: reading 384 files is not needed to
     # detect an off-by-one, and the split itself is checked in full in test_splits.py.
     subset = type(split)(
@@ -402,7 +456,8 @@ def test_real_corpus_window_matches_the_raw_parquet_slice(
     )
     train = DeckMotionDataset(real_corpus, subset, "train", cfg, spec)
     dataset = DeckMotionDataset(real_corpus, subset, "test", cfg, spec, stats=train.norm_stats)
-    assert dataset.windows_per_realization == 1151
+    # Tied to the arithmetic, not to a literal: 1131 at the Gate 3 geometry, 1151 before it.
+    assert dataset.windows_per_realization == n_windows(PRODUCTION_SAMPLES, PRODUCTION_SPEC)
 
     target_cols = list(dataset.target_columns)
     for index in np.linspace(0, len(dataset) - 1, 12, dtype=int).tolist():
@@ -423,11 +478,9 @@ def test_real_corpus_persistence_pipeline_sanity(
     real_corpus: Path, real_manifest: pd.DataFrame
 ) -> None:
     """Criterion 5 on the real corpus, at the production geometry."""
-    from dmf.config import load_data
-
-    cfg = load_data(Path(__file__).resolve().parents[1] / "configs" / "data" / "default.yaml")
+    cfg = PRODUCTION_CFG
     split = build_split(real_manifest, "id")
-    spec = window_spec_from_config(cfg)
+    spec = PRODUCTION_SPEC
     subset = type(split)(
         regime=split.regime,
         train_keys=frozenset(sorted(split.train_keys)[:8]),
@@ -437,5 +490,5 @@ def test_real_corpus_persistence_pipeline_sanity(
     train = DeckMotionDataset(real_corpus, subset, "train", cfg, spec)
     dataset = DeckMotionDataset(real_corpus, subset, "test", cfg, spec, stats=train.norm_stats)
     result = persistence_pipeline_sanity(dataset, real_corpus)
-    assert result.n_windows == 8 * 1151
+    assert result.n_windows == 8 * n_windows(PRODUCTION_SAMPLES, PRODUCTION_SPEC)
     assert result.max_rel_diff < 1e-6

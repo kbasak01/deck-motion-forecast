@@ -1,0 +1,678 @@
+"""The experiment driver: one config in, one results table out.
+
+``scripts/`` holds argparse wrappers only, so the orchestration lives here where it is
+importable and testable.
+
+Per regime, exactly once:
+
+1. :func:`dmf.data.splits.build_split` -- realization-level, no RNG.
+2. Build the ``train`` dataset, which fits the normalisation statistics; build ``val`` and
+   ``test`` **with those statistics**, never their own.
+3. One pass of :func:`dmf.train.closed_form.accumulate_training_moments` at ``P_MAX``,
+   serving damped persistence and every AR variant -- all three orders, and the
+   attitude-only information set, which is a channel-subset slice of the same moments.
+4. One :func:`dmf.train.loop.fit` per (SGD model, seed).
+5. One :func:`dmf.eval.runner.evaluate_models` pass scoring **every** model on identical
+   windows, so the skill denominator is structurally the same for all of them.
+
+Models are dispatched on :attr:`dmf.models.base.BaseForecaster.FIT_KIND`, not on their
+class, so a Phase 4 architecture joins the run by declaring ``FIT_KIND = "sgd"`` and adding
+a config -- this module does not change.
+
+Units: horizons and lookbacks in samples, ``fs_hz`` in hertz, wall-clock times in seconds,
+errors in corpus units (degrees for roll and pitch, metres for heave).
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+import torch
+
+from dmf.config import ExperimentConfig, ModelConfig
+from dmf.data.dataset import DeckMotionDataset, make_dataloader
+from dmf.data.splits import Regime, build_split, load_manifest
+from dmf.data.windows import WindowSpec, window_spec_from_config
+from dmf.eval.controls import (
+    ControlResult,
+    controls_table,
+    persistence_pipeline_sanity,
+    shuffle_control,
+    untrained_control,
+)
+from dmf.eval.report import build_baselines_markdown, build_baselines_table, write_table
+from dmf.eval.runner import evaluate_models, marginalize_cells, per_cell_metrics
+from dmf.models.base import BaseForecaster
+from dmf.models.persistence import TAU_WINDOW_MEAN, DampedPersistence
+from dmf.train.closed_form import (
+    TrainingMoments,
+    accumulate_training_moments,
+    fit_ar,
+    fit_damped_persistence,
+)
+from dmf.train.loop import fit, set_seed
+from dmf.train.registry import MODEL_REGISTRY, build_model
+
+__all__ = ["PERSISTENCE_LABEL", "RunRecord", "run_experiment"]
+
+#: Label of the reference model. Every skill score's denominator comes from this model's
+#: accumulator, so the experiment refuses to run without it in the config.
+PERSISTENCE_LABEL = "persistence"
+
+#: Separator in the per-run key ``"<label>@<seed>"`` that every model of a regime is scored
+#: under, so that three seeds of one model stay three entries in the scoring pass rather
+#: than one overwriting the others. Labels come from the config and never contain it, so
+#: :func:`_split_run_keys` can invert the join for the committed tables.
+RUN_KEY_SEP = "@"
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """One fitted model instance, ready to be scored.
+
+    Attributes:
+        label: Results-table label, e.g. ``"ar20"``.
+        seed: Training seed, or 0 for a deterministic model (where the seed cannot enter).
+        model: The fitted model, in eval mode.
+        deterministic: True if the fit is seed-independent, so the row is exempt from the
+            three-seed rule and carries ``skill_std = NaN``.
+        n_params: Fitted value count, from
+            :attr:`dmf.models.base.BaseForecaster.n_fitted_parameters`.
+        fit_time_s: Wall-clock seconds to fit. CPU for closed-form models, device
+            wall-clock **including data loading** for SGD models -- not comparable between
+            the two, and labelled as such in the report.
+    """
+
+    label: str
+    seed: int
+    model: BaseForecaster
+    deterministic: bool
+    n_params: int
+    fit_time_s: float
+
+
+def _instantiate(
+    cfg: ModelConfig, spec: WindowSpec, n_in: int, n_out: int, seed: int
+) -> BaseForecaster:
+    """Build one model, seeding first so that a random initialisation is reproducible.
+
+    Args:
+        cfg: Model configuration.
+        spec: Window geometry.
+        n_in: Input channel count ``C_in``.
+        n_out: Target channel count ``C_out``.
+        seed: Seed applied before construction, so that weight initialisation is part of
+            what the seed controls.
+
+    Returns:
+        The constructed model, on CPU.
+    """
+    set_seed(seed)
+    return build_model(cfg, spec, n_in, n_out)
+
+
+def _fit_one(
+    cfg: ModelConfig,
+    *,
+    spec: WindowSpec,
+    train: DeckMotionDataset,
+    val: DeckMotionDataset,
+    experiment: ExperimentConfig,
+    moments_holder: dict[str, TrainingMoments],
+    device: str,
+    checkpoint_dir: Path,
+) -> list[RunRecord]:
+    """Fit one configured model, dispatching on its declared fit kind.
+
+    Args:
+        cfg: Model configuration.
+        spec: Window geometry.
+        train: Training partition.
+        val: Validation partition, used only for early stopping.
+        experiment: The experiment config, for seeds and optimisation settings.
+        moments_holder: One-element cache so the moments pass happens at most once per
+            regime, and not at all if the regime has no closed-form model.
+        device: Torch device for SGD training.
+        checkpoint_dir: Where best-epoch weights are written.
+
+    Returns:
+        One record per run: a single deterministic record for closed-form and untrained
+        models, one per seed for SGD models.
+
+    Raises:
+        ValueError: If the model declares an unknown fit kind.
+    """
+    n_in = len(train.input_columns)
+    n_out = len(train.target_columns)
+    kind = MODEL_REGISTRY[cfg.name].FIT_KIND
+
+    if kind == "none":
+        model = _instantiate(cfg, spec, n_in, n_out, experiment.seeds[0])
+        model.eval()
+        return [RunRecord(cfg.label, 0, model, True, model.n_fitted_parameters, 0.0)]
+
+    if kind == "closed_form":
+        moments = _moments(moments_holder, train, experiment)
+        common = {
+            "lookback": spec.lookback,
+            "n_input_channels": n_in,
+            "n_target_channels": n_out,
+        }
+        if issubclass(MODEL_REGISTRY[cfg.name], DampedPersistence):
+            model, decay_report = fit_damped_persistence(
+                moments, fs_hz=experiment.data.fs_hz, channels=train.target_columns, **common
+            )
+            return [
+                RunRecord(
+                    cfg.label,
+                    0,
+                    model,
+                    True,
+                    decay_report.n_fitted_parameters,
+                    decay_report.fit_time_s,
+                )
+            ]
+        # `n_input_used` is read here rather than defaulted inside `fit_ar` because
+        # ignoring it would fit the six-channel model and label it `ar_attitude_only`,
+        # which is a silently wrong row rather than a loud failure. Slicing the cached
+        # moments costs one extra solve and no extra pass over the training split.
+        used = cfg.params.get("n_input_used")
+        ar_model, ar_report = fit_ar(
+            moments,
+            order=int(cfg.params["order"]),
+            ridge=float(cfg.params.get("ridge", 0.0)),
+            n_input_used=None if used is None else int(used),
+            **common,
+        )
+        return [
+            RunRecord(
+                cfg.label, 0, ar_model, True, ar_report.n_fitted_parameters, ar_report.fit_time_s
+            )
+        ]
+
+    if kind != "sgd":
+        raise ValueError(f"model {cfg.label!r} declares unknown FIT_KIND {kind!r}")
+
+    records: list[RunRecord] = []
+    train_loader = make_dataloader(
+        train,
+        batch_size=experiment.train.batch_size,
+        shuffle=True,
+        num_workers=experiment.train.num_workers,
+        seed=0,
+    )
+    val_loader = make_dataloader(
+        val,
+        batch_size=max(experiment.train.batch_size, 1024),
+        shuffle=False,
+        num_workers=experiment.train.num_workers,
+        seed=0,
+    )
+    for seed in experiment.seeds:
+        model = _instantiate(cfg, spec, n_in, n_out, seed).to(device)
+        result = fit(model, train_loader, val_loader, experiment.train, seed, checkpoint_dir)
+        model.eval()
+        records.append(
+            RunRecord(cfg.label, seed, model, False, model.n_fitted_parameters, result.wall_time_s)
+        )
+    return records
+
+
+def _moments(
+    holder: dict[str, TrainingMoments], train: DeckMotionDataset, experiment: ExperimentConfig
+) -> TrainingMoments:
+    """Return the regime's training moments, accumulating them at most once.
+
+    Args:
+        holder: Per-regime cache.
+        train: Training partition.
+        experiment: The experiment config, supplying the AR orders and worker count.
+
+    Returns:
+        The :class:`dmf.train.closed_form.TrainingMoments` for this regime.
+    """
+    if "moments" not in holder:
+        holder["moments"] = accumulate_training_moments(
+            train,
+            max_order=_max_order(experiment),
+            num_workers=experiment.train.num_workers,
+        )
+    return holder["moments"]
+
+
+def _max_order(experiment: ExperimentConfig) -> int:
+    """Return the largest AR order any configured model asks for, samples.
+
+    Args:
+        experiment: The experiment config.
+
+    Returns:
+        The maximum ``order`` over the AR configs, or 1 if none are present.
+    """
+    orders = [int(m.params["order"]) for m in experiment.models if "order" in m.params]
+    return max(orders, default=1)
+
+
+def _split_run_keys(frame: pd.DataFrame) -> pd.DataFrame:
+    """Split a composite ``"<label>@<seed>"`` model column into ``model`` and ``seed``.
+
+    The scoring pass has to key on the composite run key; the committed tables must not.
+    ``baselines.csv`` and ``baselines_by_seed.csv`` carry the bare label in ``model``, so a
+    per-cell table still keyed ``"dlinear@1"`` shares a column name with them while using a
+    different key space: it cannot be joined on
+    ``(model, regime, dof, horizon_samples)``, and ``baselines.md`` renders three seeds of
+    one model as three unrelated models. Undoing the join here rather than in
+    :mod:`dmf.eval.runner` leaves the runner's single-key contract intact -- the
+    accumulators are keyed the same way and the per-cell breakdown needs them to stay
+    distinct.
+
+    Args:
+        frame: A table whose ``model`` column holds composite run keys. Not mutated.
+
+    Returns:
+        A copy in which ``model`` holds the bare label, with an integer ``seed`` column
+        inserted immediately after it. Every other column and the row order are unchanged,
+        so no metric is recomputed and no number moves.
+
+    Raises:
+        ValueError: If any ``model`` value carries no :data:`RUN_KEY_SEP`, which would mean
+            the frame did not come from a per-run scoring pass and the split would silently
+            invent a seed.
+    """
+    keys = frame["model"].astype(str)
+    composite = keys.str.contains(RUN_KEY_SEP, regex=False)
+    if not bool(composite.all()):
+        bad = sorted(set(keys[~composite]))
+        raise ValueError(
+            f"model column holds {bad} without the {RUN_KEY_SEP!r} run-key separator; "
+            f"this frame did not come from a per-run scoring pass"
+        )
+    parts = keys.str.rsplit(RUN_KEY_SEP, n=1, expand=True)
+    out = frame.copy()
+    out["model"] = parts[0]
+    out.insert(list(frame.columns).index("model") + 1, "seed", parts[1].astype(int))
+    return out
+
+
+def run_experiment(
+    cfg: ExperimentConfig,
+    corpus_root: Path,
+    *,
+    results_dir: Path = Path("results"),
+    seeds: Sequence[int] | None = None,
+    regimes: Sequence[str] | None = None,
+    device: str = "cpu",
+    run_controls: bool = True,
+    checkpoint_root: Path = Path("artifacts/checkpoints"),
+) -> pd.DataFrame:
+    """Run one experiment end to end and write its result tables.
+
+    Args:
+        cfg: The experiment configuration.
+        corpus_root: Path to the Parquet corpus.
+        results_dir: Directory the CSV and Markdown artifacts are written to. The
+            per-seed and per-cell tables are rewritten after every regime, so a failure
+            late in a four-regime run leaves the completed regimes on disk.
+        seeds: Override for ``cfg.seeds``. Fewer than three still raises downstream when
+            the stochastic rows are aggregated; the override exists for smoke tests, which
+            do not aggregate.
+        regimes: Override for ``cfg.regimes``.
+        device: Torch device for SGD training and inference.
+        run_controls: If True, run the shuffle, untrained and pipeline-sanity controls and
+            write ``baselines_controls.csv``. Turned off only by fast smoke tests.
+        checkpoint_root: Root for per-regime best-epoch checkpoints.
+
+    Returns:
+        The per-run table (``baselines_by_seed.csv``), one row per
+        (model, regime, DOF, horizon, run). It is the source of truth; the aggregated
+        table is derived from it.
+
+    Raises:
+        ValueError: If the reference model is absent from the config, or if a requested
+            regime is unknown.
+    """
+    labels = [m.label for m in cfg.models]
+    if PERSISTENCE_LABEL not in labels:
+        raise ValueError(
+            f"experiment {cfg.name!r} has no {PERSISTENCE_LABEL!r} model; every skill "
+            f"score needs its persistence denominator measured over the same windows "
+            f"(CLAUDE.md non-negotiable 4). Configured models: {labels}"
+        )
+    experiment = cfg if seeds is None else _with_seeds(cfg, tuple(int(s) for s in seeds))
+    chosen = tuple(regimes) if regimes is not None else experiment.regimes
+    spec = window_spec_from_config(experiment.data)
+    manifest = load_manifest(corpus_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    by_seed: list[pd.DataFrame] = []
+    by_cell: list[pd.DataFrame] = []
+    control_results: list[ControlResult] = []
+    heading_marginals: list[pd.DataFrame] = []
+
+    for regime in chosen:
+        split = build_split(manifest, _as_regime(regime))
+        train = DeckMotionDataset(corpus_root, split, "train", experiment.data, spec)
+        val = DeckMotionDataset(
+            corpus_root, split, "val", experiment.data, spec, stats=train.norm_stats
+        )
+        test = DeckMotionDataset(
+            corpus_root, split, "test", experiment.data, spec, stats=train.norm_stats
+        )
+        n_in = len(train.input_columns)
+        n_out = len(train.target_columns)
+        holder: dict[str, TrainingMoments] = {}
+
+        records: list[RunRecord] = []
+        for model_cfg in experiment.models:
+            records.extend(
+                _fit_one(
+                    model_cfg,
+                    spec=spec,
+                    train=train,
+                    val=val,
+                    experiment=experiment,
+                    moments_holder=holder,
+                    device=device,
+                    checkpoint_dir=checkpoint_root / experiment.name / regime,
+                )
+            )
+
+        # One pass, every model, identical windows. Runs are keyed "<label>@<seed>" so that
+        # three seeds of one model are three entries rather than one silently overwriting
+        # the others -- a dict keyed on the label alone would lose two of every three. The
+        # key is split back into `model` and `seed` columns before anything is written, so
+        # that every committed table shares one key space.
+        keyed = {f"{r.label}@{r.seed}": r for r in records}
+        table, accumulators = evaluate_models(
+            {k: r.model for k, r in keyed.items()},
+            test,
+            persistence_key=f"{PERSISTENCE_LABEL}@0",
+            horizons=experiment.data.horizons,
+            fs_hz=experiment.data.fs_hz,
+            num_workers=experiment.train.num_workers,
+            device=device,
+        )
+        meta = pd.DataFrame(
+            [
+                {
+                    "model": key,
+                    "label": record.label,
+                    "seed": record.seed,
+                    "deterministic": record.deterministic,
+                    "n_params": record.n_params,
+                    "fit_time_s": record.fit_time_s,
+                }
+                for key, record in keyed.items()
+            ]
+        )
+        table = table.merge(meta, on="model", validate="many_to_one")
+        table["model"] = table["label"]
+        table["regime"] = regime
+        by_seed.append(table.drop(columns=["label"]))
+
+        cells = per_cell_metrics(
+            accumulators,
+            test,
+            persistence_key=f"{PERSISTENCE_LABEL}@0",
+            horizons=experiment.data.horizons,
+            fs_hz=experiment.data.fs_hz,
+        )
+        cells["regime"] = regime
+        # Marginalise *before* splitting the run key. `marginalize_cells` groups on
+        # ``model``, so collapsing headings after the split would sum the squared errors of
+        # three seeds into one row and report a pooled-over-seeds skill that no run ever
+        # achieved. Splitting afterwards is a pure relabelling.
+        heading = marginalize_cells(cells, ["heading_deg"]) if regime == "id" else None
+        by_cell.append(_split_run_keys(cells))
+        if heading is not None:
+            heading = _split_run_keys(heading)
+            heading["regime"] = regime
+            heading_marginals.append(heading)
+
+        # Checkpoint the two accumulating tables to disk once per regime, before the
+        # controls run. Deliberately redundant with the final writes after the loop: the
+        # shuffle control keeps strict=True because a failed integrity control must stop
+        # the sweep loudly rather than be quietly recorded, and these writes are what stop
+        # that legitimate stop on regime 3 from also destroying the finished work of
+        # regimes 1 and 2 in a run that takes hours. Writing before the controls means the
+        # current regime's own scored rows survive its own control failure too. Do not
+        # "optimise" these away as duplicated work -- recoverability is the point.
+        write_table(pd.concat(by_seed, ignore_index=True), results_dir / "baselines_by_seed.csv")
+        write_table(pd.concat(by_cell, ignore_index=True), results_dir / "baselines_by_cell.csv")
+
+        if run_controls:
+            control_results.extend(
+                _run_controls(
+                    regime=regime,
+                    train=train,
+                    test=test,
+                    experiment=experiment,
+                    spec=spec,
+                    n_in=n_in,
+                    n_out=n_out,
+                    records=records,
+                    corpus_root=corpus_root,
+                    device=device,
+                )
+            )
+
+    per_run = pd.concat(by_seed, ignore_index=True)
+    write_table(per_run, results_dir / "baselines_by_seed.csv")
+    write_table(pd.concat(by_cell, ignore_index=True), results_dir / "baselines_by_cell.csv")
+    aggregated = build_baselines_table(per_run)
+    write_table(aggregated, results_dir / "baselines.csv")
+    controls = controls_table(control_results) if control_results else None
+    if controls is not None:
+        write_table(controls, results_dir / "baselines_controls.csv")
+    markdown = build_baselines_markdown(
+        aggregated,
+        controls=controls,
+        by_heading=heading_marginals[0] if heading_marginals else None,
+        gate_regime=_gate_regime(chosen),
+        gate_horizon_samples=_gate_horizon(experiment.data.horizons),
+    )
+    (results_dir / "baselines.md").write_text(markdown, encoding="utf-8")
+    return per_run
+
+
+def _gate_horizon(horizons: tuple[int, ...]) -> int:
+    """Return the horizon the Gate 3 threshold is read at, samples.
+
+    Gate 3 is stated at 3 s, i.e. 30 samples at 10 Hz, and that is what the production
+    config reports. A cut-down geometry that does not contain 30 falls back to its longest
+    horizon so the report still renders; production is unaffected.
+
+    Args:
+        horizons: Reported horizons, samples, ascending.
+
+    Returns:
+        The gate horizon, samples.
+    """
+    return 30 if 30 in horizons else horizons[-1]
+
+
+def _gate_regime(regimes: tuple[str, ...]) -> str:
+    """Return the regime the Gate 3 threshold is read on.
+
+    Args:
+        regimes: The regimes actually scored in this run.
+
+    Returns:
+        ``"id"`` when it was scored -- the gate is an in-distribution difficulty check --
+        otherwise the first regime present.
+    """
+    return "id" if "id" in regimes else regimes[0]
+
+
+def _run_controls(
+    *,
+    regime: str,
+    train: DeckMotionDataset,
+    test: DeckMotionDataset,
+    experiment: ExperimentConfig,
+    spec: WindowSpec,
+    n_in: int,
+    n_out: int,
+    records: Sequence[RunRecord],
+    corpus_root: Path,
+    device: str,
+) -> list[ControlResult]:
+    """Run the negative controls for one regime.
+
+    The shuffle control refits AR on time-shuffled targets. Its null is the **window-mean
+    forecast**, not zero skill: a least-squares fit on shuffled targets degenerates to the
+    conditional mean, which :func:`dmf.data.normalize.invert_norm` turns back into the
+    window mean, and the window mean beats persistence at long horizons on a narrowband
+    signal. Testing against zero would report leakage on a clean pipeline.
+
+    Args:
+        regime: Regime name, for the control rows.
+        train: Training partition, refitted on shuffled targets.
+        test: Test partition to score on.
+        experiment: The experiment config.
+        spec: Window geometry.
+        n_in: Input channel count.
+        n_out: Target channel count.
+        records: The regime's fitted models, for the persistence and untrained subjects.
+        corpus_root: Corpus root, re-read independently by the pipeline-sanity control.
+        device: Torch device.
+
+    Returns:
+        The control outcomes.
+    """
+    by_label = {r.label: r.model for r in records}
+    persistence = by_label[PERSISTENCE_LABEL]
+    persistence_pipeline_sanity(test, corpus_root, model=persistence)
+
+    window_mean = DampedPersistence(
+        spec.lookback,
+        spec.max_horizon,
+        n_in,
+        n_out,
+        tau_samples=torch.full((n_out,), TAU_WINDOW_MEAN, dtype=torch.float64).numpy(),
+    )
+    window_mean.eval()
+
+    results: list[ControlResult] = []
+    ar_cfgs = [m for m in experiment.models if "order" in m.params]
+    if ar_cfgs:
+        # AR(20) on the full input set is the Gate 3 subject, so it is what the shuffle
+        # control refits. Explicit rather than a max() over a predicate: that form returns
+        # the first maximal element and so happens to be right only while ar20 precedes
+        # ar40 in the config list. `n_input_used` is excluded because `ar_attitude_only`
+        # also carries order 20; a control run on the ablation would test a model that is
+        # not the headline one and would depend on config order to notice. The fallback
+        # keeps the control running on a cut-down config that ships some other order.
+        target = next(
+            (m for m in ar_cfgs if int(m.params["order"]) == 20 and "n_input_used" not in m.params),
+            ar_cfgs[0],
+        )
+        shuffled_moments = accumulate_training_moments(
+            train,
+            max_order=int(target.params["order"]),
+            num_workers=experiment.train.num_workers,
+            shuffle_targets=True,
+        )
+        shuffled_model, _ = fit_ar(
+            shuffled_moments,
+            order=int(target.params["order"]),
+            ridge=float(target.params.get("ridge", 0.0)),
+            lookback=spec.lookback,
+            n_input_channels=n_in,
+            n_target_channels=n_out,
+        )
+        results.append(
+            shuffle_control(
+                test,
+                shuffled_model=shuffled_model,
+                window_mean_model=window_mean,
+                persistence_model=persistence,
+                regime=regime,
+                horizons=experiment.data.horizons,
+                fs_hz=experiment.data.fs_hz,
+                num_workers=experiment.train.num_workers,
+                device=device,
+            )
+        )
+
+    sgd_cfgs = [m for m in experiment.models if MODEL_REGISTRY[m.name].FIT_KIND == "sgd"]
+    if sgd_cfgs:
+        untrained = _instantiate(sgd_cfgs[0], spec, n_in, n_out, experiment.seeds[0])
+        untrained.eval()
+        # strict=False: the outcome is recorded in baselines_controls.csv rather than
+        # raised. The protocol's null for this control ("a random-init model must score
+        # worse than persistence") is wrong on this task in exactly the way the shuffle
+        # control's null was, and for the same reason. A small-weight random
+        # initialisation emits something close to zero, which after invert_norm is the
+        # window-mean forecast -- and on a narrowband signal the window mean beats
+        # persistence from about 2 s out (measured on id/test: window-mean skill +0.37 at
+        # 3 s, +0.71 at 5 s). Measured untrained DLinear skill on id/test is +0.32 at 2 s
+        # and +0.70 at 5 s, i.e. it reproduces the window mean rather than learning
+        # anything. Raising here would fail a clean pipeline.
+        #
+        # null_model=None is a decision, not an omission. `untrained_control` does accept a
+        # null_model, and its docstring records what happens when the window mean is
+        # substituted: the same untrained DLinear still removes 17.5% of that null's error
+        # at a 2 s horizon on roll (skill -0.0432 against a null of -0.2639). A randomly
+        # initialised *linear map of the lookback* is not a null model -- it is a bad filter
+        # of genuine past data, and a bad filter of the recent past of a narrowband signal
+        # carries real skill. The only initialisation this control is guaranteed to pass is
+        # one that emits the window mean exactly, which passes by construction and therefore
+        # tests nothing. Since no null makes it sound for a linear architecture, we keep the
+        # protocol's literal criterion (null = persistence), which holds at 1 s on every DOF
+        # and fails at 5 s on all three, and report the failure rather than tune the null or
+        # the tolerance until it disappears. The informative comparison is
+        # untrained-versus-trained, which the headline table already carries.
+        results.append(
+            untrained_control(
+                test,
+                untrained_model=untrained,
+                persistence_model=persistence,
+                regime=regime,
+                horizons=experiment.data.horizons,
+                fs_hz=experiment.data.fs_hz,
+                num_workers=experiment.train.num_workers,
+                device=device,
+                strict=False,
+            )
+        )
+    return results
+
+
+def _with_seeds(cfg: ExperimentConfig, seeds: tuple[int, ...]) -> ExperimentConfig:
+    """Return a copy of the config with different seeds.
+
+    Args:
+        cfg: The original configuration.
+        seeds: Replacement seeds.
+
+    Returns:
+        A new configuration; the original is frozen and unchanged.
+    """
+    return ExperimentConfig(
+        name=cfg.name,
+        data=cfg.data,
+        models=cfg.models,
+        train=cfg.train,
+        seeds=seeds,
+        regimes=cfg.regimes,
+    )
+
+
+def _as_regime(name: str) -> Regime:
+    """Narrow a regime name to the ``Regime`` literal type.
+
+    Args:
+        name: Regime name from the config.
+
+    Returns:
+        The same string, typed.
+
+    Raises:
+        ValueError: If the name is not one of the four regimes.
+    """
+    if name not in ("id", "unseen_seastate", "unseen_heading", "unseen_vessel"):
+        raise ValueError(f"unknown regime {name!r}")
+    regime: Regime = name  # type: ignore[assignment]
+    return regime

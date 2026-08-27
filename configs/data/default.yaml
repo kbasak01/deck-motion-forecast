@@ -1,20 +1,53 @@
-# Task definition for the supervised forecasting problem.
+# Task definition for the supervised forecasting problem -- `ideal` observation mode.
 #
 # Units: fs_hz hertz; lookback, horizons and stride in samples. Channel names are corpus
 # column names in `ideal` mode; `imu` mode maps each of them onto its `*_imu` twin (see
-# dmf.data.dataset.resolve_columns).
+# dmf.data.dataset.resolve_columns). Paired with `imu.yaml`, which differs from this file in
+# `observation_mode` and nothing else, so that the Phase 6.3 observability ablation compares
+# two task definitions rather than two unrelated experiments.
 #
 # `target_dofs` must be a prefix of `input_channels`: dmf.models.persistence.Persistence
 # forecasts by slicing the first C_out input channels, so any other ordering would make it
-# forecast the wrong channel silently. dmf.config.load_data enforces this.
+# forecast the wrong channel silently. dmf.config.load_data enforces this. Here the prefix
+# is the whole list, which is legal and intended.
 #
 # The key is `fs_hz`, not the `fs` of docs/IMPLEMENTATION_PLAN.md 2.1, so that it matches
 # SimConfig.fs_hz and configs/sim/corpus.yaml (docs/protocol.md P2-D7).
+#
+# --- Revised after Gate 3 (docs/protocol.md P3). Two changes, both measured. ---
+#
+# 1. `target_dofs` is all six channels, not the three attitudes. The operational metric
+#    needs it: dmf.eval.quiescence.detect_quiescent_mask thresholds |roll|, |pitch| AND
+#    |heave_rate|, so the three-target task could not supply its own decision variable and
+#    would have had to differentiate a forecast heave -- amplifying exactly the
+#    high-frequency error the forecast is worst at. The wider framing needs it too: a
+#    full-scale helicopter deck landing requires attitudes *and* their rates to stay bounded
+#    through the window, not attitudes alone.
+#
+#    Note this does NOT make the task harder. Measured on `id`/imu with AR(20), the rate
+#    channels sit within 0.03 of their position channels in normalised RMSE at every
+#    horizon -- differentiation multiplies by omega, but the response is already narrowband,
+#    so relative spectral width barely moves (0.11-0.17 across all six). Added for
+#    correctness, not for difficulty.
+#
+# 2. `horizons` extends to 10 s and 15 s. Gate 3 failed at the original 1-5 s: AR(20) scored
+#    0.9987 skill vs persistence at 3 s on roll in `id`, and 0.9958 in `imu` mode, against a
+#    0.8 "too easy" threshold. Roll does not fall below 0.8 skill until ~30 s. The binding
+#    DOF is pitch, not roll -- normalised RMSE 0.50 at 5 s and 0.99 at 15 s, where roll is
+#    still 0.51 at 15 s. The 1-5 s horizons are kept because they are the operational set;
+#    10 s and 15 s are added because that is the band where the problem is non-trivial and
+#    where a full-scale rotorcraft's commit-to-land lead time actually sits.
+#
+# Reading the resulting tables: skill vs persistence is NOT safe to compare across horizons
+# on this signal. The denominator oscillates with the roll period -- persistence RMSE for
+# roll is 5.26 deg at 3 s, 7.07 deg at 5 s, then *down* to 3.79 deg at 10 s, because at one
+# period the signal has come back around. Report normalised RMSE alongside skill whenever
+# the horizon varies (docs/protocol.md P3).
 fs_hz: 10.0
-lookback: 200                 # 20 s at 10 Hz
-horizons: [10, 20, 30, 50]    # 1, 2, 3, 5 s
-target_dofs: [roll, pitch, heave]
+lookback: 200                      # 20 s at 10 Hz
+horizons: [10, 20, 30, 50, 100, 150]   # 1, 2, 3, 5, 10, 15 s
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
 input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
 stride: 5
-observation_mode: ideal       # or `imu`; never mix an imu input with an ideal target (P1-D6)
+observation_mode: ideal            # or `imu`; never mix an imu input with an ideal target (P1-D6)
 revin: false
