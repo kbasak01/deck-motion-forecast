@@ -830,6 +830,51 @@ channel-independence tests, which perturb `x[:, :, N_OUT:]`. Since P3-D4 makes
 `target_dofs == input_channels`, that became an empty slice — one test silently vacuous, the other
 silently failing. Both now run against an explicit proper-prefix geometry.
 
+### P3-D17 — Training batch raised to 1024 and lr scaled; the bottleneck was never the data path
+
+`docs/IMPLEMENTATION_PLAN.md` §Phase 4 gives training defaults of batch 256 and lr 1e-3.
+`e01_baselines` now uses **batch 1024, lr 2e-3, num_workers 16**. Recorded because it is a
+deviation from a stated default and because it changes the optimisation trajectory.
+
+**Why: the first sweep attempt was 6x slower than budgeted.** One DLinear seed on `id` took 68
+minutes at batch 256; the four-regime sweep extrapolated to ~15 h per observation mode, ~30 h for
+both. The main process sat at 87% of a single core with the GPU oscillating 10-33%.
+
+**A wrong diagnosis, recorded because the measurement is the useful part.** That profile was read
+as per-window Python cost in `DeckMotionDataset.__getitem__`, and a vectorised `__getitems__`
+batch-gather was written to remove it. It was verified bitwise-identical to the per-index path on
+random batches, single-element batches, realization boundaries and the final partial batch — and
+it bought **1.02x** (0.99-1.20x across batch sizes 256-4096). It was reverted. The data path was
+never the constraint: the loader delivers 47 k windows/s at 8 workers and 185 k at 16, on ~2 of 36
+cores.
+
+**The actual constraint is fixed per-step overhead** — Python, kernel launches, the optimizer —
+which for a 60 300-parameter linear map dwarfs the arithmetic. Measured on the production geometry
+(A4000, bf16 autocast, H2D + forward + backward + clip + step):
+
+| batch | ms/step | steps/epoch (`id`) | s/epoch |
+|---|---|---|---|
+| 256 | 6.85 | 5 726 | 39.2 |
+| 1 024 | 7.55 | 1 431 | 10.8 |
+| 4 096 | 8.03 | 358 | 2.9 |
+
+Step cost is nearly flat in batch size, so 4x the batch is ~3.6x less wall time. With the loader at
+7.9 s/epoch on 16 workers, the two overlap at ~11-13 s/epoch against ~68 before: roughly **5x**,
+~13 min per seed, ~3 h per observation mode.
+
+**Why changing lr is safe here and would not be for a deep model.** DLinear under MSE is convex;
+its optimum is the closed-form least-squares solution, and
+`tests/test_models.py::test_dlinear_sgd_reaches_the_closed_form_optimum` asserts SGD reaches it.
+Batch and lr therefore govern how fast it converges, not where — the oracle test is the guard, and
+it passes at the new settings. `lr = 2e-3` is square-root scaling for a 4x batch, chosen over
+linear scaling's 4e-3 as the conservative option. 4096 was not taken despite being faster still:
+at 358 steps/epoch the schedule has too few steps for warmup and cosine decay to mean much.
+
+Applies uniformly to every SGD model in both `e01_baselines` and `e01_baselines_imu`, so the Gate 4
+fairness requirement is unaffected. **Phase 4 must re-derive these numbers before adopting them** —
+this measurement is for a 60 300-parameter linear map, and a TCN or Transformer will not be
+fixed-overhead-bound in the same way.
+
 ### Gate 3 evidence
 
 | Criterion | Where | Evidence |

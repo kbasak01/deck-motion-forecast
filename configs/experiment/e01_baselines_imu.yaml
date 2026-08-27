@@ -27,16 +27,35 @@ models:
 
 # Applies to the SGD models only. The closed-form models (persistence, damped persistence,
 # AR) ignore it: they are deterministic and emit one row each with skill_std = NaN.
+# Batch 1024, not the 256 of the plan's training defaults, and lr scaled with it.
+#
+# Measured, not guessed (docs/protocol.md P3-D17). The training step here is dominated by
+# fixed per-step cost -- Python, kernel launches, the optimizer -- not by the model's
+# arithmetic, which for a 60 300-parameter linear map is negligible: 6.85 ms/step at batch
+# 256, 7.55 ms at 1024, 8.03 ms at 4096. Step cost is nearly flat in batch size, so 4x the
+# batch is ~3.6x less wall time: 39.2 s/epoch -> 10.8 s/epoch on the `id` training split.
+# At batch 256 one DLinear seed on `id` took 68 minutes and the four-regime sweep
+# extrapolated to ~15 h per observation mode.
+#
+# num_workers 16 to match: the loader delivers 47 k windows/s at 8 workers (31 s/epoch) and
+# 185 k at 16 (7.9 s/epoch), using ~2 of 36 cores either way. Below 16 the loader, not the
+# step, becomes the ceiling once the batch grows.
+#
+# lr 2e-3 is the square-root scaling of 1e-3 for a 4x batch -- the conservative choice over
+# linear scaling's 4e-3. Safe to change here in a way it would not be for a deep model:
+# DLinear under MSE is convex, its optimum is the closed-form least-squares solution, and
+# `test_dlinear_sgd_reaches_the_closed_form_optimum` asserts SGD actually reaches it. Batch
+# and lr therefore set how fast it converges, not where.
 train:
   epochs: 60
-  batch_size: 256
-  lr: 1.0e-3
+  batch_size: 1024
+  lr: 2.0e-3
   weight_decay: 1.0e-4
   warmup_frac: 0.05
   grad_clip: 1.0
   patience: 15
   amp_dtype: bf16
-  num_workers: 8
+  num_workers: 16
 
 seeds: [0, 1, 2]
 regimes: [id, unseen_seastate, unseen_heading, unseen_vessel]
