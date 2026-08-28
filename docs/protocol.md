@@ -600,6 +600,13 @@ not of the model. **Report normalised RMSE (RMSE / signal std) alongside skill w
 horizon varies.** This is not a presentational preference; P3-D7 records a case where reading skill
 alone would produce a false conclusion about a model.
 
+**Status: recorded, not implemented.** No `nrmse` or `signal_std` column exists in any committed
+artifact or anywhere in `src/dmf/`. Every normalised-RMSE figure quoted in this protocol — including
+the value used to reject 15 s as the gate cell in P3-D12 — comes from an ad-hoc measurement outside
+the pipeline and is not reproducible from `results/`. The per-cell target standard deviation is
+available at scoring time, so this is a column, not a re-run. **It is a Phase 4 prerequisite**: the
+mandate is stated twice and honoured nowhere.
+
 ### P3-D6 — P2-D9 denominators superseded (the Phase 2 record stands as history)
 
 Raising `max_horizon` from 50 to 150 samples drops the last 20 window starts of every realization:
@@ -785,33 +792,43 @@ Gate 3 adversarial audit, not by review.
 Corrected to **AR(40) on three channels**: 40 x 3 = 120 features = 108 900 parameters, identical to
 `ar20`, same ridge, same solver, sliced from the same cached `p_max = 40` moments at no extra pass.
 
-**The correction changes the conclusion, and the full sweep then changes it again by observation
-mode.** Median skill differences over all 144 cells of each mode:
+**The correction changes the conclusion; a second correction then narrows it further.** Median
+skill differences over all 144 cells of each mode:
 
 | contrast | what it isolates | ideal | imu |
 |---|---|---|---|
-| `ar20` - `ar_attitude_only` (both 108 900) | rate channels, capacity held | +0.0046 | **+0.0091** |
-| `ar10` -> `ar20` (54 900 -> 108 900) | capacity, information set held | **+0.0063** | +0.0053 |
-| `ar20` -> `ar40` (108 900 -> 216 900) | capacity, information set held | +0.0017 | +0.0011 |
+| `ar20` - `ar_attitude_only` (both 108 900) | rate channels | +0.0046 | +0.0091 |
+| `ar10` -> `ar20` (54 900 -> 108 900) | capacity | +0.0063 | +0.0053 |
+| `ar20` -> `ar40` (108 900 -> 216 900) | capacity | +0.0017 | +0.0011 |
 
-At the confounded 54 900 the rate-channel effect measured ~+0.01 — indistinguishable from the
-capacity step contaminating it. At matched capacity the two separate, **and they order differently
-in the two observation modes**: under `ideal` the rate channels are worth *less* than doubling the
-lag budget (+0.0046 vs +0.0063), under `imu` they are worth *more* (+0.0091 vs +0.0053).
+An earlier draft compared the first two rows directly and concluded the ordering flips by observation
+mode — rate channels worth less than lags under `ideal`, more under `imu`. **That was wrong**, and it
+is the exact error P3-D22 warns about: those are medians of two *separate* marginal distributions,
+not a paired contrast. Per cell:
 
-That ordering is physically sensible and is the more interesting result. With clean attitude
-observations, a longer lag window recovers much of what the rate channels carry, since the rates are
-very nearly the derivative of the attitudes the model already sees. Once the attitudes are corrupted
-by the IMU model, the separately-measured rate channels stop being redundant with them and start
-carrying independent information — so their value roughly doubles while the value of extra lags
-falls.
+| | median(rate effect - lag effect) | cells where rate > lag |
+|---|---|---|
+| ideal | **+0.00060** | 85/144 |
+| imu | +0.00252 | 95/144 |
 
-**The earlier universal claim is withdrawn.** The rate channels are not simply "worth more than
-extra lags"; whether they are depends on the observation mode, and the effect is small in both
-(under 0.01 median) relative to what the confounded pair appeared to show. Note also that an
-earlier draft of this entry recorded +0.0033 vs +0.0044 from an `id`-only slice and concluded the
-rate channels were worth uniformly less; that slice was one regime of one mode and did not support
-the generalisation.
+**Positive in both modes.** The honest reading: under `ideal` the two effects are indistinguishable;
+under `imu` the rate channels are worth somewhat more. There is no reversal.
+
+**A confound remains, and it biases the channel effect downward.** Capacity and lag depth cannot both
+be held on a lag-feature design. Matching parameters forced `ar_attitude_only` to AR(**40**) on 3
+channels — a **4.0 s** lag window against `ar20`'s 6 channels over **2.0 s**. On a 12 s-period
+narrowband signal that is not a nuisance. The direction is knowable: `ar_attitude_only` gets the
+*longer* window, so `ar20 - ar_attitude_only` **understates** the pure channel effect, by roughly the
+`ar20 -> ar40` step (+0.0017 ideal). Corrected, the channel effect is ~+0.0063 — about equal to the
+lag effect, not below it. The pair is one information set apart *and* one lag depth apart; only the
+parameter count is held.
+
+**The earlier universal claim is withdrawn**, and so is its first replacement. What survives: at
+matched parameter count the rate channels are worth a small positive amount in both modes (paired
+median +0.0006 ideal, +0.0025 imu), of the same order as doubling the lag budget, and the measurement
+still carries a downward bias from the unheld lag depth. This entry has now been wrong twice — first
+from an `id`-only slice, then from unpaired medians — which is the argument for wiring
+`paired_skill_difference_ci` (P3-D22) before Phase 4 makes claims of this size.
 
 The earlier claim that `ar_attitude_only` "loses to `ar10` on every DOF and horizon" is also
 withdrawn — it was false even at the old parametrisation (122/144 across regimes, not 144/144;
@@ -963,10 +980,10 @@ The tiny seed spread (+/- 7e-6) is not evidence against this: three seeds under 
 budget on a convex problem stop in the same place. `skill_std` measures initialisation and shuffle
 noise; the optimisation shortfall is systematic and invisible to it.
 
-**The full sweep localises the gap precisely, via the `epochs_run` column P3-D23 added.** Under
-`ideal`, all twelve DLinear runs report `epochs_run = 60`: early stopping never fired in any regime,
-so every run stopped at the cap with the validation loss still falling. Under `imu`, `epochs_run` is
-43, 45 and 60 — early stopping did fire. The consequence is visible in the tables:
+**The `epochs_run` column P3-D23 added shows the budget bound almost everywhere.** Under `ideal`,
+all twelve DLinear runs report `epochs_run = 60` — early stopping never fired. Under `imu` it fired
+in **2 of 12** runs (45 on `id`/seed 0, 43 on `unseen_heading`/seed 2); the other ten also hit the
+cap. So the budget bound in 22 of 24 runs overall. The consequence is visible in the tables:
 
 | | ideal | imu |
 |---|---|---|
@@ -975,10 +992,13 @@ so every run stopped at the cap with the validation loss still falling. Under `i
 | `ar20` beats `dlinear` | 107/144 | 102/144 |
 | `ar20` beats `dlinear_ols` | **89/144** | 102/144 |
 
-So the optimisation gap is real where the budget bound and absent where it did not, which is exactly
-the shape the diagnosis predicts. Under `ideal` it accounts for 18 of the 107 cells in which AR(20)
-appeared to beat DLinear; under `imu`, where DLinear largely converged, removing the gap changes
-nothing (102 both ways). Any DLinear-vs-AR statement must therefore name the mode.
+Under `ideal` the closed-form row accounts for 18 of the 107 cells in which AR(20) appeared to beat
+DLinear; under `imu` it changes nothing (102 both ways). **Why the gap is mode-dependent is not
+explained.** The obvious hypothesis — that `imu` runs converged and `ideal` runs did not — is refuted
+by `epochs_run`: the cap bound in 10 of 12 `imu` runs too. A likelier cause is that IMU observation
+noise raises the irreducible error and flattens the loss basin, so the remaining distance to the
+optimum costs less skill; that is untested. Recorded as an open question, not a finding. Any
+DLinear-vs-AR statement must name the mode.
 
 The per-cell spread is wide in both directions (`ideal` min -0.3496, max +0.1270): `dlinear_ols` is
 the exact optimum of the regularised *training* objective, which carries no guarantee on held-out
@@ -1094,7 +1114,7 @@ Artifacts in `results/` and `results/imu/`, five files each. Supersedes the seve
 | Gate cell read and acted on | Original gate (roll @ 3 s, `id`) **failed** at 0.9987 / 0.9958 against 0.8; task revised (P3-D4); gate restated to pitch @ 10 s and applied (P3-D12). Final: **AR(20) 0.5446 (`ideal`) / 0.5132 (`imu`)** — passes |
 | Reference is exact | Persistence **bitwise 0.0** in all 144 rows of both modes; `rmse_persistence` identical across all nine models in every cell |
 | Not attributable to leakage | Shuffle control **0 rows in the failing direction of 288**; worst positive excess 0.0095 (`ideal`) / 0.0064 (`imu`) against a 2% tolerance. Large negative excursions explained in P3-D18 |
-| Denominators correct | `ideal` reproduces the P3-D6 table to 4.7e-07; `imu` table pinned from the same 434 304-window partition |
+| Denominators correct | `ideal` reproduces the P3-D6 table to 4.7e-07 and is pinned in `tests/test_models.py`; the `imu` table is recorded in P3-D6 and reproduces the sweep to 5.0e-07 but is **not** pinned by a test |
 | Underperforming cells reported | AR(20) negative in **12/144** (`ideal`), **13/144** (`imu`), matching the sets pinned in `tests/test_models.py` |
 | Per-cell table decomposes the headline | Joins to `baselines.csv` with **0 unmatched of 47 520**, both modes |
 | Optimisation state traceable | `epochs_run` / `best_epoch` / `best_val_loss` on `baselines_by_seed.csv` (P3-D23); this is what localised P3-D19 |

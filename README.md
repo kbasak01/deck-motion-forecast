@@ -9,7 +9,7 @@ full-scale manned or unmanned helicopter needs, not attitudes alone.
 **All results in this repository are from simulated vessel motion. No real deck data is used,
 and no sim-to-real claim is made.**
 
-Status: **Phase 3 — Gate 3 read, task revised, gate restated and passing.**
+Status: **Phase 3 complete. Gate 3 as written failed; the task was revised and the criterion restated at the binding DOF.**
 
 The simulator (`src/dmf/sim/`) and corpus are complete and Gate 1 passes; the realization-level
 split, windowing and train-only normalization are complete and Gate 2 passes (`src/dmf/data/`).
@@ -43,15 +43,19 @@ denominator of every skill score here — in 107 of 144 cells.
 
 Two results worth stating plainly, both of which reversed an earlier claim of ours:
 
-- **A converged linear model is competitive.** `dlinear_ols` (60 300 parameters, solved closed-form)
-  scores 0.568 at the gate cell against AR(20)'s 0.545 with 108 900 parameters. Before the
-  closed-form row existed, DLinear was trained by SGD to a 60-epoch cap that early stopping never
-  reached, and the resulting shortfall was being read as an architecture gap. It is not, under
-  `ideal`. Under `imu`, where DLinear does converge, AR wins.
-- **The rate channels are worth less than they first appeared, and the answer depends on
-  observability.** At matched capacity the rate channels are worth +0.0046 median skill under
-  `ideal` — less than the +0.0063 from simply doubling the lag budget — but +0.0091 under `imu`,
-  where corrupted attitudes stop making them redundant.
+- **A converged linear model is competitive at the gate cell.** `dlinear_ols` (60 300 parameters,
+  solved closed-form) scores 0.568 there against AR(20)'s 0.545 with 108 900. Read across the whole
+  `id` regime the ranking flips back — AR(20) wins 28 of 36 cells, median +0.0056 — so this is a
+  cell-level result, not a general one. What is general: DLinear was previously trained by SGD to a
+  60-epoch cap that early stopping never reached, and that shortfall was being read as an
+  architecture gap. Removing it drops AR(20)'s wins over DLinear from 107/144 to 89/144 under
+  `ideal`.
+- **The rate channels are worth less than they first appeared.** At matched parameter count the
+  paired per-cell effect is +0.0006 median under `ideal` and +0.0025 under `imu` — small and positive
+  in both, and of the same order as simply doubling the lag budget. An earlier version of this line
+  claimed the ordering reversed between modes; that came from comparing two unpaired medians and does
+  not survive a paired contrast. The measurement also still carries a downward bias, because matching
+  parameter counts left the two models with different lag depths.
 
 `docs/protocol.md` §Phase 3 is the full decision log, including the defects an adversarial audit
 found in the first sweep and what changed as a result.
