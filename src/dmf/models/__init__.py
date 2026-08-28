@@ -18,14 +18,18 @@ hide.
 from dmf.models.ar import ARForecaster
 from dmf.models.base import BaseForecaster, ForecastModel, QuantileForecastModel
 from dmf.models.dlinear import DLinear
+from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.persistence import DampedPersistence, Persistence
+from dmf.models.window_mean import WindowMean
 
 __all__ = [
     "ARForecaster",
     "BaseForecaster",
     "DLinear",
+    "DLinearOLS",
     "DampedPersistence",
     "ForecastModel",
     "Persistence",
     "QuantileForecastModel",
+    "WindowMean",
 ]

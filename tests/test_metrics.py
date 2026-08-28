@@ -19,6 +19,18 @@ Covered here:
 - The bootstrap resamples **realizations**, not windows, and brackets the point estimate.
 - ``aggregate_over_seeds`` refuses a group with fewer than three seeds; ``aggregate_results``
   routes deterministic rows around it with ``n_seeds = 1`` and a **NaN** std.
+- The rendered ``baselines.md`` cites the directory it was written from, so an ``imu`` run
+  cannot point a reader at the ``ideal`` run's CSVs -- the exact files its own last caveat
+  says must not be mixed with its numbers.
+- Geometry-dependent prose in ``baselines.md`` is *measured from the table*, not written as
+  a literal, because the literal that used to sit there survived the task revision that
+  changed it and was rendered into every committed artifact.
+- ``skill_ci_lo``/``skill_ci_hi`` aggregated over seeds is the **envelope** of the per-run
+  intervals, never their mean: the mean of several finished intervals is not an interval for
+  anything, and it is invariant to the seed disagreement a reader would use it to detect.
+- ``paired_skill_difference_ci`` resamples both models under one set of realization weights,
+  so a model-vs-model difference is judged on its own interval rather than by eye from two
+  overlapping marginals.
 
 Controls, from the validation protocol:
 
@@ -38,6 +50,7 @@ Units: degrees for roll and pitch, metres for heave, samples for horizons.
 
 import dataclasses
 import itertools
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -60,9 +73,11 @@ from dmf.eval.metrics import (
     skill_score,
 )
 from dmf.eval.report import (
+    BASELINES_ARTIFACTS,
     BASELINES_COLUMNS,
     aggregate_over_seeds,
     aggregate_results,
+    baselines_caveats,
     build_baselines_markdown,
     build_baselines_table,
     to_markdown,
@@ -72,6 +87,7 @@ from dmf.eval.runner import (
     bootstrap_skill_ci,
     evaluate_models,
     marginalize_cells,
+    paired_skill_difference_ci,
     per_cell_metrics,
 )
 
@@ -1225,3 +1241,354 @@ def test_write_table_creates_its_parent_directory(tmp_path: Path) -> None:
     path = write_table(pd.DataFrame({"a": [1]}), tmp_path / "nested" / "t.csv")
     assert path.exists()
     assert pd.read_csv(path)["a"].tolist() == [1]
+
+
+# --------------------------------------------------------------------------------------
+# Provenance: the document must cite the directory it was written from.
+# --------------------------------------------------------------------------------------
+
+
+def _multi_mode_frames() -> dict[str, pd.DataFrame]:
+    """Build one minimal aggregated table per observation mode's results directory."""
+    return {"results": _gate_table("ideal"), "results/imu": _gate_table("imu")}
+
+
+@pytest.mark.parametrize("results_dir", ["results", "results/imu"])
+def test_baselines_markdown_cites_the_directory_it_was_written_from(results_dir: str) -> None:
+    """S5a: an `imu` run used to name the `ideal` run's four CSVs.
+
+    That is worse than a broken link. The document's own last caveat says skill is not
+    comparable across observation modes because the persistence denominator differs
+    (P1-D6), so a provenance line naming the other mode's files points the reader at
+    exactly what the caveat forbids mixing.
+    """
+    table = _multi_mode_frames()[results_dir]
+    rendered = build_baselines_markdown(table, results_dir=Path(results_dir))
+    for name, _what in BASELINES_ARTIFACTS:
+        if name == "baselines_controls.csv":
+            continue  # No controls passed; asserted separately below.
+        assert f"`{results_dir}/{name}`" in rendered
+    if results_dir == "results/imu":
+        # The regression itself: no bare `results/<file>` path may survive anywhere.
+        for name, _what in BASELINES_ARTIFACTS:
+            assert f"`results/{name}`" not in rendered
+
+
+def test_baselines_markdown_names_every_artifact_it_was_built_from() -> None:
+    """The provenance line is generated from one list, so it cannot drift from the run."""
+    table = _gate_table("ideal")
+    controls = pd.DataFrame(
+        {
+            "control": ["shuffle"],
+            "subject_model": ["ar20"],
+            "null_model": ["window_mean"],
+            "excess": [0.001],
+            "tol": [0.02],
+            "passed": [True],
+        }
+    )
+    rendered = build_baselines_markdown(table, controls=controls, results_dir=Path("results/imu"))
+    for name, what in BASELINES_ARTIFACTS:
+        assert f"`results/imu/{name}` ({what})" in rendered
+
+
+def test_baselines_markdown_does_not_cite_a_controls_file_that_was_not_written() -> None:
+    """`run_experiment` writes `baselines_controls.csv` only when the controls ran.
+
+    Naming a file that is not there is the same class of defect as naming the wrong one.
+    """
+    rendered = build_baselines_markdown(_gate_table("ideal"), results_dir=Path("results"))
+    assert "baselines_controls.csv" not in rendered
+    assert "`results/baselines_by_seed.csv`" in rendered
+
+
+def test_baselines_markdown_without_a_directory_makes_no_claim_about_one() -> None:
+    """The default must be true in any directory, not true in one and false elsewhere."""
+    rendered = build_baselines_markdown(_gate_table("ideal"))
+    assert "beside this document" in rendered
+    assert "`baselines_by_seed.csv`" in rendered
+    assert "results/" not in rendered.split("## The gate cell")[0]
+
+
+def test_baselines_markdown_directory_is_rendered_repo_relative(tmp_path: Path) -> None:
+    """An absolute path below the CWD renders repo-relative; one outside renders as given."""
+    inside = Path.cwd() / "results" / "imu"
+    assert "`results/imu/baselines.csv`" in build_baselines_markdown(
+        _gate_table("imu"), results_dir=inside
+    )
+    outside = tmp_path / "elsewhere"
+    assert f"`{outside.as_posix()}/baselines.csv`" in build_baselines_markdown(
+        _gate_table("ideal"), results_dir=outside
+    )
+
+
+# --------------------------------------------------------------------------------------
+# NOTE-1: geometry-dependent prose is measured, not narrated.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_window_count_caveat_is_read_off_the_table() -> None:
+    """A literal window count in this prose already went stale once (P3-D4 -> P3-D6).
+
+    ``max_horizon`` 50 -> 150 dropped `id/test` from 441 984 windows to 434 304, and every
+    committed ``baselines.md`` kept rendering the old number. The sentence now reports what
+    the table it is printed beside actually says.
+    """
+    table = _gate_table("ideal")
+    table["n_windows"] = 434_304
+    caveat = next(c for c in baselines_caveats(table) if "window count" in c)
+    assert "434 304 windows of `id/test`" in caveat
+    assert "441 984" not in caveat
+
+    moved = table.assign(n_windows=123_456)
+    assert "123 456 windows" in next(c for c in baselines_caveats(moved) if "window count" in c)
+
+
+def test_the_window_count_caveat_quotes_the_gate_regime_not_the_first_one() -> None:
+    """Regimes have different window counts; quoting another one's would mislead."""
+    table = pd.concat(
+        [
+            _gate_table("ideal"),
+            _gate_table("ideal", regime="unseen_seastate").assign(n_windows=999),
+        ],
+        ignore_index=True,
+    )
+    caveat = next(
+        c for c in baselines_caveats(table, gate_regime="unseen_seastate") if "window count" in c
+    )
+    assert "999 windows of `unseen_seastate/test`" in caveat
+
+
+def test_the_window_count_caveat_drops_the_number_when_it_is_not_well_defined() -> None:
+    """Two counts in one regime means the runs were not comparable; do not pick one."""
+    table = _gate_table("ideal")
+    table.loc[table.index[0], "n_windows"] = 7
+    caveat = next(c for c in baselines_caveats(table) if "window count" in c)
+    assert "windows of `id/test`" not in caveat
+    assert caveat.count("**") == 2  # Still one caveat, just without the literal.
+    assert "windows of" not in caveat
+
+
+def test_no_hardcoded_window_count_survives_in_the_reporting_modules() -> None:
+    """The stale literal is gone from the source, not merely from one rendered document.
+
+    Lines citing a decision record are exempt: naming the superseded number *as history*
+    ("441 984 -> 434 304, P3-D6") is the opposite of the defect. What is forbidden is a
+    live sentence that asserts a count nothing measured.
+    """
+    for module in ("src/dmf/eval/report.py", "src/dmf/eval/runner.py"):
+        text = Path(module).read_text(encoding="utf-8")
+        body = "\n".join(
+            line for line in text.splitlines() if "P3-D" not in line and "superseded" not in line
+        )
+        assert "441 984" not in body
+        assert "434 304" not in body
+
+
+# --------------------------------------------------------------------------------------
+# S3: aggregated intervals are an envelope, and are labelled as one.
+# --------------------------------------------------------------------------------------
+
+
+def _frame_with_intervals(los: Sequence[float], his: Sequence[float]) -> pd.DataFrame:
+    """Per-run frame whose bootstrap interval differs between seeds.
+
+    Args:
+        los: Per-seed interval lower bounds, dimensionless skill.
+        his: Per-seed interval upper bounds, dimensionless skill.
+
+    Returns:
+        A frame in the ``build_baselines_table`` input schema.
+    """
+    frame = _seeded_frame(len(los)).assign(model="dlinear")
+    frame["skill_ci_lo"] = list(los)
+    frame["skill_ci_hi"] = list(his)
+    return frame
+
+
+def test_multi_seed_intervals_are_the_envelope_not_the_mean() -> None:
+    """The mean of three finished bootstrap intervals is not an interval for anything.
+
+    It excludes seed variance and is narrower than any of its inputs' own coverage
+    justifies. The envelope is conservative -- it contains every seed's interval -- and,
+    unlike the mean, it responds when the seeds disagree.
+    """
+    row = build_baselines_table(_frame_with_intervals([0.60, 0.70, 0.80], [0.86, 0.90, 0.94])).iloc[
+        0
+    ]
+    assert float(row["skill_ci_lo"]) == pytest.approx(0.60)
+    assert float(row["skill_ci_hi"]) == pytest.approx(0.94)
+    # The value the audit found: mean-of-intervals would have reported [0.70, 0.90].
+    assert float(row["skill_ci_lo"]) != pytest.approx(0.70)
+
+
+def test_the_aggregated_interval_widens_when_the_seeds_disagree() -> None:
+    """Monotone in seed disagreement, which is the property the mean does not have."""
+    tight = build_baselines_table(_frame_with_intervals([0.70, 0.70, 0.70], [0.90, 0.90, 0.90]))
+    loose = build_baselines_table(_frame_with_intervals([0.50, 0.70, 0.70], [0.90, 0.90, 0.99]))
+    tight_width = float(tight["skill_ci_hi"].iloc[0] - tight["skill_ci_lo"].iloc[0])
+    loose_width = float(loose["skill_ci_hi"].iloc[0] - loose["skill_ci_lo"].iloc[0])
+    assert loose_width > tight_width
+    # Mean-of-intervals would have reported the *same* width for both.
+    assert loose_width == pytest.approx(0.49)
+
+
+def test_a_single_seed_interval_passes_through_exactly() -> None:
+    """A deterministic row's interval is a genuine bootstrap CI and must not be altered."""
+    frame = _seeded_frame(1, deterministic=True)
+    frame["skill_ci_lo"] = [0.61]
+    frame["skill_ci_hi"] = [0.93]
+    row = build_baselines_table(frame).iloc[0]
+    assert float(row["skill_ci_lo"]) == 0.61
+    assert float(row["skill_ci_hi"]) == 0.93
+    assert int(row["n_seeds"]) == 1
+
+
+def test_the_envelope_is_labelled_wherever_a_multi_seed_row_is_rendered() -> None:
+    """A mislabelled statistic is not fixed by being conservative; it has to say so."""
+    multi = _gate_table("ideal")
+    multi["n_seeds"] = 3
+    caveat = next(c for c in baselines_caveats(multi) if "single-seed row" in c)
+    assert "confidence interval only on a single-seed row" in caveat
+    assert "envelope" in caveat
+    assert "baselines_by_seed.csv" in caveat
+    rendered = build_baselines_markdown(multi)
+    assert "envelope" in rendered
+
+
+def test_the_envelope_caveat_is_omitted_when_every_row_is_single_seed() -> None:
+    """An all-deterministic table's intervals are all genuine CIs; do not muddy them."""
+    single = _gate_table("ideal")
+    assert set(single["n_seeds"]) == {1}
+    assert not [c for c in baselines_caveats(single) if "single-seed row" in c]
+
+
+def test_caveats_assume_the_envelope_applies_when_the_table_is_unknown() -> None:
+    """A caveat printed unnecessarily costs a line; an omitted one costs a misread CI."""
+    assert [c for c in baselines_caveats(None) if "single-seed row" in c]
+
+
+# --------------------------------------------------------------------------------------
+# Paired model-vs-model differences.
+# --------------------------------------------------------------------------------------
+
+
+def _correlated_sse(n_keys: int, *, offset: float, seed: int) -> Tensor:
+    """Per-realization SSE for one model, scaled by a shared realization severity.
+
+    Args:
+        n_keys: Number of realizations.
+        offset: Model-specific error ratio against the reference, dimensionless.
+        seed: Seed for the realization severities. Equal seeds give the same severities,
+            i.e. the same realizations scored by both models.
+
+    Returns:
+        Tensor of shape ``(n_keys, 4, 1)``: four horizons whose error grows with lead time,
+        one target channel. Squared corpus units.
+    """
+    rng = np.random.default_rng(seed)
+    severity = rng.uniform(1.0, 20.0, size=(n_keys, 1, 1))
+    growth = np.arange(1, 5, dtype=np.float64).reshape(1, 4, 1)
+    return torch.from_numpy(severity * growth * offset)
+
+
+def _paired_fixture(n_keys: int, *, gap: float, seed: int) -> tuple[Tensor, Tensor, Tensor]:
+    """Two models and their reference, with the real correlation structure.
+
+    The error *ratio* against persistence swings widely from realization to realization --
+    that is what makes each model's marginal skill interval wide -- while the gap between
+    the two models is nearly constant across realizations. On the real corpus this is the
+    narrowband structure: a rough realization is rough for every model.
+
+    Args:
+        n_keys: Number of realizations.
+        gap: Mean advantage of model ``a`` over model ``b`` in error ratio, dimensionless;
+            positive means ``a`` has the lower error and therefore the higher skill.
+        seed: Seed for the severities, ratios and gap jitter.
+
+    Returns:
+        Tuple ``(sse_a, sse_b, sse_persistence)``, each ``(n_keys, 1, 1)`` and in squared
+        corpus units.
+    """
+    rng = np.random.default_rng(seed)
+    severity = rng.uniform(1.0, 20.0, size=(n_keys, 1, 1))
+    ratio = rng.uniform(0.10, 0.60, size=(n_keys, 1, 1))
+    jitter = rng.normal(1.0, 0.02, size=(n_keys, 1, 1))
+    reference = torch.from_numpy(severity)
+    a = torch.from_numpy(severity * ratio)
+    b = torch.from_numpy(severity * (ratio + gap * jitter))
+    return a, b, reference
+
+
+def test_the_paired_difference_is_far_tighter_than_the_unpaired_marginals() -> None:
+    """Two overlapping marginal intervals do not mean the difference is indistinguishable.
+
+    Every model is scored on identical realizations, so the realization-to-realization
+    variation that dominates both marginals cancels in the difference. This is the reading
+    error the audit found on `id`: the `ar20` - `ar_attitude_only` effect is smaller than
+    the `ar20` marginal half-width in 3 of 36 cells, which says nothing at all about the
+    effect once the comparison is paired.
+    """
+    a, b, reference = _paired_fixture(64, gap=0.02, seed=11)
+    horizons = (1,)
+    lo_a, hi_a = bootstrap_skill_ci(a, reference, horizons=horizons)
+    lo_b, hi_b = bootstrap_skill_ci(b, reference, horizons=horizons)
+    diff, lo, hi = paired_skill_difference_ci(a, b, reference, horizons=horizons)
+    # The marginals overlap heavily, so eyeballing them calls the effect indistinguishable.
+    assert lo_a[0, 0] < hi_b[0, 0] and lo_b[0, 0] < hi_a[0, 0]
+    # The paired interval excludes zero and is far tighter than either marginal.
+    assert lo[0, 0] > 0.0
+    assert float(hi[0, 0] - lo[0, 0]) < 0.2 * float(hi_a[0, 0] - lo_a[0, 0])
+    assert diff[0, 0] == pytest.approx(0.02, abs=5e-3)
+
+
+def test_the_paired_difference_of_a_model_with_itself_is_exactly_zero() -> None:
+    """No resample can separate a model from itself; the interval must be degenerate."""
+    reference = _correlated_sse(32, offset=1.0, seed=3)
+    a = _correlated_sse(32, offset=0.4, seed=3)
+    diff, lo, hi = paired_skill_difference_ci(a, a, reference, horizons=(1, 2))
+    assert np.all(diff == 0.0)
+    assert np.all(lo == 0.0)
+    assert np.all(hi == 0.0)
+
+
+def test_the_paired_difference_is_antisymmetric_and_signed_toward_the_first_model() -> None:
+    """Positive means the first argument has the higher skill, i.e. the lower error."""
+    reference = _correlated_sse(48, offset=1.0, seed=5)
+    better = _correlated_sse(48, offset=0.2, seed=5)
+    worse = _correlated_sse(48, offset=0.5, seed=5)
+    diff, lo, hi = paired_skill_difference_ci(better, worse, reference, horizons=(1,))
+    flip_diff, flip_lo, flip_hi = paired_skill_difference_ci(
+        worse, better, reference, horizons=(1,)
+    )
+    assert diff[0, 0] > 0.0
+    assert flip_diff == pytest.approx(-diff)
+    assert flip_lo == pytest.approx(-hi)
+    assert flip_hi == pytest.approx(-lo)
+
+
+def test_the_paired_difference_matches_the_marginal_skills_on_the_full_sample() -> None:
+    """The point estimate must be the difference of the two reported skills, exactly."""
+    reference = _correlated_sse(24, offset=1.0, seed=7)
+    a = _correlated_sse(24, offset=0.3, seed=7)
+    b = _correlated_sse(24, offset=0.45, seed=7)
+    skill_a = 1.0 - float(a[:, 0, 0].sum()) / float(reference[:, 0, 0].sum())
+    skill_b = 1.0 - float(b[:, 0, 0].sum()) / float(reference[:, 0, 0].sum())
+    diff, _lo, _hi = paired_skill_difference_ci(a, b, reference, horizons=(1,))
+    assert float(diff[0, 0]) == pytest.approx(skill_a - skill_b)
+
+
+def test_the_paired_difference_rejects_mismatched_inputs() -> None:
+    """Shapes, horizons and bootstrap parameters are validated, not assumed."""
+    reference = _correlated_sse(16, offset=1.0, seed=9)
+    a = _correlated_sse(16, offset=0.3, seed=9)
+    with pytest.raises(ValueError, match="same realizations and windows"):
+        paired_skill_difference_ci(a, a[:8], reference, horizons=(1,))
+    with pytest.raises(ValueError, match="outside"):
+        paired_skill_difference_ci(a, a, reference, horizons=(99,))
+    with pytest.raises(ValueError, match="n_boot"):
+        paired_skill_difference_ci(a, a, reference, horizons=(1,), n_boot=0)
+    with pytest.raises(ValueError, match="ci_level"):
+        paired_skill_difference_ci(a, a, reference, horizons=(1,), ci_level=1.0)
+    with pytest.raises(ValueError, match="persistence SSE is zero"):
+        paired_skill_difference_ci(a, a, torch.zeros_like(reference), horizons=(1,))

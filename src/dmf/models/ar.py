@@ -21,8 +21,9 @@ appear in input order, so the design matrix of the first ``m`` input channels is
 column subset ``{k * C_in + c : k < p, c < m}`` of the six-channel one -- strided rather
 than a prefix, but still a plain slice of the already-accumulated Gram and cross moments.
 That is what lets ``ar_attitude_only`` (``n_input_used = 3``, the attitudes under the P2-D4
-prefix rule) be fitted from the *same* moments pass as ``ar20`` with no second pass over
-the training split. :func:`dmf.train.closed_form.subset_columns` builds the index and
+prefix rule, at order 40 so that its 120 features match ``ar20``'s 20 x 6 exactly) be
+fitted from the *same* moments pass as ``ar20`` and ``ar40``, with no second pass over the
+training split. :func:`dmf.train.closed_form.subset_columns` builds the index and
 ``tests/test_models.py`` checks the sliced fit against a design matrix built directly on
 three channels.
 """
@@ -105,7 +106,9 @@ class ARForecaster(BaseForecaster):
                 the attitude-only information set. The **target** set is untouched: the
                 model still forecasts all ``C_out`` channels. This is an information-set
                 ablation, not a smaller task, and it is deliberately the only thing that
-                differs between ``ar20`` and ``ar_attitude_only``.
+                differs between ``ar20`` and ``ar_attitude_only`` -- which is why the
+                ablation runs at ``order = 40``: ``40 * 3`` features is exactly ``20 * 6``,
+                so the pair is matched on capacity as well as on solver and ridge.
 
         Raises:
             ValueError: If ``order`` exceeds ``lookback`` or is not positive, if ``ridge``
@@ -135,10 +138,12 @@ class ARForecaster(BaseForecaster):
     def n_fitted_parameters(self) -> int:
         """Coefficient count: ``p * n_input_used * H * C_out`` plus one intercept per output.
 
-        216 900 at ``p = 40`` with the P3 geometry (``L = 200``, ``H = 150``,
-        ``C_in = C_out = 6``); 108 900 for ``ar20`` and 54 900 for ``ar_attitude_only``,
-        which reads three of the six input channels at the same order. Reported instead of
-        the parameter count because the coefficients are buffers.
+        216 900 at ``p = 40`` on all six inputs with the P3 geometry (``L = 200``,
+        ``H = 150``, ``C_in = C_out = 6``); 108 900 for ``ar20``, and 108 900 again for
+        ``ar_attitude_only``, which reads three of the six input channels at twice the
+        order. That equality is the point of the pair and is asserted in
+        ``tests/test_models.py``. Reported instead of the parameter count because the
+        coefficients are buffers.
         """
         if not self._fitted:
             return 0

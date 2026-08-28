@@ -1,18 +1,25 @@
 """Closed-form fitting of the linear baselines from streaming sufficient statistics.
 
-Two models here are exactly solvable, and both are solved from the *same* single pass over
-the training dataloader:
+Three models here are exactly solvable, and all three are solved from the *same* single
+pass over the training dataloader:
 
 - **AR(p)** -- least squares over a lag-major design block. One pass at ``P_MAX`` yields
   the exact normal equations for every ``p <= P_MAX``, because
   :func:`dmf.models.ar.lag_features` is prefix-nested in the order.
 - **Damped persistence** -- one decay constant per channel, minimised over a closed-form
   ``SSE(tau)`` built from three small statistics (:func:`dmf.models.persistence.decay_sse`).
+- **DLinear** (:class:`dmf.models.dlinear_ols.DLinearOLS`) -- least squares over the
+  ``(2L)``-column decomposed design ``[trend_lags, remainder_lags]``, stacked over target
+  channels because the canonical model shares one ``(L -> H)`` map across them. Fitted
+  *beside* the SGD ``dlinear`` row, never instead of it: every ``ar*`` row is at its exact
+  optimum while the SGD row is wherever the epoch budget landed, so without this solve a
+  DLinear-vs-AR gap conflates optimisation with architecture. The difference between the
+  two DLinear rows is the measured optimisation shortfall.
 
 Nothing here ever materialises the design matrix. ``unseen_vessel/train`` holds 1 878 432
 windows, so a stacked ``(N, L, C_in)`` float64 array would be 18 GB and the targets alone
-2.2 GB. The accumulated moments are 240x240 plus 240x150 -- under a megabyte, independent
-of ``N``.
+2.2 GB. The accumulated moments are 240x240 plus 240x150 for AR and 400x400 plus 400x150
+for DLinear -- under two megabytes in total, independent of ``N``.
 
 **One Gram serves all 150 regressions.** The design matrix is identical for every horizon
 step and every target channel, so ``H * C_out = 150`` right-hand sides share one Cholesky
@@ -21,9 +28,10 @@ factorisation.
 **One Gram also serves every information set.** ``lag_features`` is prefix-nested in the
 order *and* channel-strided within each lag block, so both a lower order and a leading
 subset of the input channels are sub-blocks of the same accumulated moments -- see
-:func:`subset_columns`. ``ar_attitude_only`` (AR(20) on roll, pitch and heave only) is
-therefore solved from the ``ar20`` moments and adds **no** pass over the training split,
-which matters because that pass, not the solve, is the whole cost of a closed-form fit.
+:func:`subset_columns`. ``ar_attitude_only`` (AR(40) on roll, pitch and heave only, whose
+120 features are budget-matched to ``ar20``'s 20 x 6) is therefore solved from the same
+moments as every other AR row and adds **no** pass over the training split, which matters
+because that pass, not the solve, is the whole cost of a closed-form fit.
 
 **The solve is centred and whitened.** ``Gc = G/n - outer(mx, mx)`` is rescaled to a
 correlation matrix ``R`` with unit diagonal before the ridge penalty is added, which is
@@ -46,6 +54,8 @@ from scipy.linalg import cho_factor, cho_solve
 from dmf.data.dataset import DeckMotionDataset, make_dataloader
 from dmf.data.normalize import normalize_target
 from dmf.models.ar import ARForecaster, lag_features
+from dmf.models.dlinear import series_decompose
+from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.persistence import DampedPersistence, DecayFit, solve_decay_tau
 from dmf.typedefs import FloatArray, IntArray
 
@@ -53,12 +63,16 @@ __all__ = [
     "ARFitReport",
     "DecayFitReport",
     "DecayMoments",
+    "DecompFitReport",
+    "DecompMoments",
     "LagMoments",
     "TrainingMoments",
     "accumulate_training_moments",
     "fit_ar",
     "fit_damped_persistence",
+    "fit_dlinear_ols",
     "solve_ar_coefficients",
+    "solve_decomp_coefficients",
     "subset_columns",
 ]
 
@@ -122,6 +136,45 @@ class DecayMoments:
 
 
 @dataclass(frozen=True)
+class DecompMoments:
+    """Streaming sufficient statistics for the closed-form DLinear normal equations.
+
+    The canonical DLinear shares one ``(L -> H)`` map per component across target
+    channels, so the regression stacks the channels: one row per (window, target channel)
+    pair, ``n_rows = n_windows * C_out``. Every entry is a float64 sum over those rows.
+
+    Attributes:
+        n_windows: Windows accumulated over.
+        n_rows: Regression rows, ``n_windows * n_target_channels``.
+        sx: ``sum_r feats_r``, shape ``(2 * L,)``.
+        sy: ``sum_r y_r``, shape ``(H,)``.
+        syy: ``sum_r y_r^2`` elementwise, shape ``(H,)``.
+        gram: ``sum_r feats_r feats_r^T``, shape ``(2 * L, 2 * L)``. **Singular by
+            construction**: with ``trend = A x`` and ``remainder = (I - A) x`` the ``2L``
+            columns span an at-most-``L``-dimensional space, so the rank deficiency is a
+            property of the DLinear parameterisation and not of the corpus.
+        cross: ``sum_r feats_r y_r^T``, shape ``(2 * L, H)``.
+        kernel_size: Trend-extraction window the decomposition used, samples. A fit
+            solved from these moments must declare the same one or it is a different model.
+        lookback: ``L``.
+        max_horizon: ``H``.
+        n_target_channels: ``C_out``.
+    """
+
+    n_windows: int
+    n_rows: int
+    sx: FloatArray
+    sy: FloatArray
+    syy: FloatArray
+    gram: FloatArray
+    cross: FloatArray
+    kernel_size: int
+    lookback: int
+    max_horizon: int
+    n_target_channels: int
+
+
+@dataclass(frozen=True)
 class TrainingMoments:
     """Everything the closed-form fitters need, from one pass over the training split.
 
@@ -133,6 +186,10 @@ class TrainingMoments:
         shuffled_targets: True if the targets were permuted within each batch, i.e. these
             moments belong to the shuffle **control** and not to a real model.
         wall_time_s: Wall-clock seconds for the pass, dominated by the dataloader.
+        decomp: DLinear normal-equation statistics, or None if no ``decompose_kernel`` was
+            requested. None rather than zeros, so that asking for a DLinear fit from a pass
+            that never accumulated its design fails loudly instead of solving an empty
+            system.
     """
 
     lag: LagMoments
@@ -141,6 +198,7 @@ class TrainingMoments:
     n_windows: int
     shuffled_targets: bool
     wall_time_s: float
+    decomp: DecompMoments | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +244,35 @@ class DecayFitReport:
     fit_time_s: float
 
 
+@dataclass(frozen=True)
+class DecompFitReport:
+    """Diagnostics from one closed-form DLinear solve.
+
+    Attributes:
+        kernel_size: Trend-extraction window, samples.
+        ridge: Tikhonov strength applied to the whitened correlation matrix,
+            dimensionless.
+        cond_r: Measured 2-norm condition number of the whitened correlation matrix ``R``,
+            dimensionless, **before** the ridge term. Expected to be effectively infinite:
+            the decomposed design is exactly rank-deficient by construction, so this number
+            reports the parameterisation, not a data pathology.
+        n_fitted_parameters: Weights plus intercepts, counted the same way as the SGD twin
+            so the two rows share a budget column.
+        residual_train_mse: Mean squared residual on the training split, dimensionless,
+            computed from the moments rather than by a second pass. Directly comparable to
+            :attr:`dmf.train.loop.TrainResult.best_val_loss` in units, though not in
+            partition.
+        fit_time_s: Wall-clock seconds for the solve alone, excluding the moments pass.
+    """
+
+    kernel_size: int
+    ridge: float
+    cond_r: float
+    n_fitted_parameters: int
+    residual_train_mse: float
+    fit_time_s: float
+
+
 def accumulate_training_moments(
     dataset: DeckMotionDataset,
     *,
@@ -193,8 +280,9 @@ def accumulate_training_moments(
     batch_size: int = 4096,
     num_workers: int = 4,
     shuffle_targets: bool = False,
+    decompose_kernel: int | None = None,
 ) -> TrainingMoments:
-    """Stream the AR and damped-persistence sufficient statistics in one pass.
+    """Stream the AR, damped-persistence and DLinear sufficient statistics in one pass.
 
     Args:
         dataset: The **training** partition to fit on.
@@ -202,6 +290,12 @@ def accumulate_training_moments(
             order is solvable from the leading sub-blocks, so this is called once at 40.
         batch_size: Windows per batch. Affects speed only.
         num_workers: DataLoader worker processes.
+        decompose_kernel: Trend-extraction window of the closed-form DLinear, samples, or
+            None to skip its moments entirely. Passed in rather than defaulted because the
+            kernel is a property of the model config, and accumulating a design at the
+            wrong kernel would silently solve a different model. Adds no pass over the
+            training split -- the decomposition rides on the same batches as the AR
+            design.
         shuffle_targets: If True, permute the targets within each batch **and** draw the
             batches in shuffled order, destroying the input-target correspondence. This is
             the shuffle **control**: a model fitted on these moments must not beat the
@@ -227,7 +321,8 @@ def accumulate_training_moments(
 
     Raises:
         ValueError: If ``dataset`` is not a training partition, if its normalisation
-            statistics were not fitted on train, or if ``max_order`` exceeds the lookback.
+            statistics were not fitted on train, or if ``max_order`` or
+            ``decompose_kernel`` exceeds the lookback.
     """
     if dataset.partition != "train":
         raise ValueError(
@@ -240,6 +335,10 @@ def accumulate_training_moments(
     spec = dataset.window_spec
     if not 1 <= max_order <= spec.lookback:
         raise ValueError(f"max_order must be in [1, lookback={spec.lookback}], got {max_order}")
+    if decompose_kernel is not None and not 1 <= decompose_kernel <= spec.lookback:
+        raise ValueError(
+            f"decompose_kernel must be in [1, lookback={spec.lookback}], got {decompose_kernel}"
+        )
 
     stats = dataset.norm_stats.subset(dataset.target_columns)
     n_in = len(dataset.input_columns)
@@ -256,6 +355,12 @@ def accumulate_training_moments(
     sxx = torch.zeros(n_out, dtype=torch.float64)
     sxy = torch.zeros(horizon, n_out, dtype=torch.float64)
     syy_decay = torch.zeros(n_out, dtype=torch.float64)
+    d_decomp = 2 * spec.lookback
+    sx_d = torch.zeros(d_decomp, dtype=torch.float64)
+    sy_d = torch.zeros(horizon, dtype=torch.float64)
+    syy_d = torch.zeros(horizon, dtype=torch.float64)
+    gram_d = torch.zeros(d_decomp, d_decomp, dtype=torch.float64)
+    cross_d = torch.zeros(d_decomp, horizon, dtype=torch.float64)
     count = 0
 
     generator = torch.Generator().manual_seed(_SHUFFLE_SEED)
@@ -285,6 +390,28 @@ def accumulate_training_moments(
             sxx += torch.square(last).sum(dim=0)
             sxy += torch.einsum("nc,nhc->hc", last, yn)
             syy_decay += torch.square(yn).sum(dim=(0, 1))
+            if decompose_kernel is not None:
+                # One row per (window, target channel): the canonical DLinear shares a
+                # single (L -> H) map across channels, so the channels stack into the same
+                # regression rather than getting one each. Row order is window-major with
+                # the channel minor, and the target below is reshaped the same way -- if
+                # the two ever disagree the fit silently regresses each channel's window on
+                # another channel's future.
+                trend, remainder = series_decompose(xd[:, :, :n_out], decompose_kernel)
+                rows = int(yn.shape[0]) * n_out
+                feats_d = torch.cat(
+                    [
+                        trend.transpose(1, 2).reshape(rows, spec.lookback),
+                        remainder.transpose(1, 2).reshape(rows, spec.lookback),
+                    ],
+                    dim=1,
+                )
+                targets_d = yn.permute(0, 2, 1).reshape(rows, horizon)
+                sx_d += feats_d.sum(dim=0)
+                sy_d += targets_d.sum(dim=0)
+                syy_d += torch.square(targets_d).sum(dim=0)
+                gram_d += feats_d.T @ feats_d
+                cross_d += feats_d.T @ targets_d
     elapsed = time.perf_counter() - started
 
     return TrainingMoments(
@@ -305,6 +432,21 @@ def accumulate_training_moments(
         n_windows=count,
         shuffled_targets=shuffle_targets,
         wall_time_s=elapsed,
+        decomp=None
+        if decompose_kernel is None
+        else DecompMoments(
+            n_windows=count,
+            n_rows=count * n_out,
+            sx=sx_d.numpy(),
+            sy=sy_d.numpy(),
+            syy=syy_d.numpy(),
+            gram=gram_d.numpy(),
+            cross=cross_d.numpy(),
+            kernel_size=decompose_kernel,
+            lookback=spec.lookback,
+            max_horizon=horizon,
+            n_target_channels=n_out,
+        ),
     )
 
 
@@ -371,22 +513,71 @@ def solve_ar_coefficients(
         raise ValueError(f"need at least 2 windows to solve, got {moments.n}")
 
     cols = _design_columns(moments, order=order, n_input_used=n_input_used)
-    n = float(moments.n)
-    mx = moments.sx[cols] / n
-    my = moments.sy / n
-    gram_c = moments.gram[np.ix_(cols, cols)] / n - np.outer(mx, mx)
-    cross_c = moments.cross[cols, :] / n - np.outer(mx, my)
-    d = int(cols.size)
+    # Reported as columns of the *accumulated* design, not of the subset: under
+    # ``n_input_used`` the two numberings differ, and an index that does not point at the
+    # offending lag/channel pair sends the reader to the wrong feature.
+    return _solve_centred_whitened(
+        n=float(moments.n),
+        sx=moments.sx[cols],
+        sy=moments.sy,
+        gram=moments.gram[np.ix_(cols, cols)],
+        cross=moments.cross[cols, :],
+        ridge=ridge,
+        labels=cols,
+        feature_kind="lag features",
+    )
+
+
+def _solve_centred_whitened(
+    *,
+    n: float,
+    sx: FloatArray,
+    sy: FloatArray,
+    gram: FloatArray,
+    cross: FloatArray,
+    ridge: float,
+    labels: IntArray,
+    feature_kind: str,
+) -> tuple[FloatArray, FloatArray, float]:
+    """Solve one centred, whitened, ridge-regularised least-squares system.
+
+    Shared by every closed-form linear fit in this module, so that "same solver, same
+    ridge treatment" is a fact about the code rather than a claim in a config comment. The
+    Gram is centred, rescaled to a correlation matrix with unit diagonal, penalised, and
+    factorised by Cholesky; a singular system falls back to ``lstsq``, whose minimum-norm
+    solution is still an exact minimiser of the squared error.
+
+    Args:
+        n: Row count the sums were accumulated over.
+        sx: ``sum feats``, shape ``(d,)``.
+        sy: ``sum y``, shape ``(k,)``.
+        gram: ``sum feats feats^T``, shape ``(d, d)``.
+        cross: ``sum feats y^T``, shape ``(d, k)``.
+        ridge: Tikhonov strength on the unit diagonal of the correlation matrix,
+            dimensionless.
+        labels: Column identifiers used in the zero-variance error message, shape ``(d,)``.
+        feature_kind: Human-readable name of the design columns, for that same message.
+
+    Returns:
+        Tuple ``(weight, bias, cond_r)`` with ``weight`` of shape ``(d, k)``, ``bias`` of
+        shape ``(k,)``, both dimensionless, and the condition number of the correlation
+        matrix **before** regularisation.
+
+    Raises:
+        ValueError: If a design column has zero variance on the training split.
+    """
+    mx = sx / n
+    my = sy / n
+    gram_c = gram / n - np.outer(mx, mx)
+    cross_c = cross / n - np.outer(mx, my)
+    d = int(mx.size)
 
     scale = np.sqrt(np.diag(gram_c))
     dead = np.flatnonzero(scale <= 0.0)
     if dead.size:
-        # Reported as columns of the *accumulated* design, not of the subset: under
-        # ``n_input_used`` the two numberings differ, and an index that does not point at
-        # the offending lag/channel pair sends the reader to the wrong feature.
         raise ValueError(
-            f"lag features {cols[dead].tolist()} have zero variance on the training split; "
-            f"the normal equations are singular"
+            f"{feature_kind} {labels[dead].tolist()} have zero variance on the training "
+            f"split; the normal equations are singular"
         )
     corr = gram_c / np.outer(scale, scale)
     corr = 0.5 * (corr + corr.T)
@@ -401,6 +592,48 @@ def solve_ar_coefficients(
     weight = z / scale[:, None]
     bias = my - weight.T @ mx
     return weight, bias, cond_r
+
+
+def solve_decomp_coefficients(
+    moments: DecompMoments, *, ridge: float
+) -> tuple[FloatArray, FloatArray, float]:
+    """Solve the centred, whitened normal equations of the closed-form DLinear.
+
+    Same solver, same centring, same whitening and the same ridge treatment as
+    :func:`solve_ar_coefficients` -- the two rows of the results table must not differ in
+    how their optimum was found, only in what design it was found over.
+
+    The system is **singular by construction** (see :class:`DecompMoments`), so the
+    regularised factorisation is what makes the solve well posed; at ``ridge = 0`` the
+    ``lstsq`` fallback returns the minimum-norm exact minimiser instead. Either way the
+    resulting *forecast* is unique even though the coefficients are not.
+
+    Args:
+        moments: Decomposed-design statistics from :func:`accumulate_training_moments`.
+        ridge: Tikhonov strength on the whitened correlation matrix, dimensionless.
+
+    Returns:
+        Tuple ``(weight, bias, cond_r)`` with ``weight`` of shape ``(2 * L, H)`` --
+        trend rows first, both blocks in window order -- ``bias`` of shape ``(H,)``, and
+        the measured condition number before regularisation.
+
+    Raises:
+        ValueError: If ``ridge`` is negative or fewer than two rows were accumulated.
+    """
+    if ridge < 0.0:
+        raise ValueError(f"ridge must be non-negative, got {ridge}")
+    if moments.n_rows < 2:
+        raise ValueError(f"need at least 2 regression rows to solve, got {moments.n_rows}")
+    return _solve_centred_whitened(
+        n=float(moments.n_rows),
+        sx=moments.sx,
+        sy=moments.sy,
+        gram=moments.gram,
+        cross=moments.cross,
+        ridge=ridge,
+        labels=np.arange(moments.sx.size, dtype=np.int64),
+        feature_kind="decomposed design columns",
+    )
 
 
 def _design_columns(moments: LagMoments, *, order: int, n_input_used: int | None) -> IntArray:
@@ -436,12 +669,49 @@ def _ar_residual_mse(
         dimensionless.
     """
     cols = _design_columns(moments, order=order, n_input_used=n_input_used)
-    n = float(moments.n)
-    mx = moments.sx[cols] / n
-    my = moments.sy / n
-    gram_c = moments.gram[np.ix_(cols, cols)] / n - np.outer(mx, mx)
-    cross_c = moments.cross[cols, :] / n - np.outer(mx, my)
-    syy_c = moments.syy / n - np.square(my)
+    return _residual_mse(
+        n=float(moments.n),
+        sx=moments.sx[cols],
+        sy=moments.sy,
+        syy=moments.syy,
+        gram=moments.gram[np.ix_(cols, cols)],
+        cross=moments.cross[cols, :],
+        weight=weight,
+    )
+
+
+def _residual_mse(
+    *,
+    n: float,
+    sx: FloatArray,
+    sy: FloatArray,
+    syy: FloatArray,
+    gram: FloatArray,
+    cross: FloatArray,
+    weight: FloatArray,
+) -> float:
+    """Return the training MSE of a solved linear model, from its moments alone.
+
+    Second passes over a 1.9 M-window training split are the expensive part of a
+    closed-form fit, so the residual comes out of the same sums the solve used.
+
+    Args:
+        n: Row count the sums were accumulated over.
+        sx: ``sum feats``, shape ``(d,)``.
+        sy: ``sum y``, shape ``(k,)``.
+        syy: ``sum y^2`` elementwise, shape ``(k,)``.
+        gram: ``sum feats feats^T``, shape ``(d, d)``.
+        cross: ``sum feats y^T``, shape ``(d, k)``.
+        weight: Solved coefficients, shape ``(d, k)``.
+
+    Returns:
+        Mean squared residual over rows and outputs, dimensionless.
+    """
+    mx = sx / n
+    my = sy / n
+    gram_c = gram / n - np.outer(mx, mx)
+    cross_c = cross / n - np.outer(mx, my)
+    syy_c = syy / n - np.square(my)
     quad = np.einsum("dj,dk,kj->j", weight, gram_c, weight)
     return float(np.mean(syy_c - 2.0 * np.einsum("dj,dj->j", weight, cross_c) + quad))
 
@@ -559,6 +829,86 @@ def fit_damped_persistence(
     residual = float(np.sum(fit.sse) / (decay.n * decay.sxy.shape[0] * n_target_channels))
     return model, DecayFitReport(
         fit=fit,
+        n_fitted_parameters=model.n_fitted_parameters,
+        residual_train_mse=residual,
+        fit_time_s=elapsed,
+    )
+
+
+def fit_dlinear_ols(
+    moments: TrainingMoments,
+    *,
+    kernel_size: int,
+    ridge: float,
+    lookback: int,
+    n_input_channels: int,
+    n_target_channels: int,
+) -> tuple[DLinearOLS, DecompFitReport]:
+    """Fit a :class:`dmf.models.dlinear_ols.DLinearOLS` from accumulated moments.
+
+    Deterministic: no RNG enters this path, so the model emits a single results row with
+    ``deterministic=True`` -- the same exemption AR gets, for the same reason.
+
+    Args:
+        moments: One pass of training moments, accumulated with ``decompose_kernel`` set.
+        kernel_size: Trend-extraction window, samples. Must equal the kernel the moments
+            were accumulated at.
+        ridge: Tikhonov strength on the whitened correlation matrix, dimensionless.
+        lookback: Input window length ``L``, samples.
+        n_input_channels: ``C_in`` -- the width of the windows the fitted model will be
+            handed at inference.
+        n_target_channels: ``C_out``.
+
+    Returns:
+        Tuple ``(model, report)``; the model is fitted and in eval mode.
+
+    Raises:
+        ValueError: If the moments carry no decomposed design, if they were accumulated at
+            a different kernel, or if they do not match the requested geometry.
+    """
+    decomp = moments.decomp
+    if decomp is None:
+        raise ValueError(
+            "these moments carry no decomposed design; accumulate_training_moments must be "
+            "called with decompose_kernel set, or the DLinear solve has nothing to read"
+        )
+    if decomp.kernel_size != kernel_size:
+        raise ValueError(
+            f"moments were accumulated at kernel_size={decomp.kernel_size} but the model "
+            f"wants {kernel_size}; the two would be different models sharing a label"
+        )
+    if decomp.lookback != lookback or decomp.n_target_channels != n_target_channels:
+        raise ValueError(
+            f"moments cover L={decomp.lookback}, C_out={decomp.n_target_channels} but the "
+            f"model wants L={lookback}, C_out={n_target_channels}"
+        )
+    started = time.perf_counter()
+    weight, bias, cond_r = solve_decomp_coefficients(decomp, ridge=ridge)
+    residual = _residual_mse(
+        n=float(decomp.n_rows),
+        sx=decomp.sx,
+        sy=decomp.sy,
+        syy=decomp.syy,
+        gram=decomp.gram,
+        cross=decomp.cross,
+        weight=weight,
+    )
+    elapsed = time.perf_counter() - started
+
+    model = DLinearOLS(
+        lookback=lookback,
+        max_horizon=decomp.max_horizon,
+        n_input_channels=n_input_channels,
+        n_target_channels=n_target_channels,
+        kernel_size=kernel_size,
+        ridge=ridge,
+    )
+    model.set_coefficients(weight, bias)
+    model.eval()
+    return model, DecompFitReport(
+        kernel_size=kernel_size,
+        ridge=ridge,
+        cond_r=cond_r,
         n_fitted_parameters=model.n_fitted_parameters,
         residual_train_mse=residual,
         fit_time_s=elapsed,

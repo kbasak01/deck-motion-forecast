@@ -30,10 +30,31 @@ threshold, read at the decision horizon (10 s) on the binding DOF (pitch), where
 0.545 (`ideal`) / 0.513 (`imu`). Both the original failure and the restatement are recorded in
 `docs/protocol.md` §Phase 3, which is the full decision log for this phase.
 
-The full 7-model x 4-regime baseline sweep has not been run, so `results/baselines.csv` does not
-yet exist. No deep model is trained yet — that is Phase 4. See `docs/IMPLEMENTATION_PLAN.md` for
-the build plan and `CLAUDE.md` for the working rules. This README is replaced by the full write-up
-in Phase 9.
+`results/baselines.csv` (`ideal`) and `results/imu/baselines.csv` (`imu`) now carry the full sweep:
+1296 rows each, nine baselines x four regimes x six DOFs x six horizons, three seeds for the one
+SGD-fitted model and deterministic single rows for the eight closed-form ones. Regenerate with
+`make train`. No deep model is trained yet — that is Phase 4.
+
+**Read the gate number with its context.** Passing is one cell of thirty-six. On `id`, AR(20) still
+exceeds 0.8 skill in 28 of 36 cells, and across the 1–5 s operational band it exceeds 0.8 in 89 of
+96 cells over all four regimes. The task is easy by construction; the gate marks where it stops
+being easy, not that it is hard. A zero-parameter `window_mean` baseline beats persistence — the
+denominator of every skill score here — in 107 of 144 cells.
+
+Two results worth stating plainly, both of which reversed an earlier claim of ours:
+
+- **A converged linear model is competitive.** `dlinear_ols` (60 300 parameters, solved closed-form)
+  scores 0.568 at the gate cell against AR(20)'s 0.545 with 108 900 parameters. Before the
+  closed-form row existed, DLinear was trained by SGD to a 60-epoch cap that early stopping never
+  reached, and the resulting shortfall was being read as an architecture gap. It is not, under
+  `ideal`. Under `imu`, where DLinear does converge, AR wins.
+- **The rate channels are worth less than they first appeared, and the answer depends on
+  observability.** At matched capacity the rate channels are worth +0.0046 median skill under
+  `ideal` — less than the +0.0063 from simply doubling the lag budget — but +0.0091 under `imu`,
+  where corrupted attitudes stop making them redundant.
+
+`docs/protocol.md` §Phase 3 is the full decision log, including the defects an adversarial audit
+found in the first sweep and what changed as a result.
 
 A caveat that travels with every number here: the generator has no process noise, so the
 achievable-skill ceiling is unrealistically high and absolute values flatter every model. Only

@@ -9,8 +9,9 @@ Per regime, exactly once:
 2. Build the ``train`` dataset, which fits the normalisation statistics; build ``val`` and
    ``test`` **with those statistics**, never their own.
 3. One pass of :func:`dmf.train.closed_form.accumulate_training_moments` at ``P_MAX``,
-   serving damped persistence and every AR variant -- all three orders, and the
-   attitude-only information set, which is a channel-subset slice of the same moments.
+   serving damped persistence, every AR variant -- all three orders, and the attitude-only
+   information set, which is a channel-subset slice of the same moments -- and the
+   closed-form DLinear, whose decomposed design rides on the same batches.
 4. One :func:`dmf.train.loop.fit` per (SGD model, seed).
 5. One :func:`dmf.eval.runner.evaluate_models` pass scoring **every** model on identical
    windows, so the skill denominator is structurally the same for all of them.
@@ -44,12 +45,14 @@ from dmf.eval.controls import (
 from dmf.eval.report import build_baselines_markdown, build_baselines_table, write_table
 from dmf.eval.runner import evaluate_models, marginalize_cells, per_cell_metrics
 from dmf.models.base import BaseForecaster
+from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.persistence import TAU_WINDOW_MEAN, DampedPersistence
 from dmf.train.closed_form import (
     TrainingMoments,
     accumulate_training_moments,
     fit_ar,
     fit_damped_persistence,
+    fit_dlinear_ols,
 )
 from dmf.train.loop import fit, set_seed
 from dmf.train.registry import MODEL_REGISTRY, build_model
@@ -59,6 +62,17 @@ __all__ = ["PERSISTENCE_LABEL", "RunRecord", "run_experiment"]
 #: Label of the reference model. Every skill score's denominator comes from this model's
 #: accumulator, so the experiment refuses to run without it in the config.
 PERSISTENCE_LABEL = "persistence"
+
+#: The (DOF, horizon) cell the Gate 3 threshold is read at, restated by ``docs/protocol.md``
+#: P3-D12 (applied 2026-08-27) from roll at 3 s to **pitch at 10 s**. The threshold value
+#: itself is unchanged at 0.8; only the cell moved, to the horizon the landing decision is
+#: taken at and the DOF that actually binds. Roll at 3 s is a quarter of the 12 s roll
+#: period on the most narrowband channel in the corpus, i.e. the easiest cell there is, and
+#: it saturates at 0.9987 whatever the model. Named here rather than passed as a literal:
+#: ``results/baselines.md`` is the document the gate decision is read from, and the
+#: committed artifact declared the superseded cell while the README claimed the gate passed.
+GATE_DOF = "pitch"
+GATE_HORIZON_SAMPLES = 100
 
 #: Separator in the per-run key ``"<label>@<seed>"`` that every model of a regime is scored
 #: under, so that three seeds of one model stay three entries in the scoring pass rather
@@ -82,6 +96,16 @@ class RunRecord:
         fit_time_s: Wall-clock seconds to fit. CPU for closed-form models, device
             wall-clock **including data loading** for SGD models -- not comparable between
             the two, and labelled as such in the report.
+        best_epoch: Zero-indexed epoch of the lowest validation loss, or None for a model
+            with no epochs. Carried into ``baselines_by_seed.csv`` so that "was this model
+            still converging when the budget ran out?" is answerable from the committed
+            artifact. The `dlinear` under-convergence that motivated ``dlinear_ols`` had to
+            be inferred from wall-clock ratios because these three fields were computed by
+            :class:`dmf.train.loop.TrainResult` and then discarded here.
+        epochs_run: Epochs completed before early stopping or exhaustion, or None. Equal to
+            ``cfg.train.epochs`` means the run hit the cap rather than converging.
+        best_val_loss: Lowest validation loss reached, dimensionless, or None. Directly
+            comparable to a closed-form model's residual only in units, not in partition.
     """
 
     label: str
@@ -90,6 +114,9 @@ class RunRecord:
     deterministic: bool
     n_params: int
     fit_time_s: float
+    best_epoch: int | None = None
+    epochs_run: int | None = None
+    best_val_loss: float | None = None
 
 
 def _instantiate(
@@ -173,6 +200,23 @@ def _fit_one(
                     decay_report.fit_time_s,
                 )
             ]
+        if issubclass(MODEL_REGISTRY[cfg.name], DLinearOLS):
+            ols_model, ols_report = fit_dlinear_ols(
+                moments,
+                kernel_size=int(cfg.params["kernel_size"]),
+                ridge=float(cfg.params.get("ridge", 0.0)),
+                **common,
+            )
+            return [
+                RunRecord(
+                    cfg.label,
+                    0,
+                    ols_model,
+                    True,
+                    ols_report.n_fitted_parameters,
+                    ols_report.fit_time_s,
+                )
+            ]
         # `n_input_used` is read here rather than defaulted inside `fit_ar` because
         # ignoring it would fit the six-channel model and label it `ar_attitude_only`,
         # which is a silently wrong row rather than a loud failure. Slicing the cached
@@ -214,7 +258,17 @@ def _fit_one(
         result = fit(model, train_loader, val_loader, experiment.train, seed, checkpoint_dir)
         model.eval()
         records.append(
-            RunRecord(cfg.label, seed, model, False, model.n_fitted_parameters, result.wall_time_s)
+            RunRecord(
+                cfg.label,
+                seed,
+                model,
+                False,
+                model.n_fitted_parameters,
+                result.wall_time_s,
+                best_epoch=result.best_epoch,
+                epochs_run=result.epochs_run,
+                best_val_loss=result.best_val_loss,
+            )
         )
     return records
 
@@ -237,6 +291,7 @@ def _moments(
             train,
             max_order=_max_order(experiment),
             num_workers=experiment.train.num_workers,
+            decompose_kernel=_decompose_kernel(experiment),
         )
     return holder["moments"]
 
@@ -252,6 +307,38 @@ def _max_order(experiment: ExperimentConfig) -> int:
     """
     orders = [int(m.params["order"]) for m in experiment.models if "order" in m.params]
     return max(orders, default=1)
+
+
+def _decompose_kernel(experiment: ExperimentConfig) -> int | None:
+    """Return the trend kernel the closed-form DLinear needs, samples, or None.
+
+    Read from the configs rather than defaulted, and only for models that are actually
+    solved in closed form: accumulating the decomposed design at the wrong kernel would
+    solve a different model under the configured label, and accumulating it when nothing
+    reads it would spend a 400x400 float64 Gram per batch for nothing.
+
+    Args:
+        experiment: The experiment config.
+
+    Returns:
+        The kernel size, or None if no closed-form DLinear is configured.
+
+    Raises:
+        ValueError: If two closed-form DLinear configs ask for different kernels. One pass
+            accumulates one design, so the second row would silently be solved from the
+            first one's moments.
+    """
+    kernels = {
+        int(m.params["kernel_size"])
+        for m in experiment.models
+        if issubclass(MODEL_REGISTRY[m.name], DLinearOLS) and "kernel_size" in m.params
+    }
+    if len(kernels) > 1:
+        raise ValueError(
+            f"closed-form DLinear configs ask for different kernel sizes {sorted(kernels)}; "
+            f"one moments pass can only carry one decomposed design"
+        )
+    return kernels.pop() if kernels else None
 
 
 def _split_run_keys(frame: pd.DataFrame) -> pd.DataFrame:
@@ -402,6 +489,11 @@ def run_experiment(
                     "deterministic": record.deterministic,
                     "n_params": record.n_params,
                     "fit_time_s": record.fit_time_s,
+                    # NaN, not a sentinel epoch count: a closed-form model has no epochs,
+                    # and 0 would read as "stopped immediately" in the committed CSV.
+                    "best_epoch": record.best_epoch,
+                    "epochs_run": record.epochs_run,
+                    "best_val_loss": record.best_val_loss,
                 }
                 for key, record in keyed.items()
             ]
@@ -469,7 +561,13 @@ def run_experiment(
         aggregated,
         controls=controls,
         by_heading=heading_marginals[0] if heading_marginals else None,
+        # Explicit, so the document cites the run's own artifacts. Defaulting it would
+        # render provenance as bare filenames -- vaguer, but never wrong, which is why the
+        # `imu` document previously pointing at the `ideal` CSVs was the failure worth
+        # avoiding.
+        results_dir=results_dir,
         gate_regime=_gate_regime(chosen),
+        gate_dof=GATE_DOF,
         gate_horizon_samples=_gate_horizon(experiment.data.horizons),
     )
     (results_dir / "baselines.md").write_text(markdown, encoding="utf-8")
@@ -479,9 +577,9 @@ def run_experiment(
 def _gate_horizon(horizons: tuple[int, ...]) -> int:
     """Return the horizon the Gate 3 threshold is read at, samples.
 
-    Gate 3 is stated at 3 s, i.e. 30 samples at 10 Hz, and that is what the production
-    config reports. A cut-down geometry that does not contain 30 falls back to its longest
-    horizon so the report still renders; production is unaffected.
+    :data:`GATE_HORIZON_SAMPLES` -- 100 samples, i.e. 10 s at 10 Hz -- is what the
+    production configs report. A cut-down geometry that does not contain it falls back to
+    its longest horizon so the report still renders; production is unaffected.
 
     Args:
         horizons: Reported horizons, samples, ascending.
@@ -489,7 +587,7 @@ def _gate_horizon(horizons: tuple[int, ...]) -> int:
     Returns:
         The gate horizon, samples.
     """
-    return 30 if 30 in horizons else horizons[-1]
+    return GATE_HORIZON_SAMPLES if GATE_HORIZON_SAMPLES in horizons else horizons[-1]
 
 
 def _gate_regime(regimes: tuple[str, ...]) -> str:
@@ -560,10 +658,12 @@ def _run_controls(
         # AR(20) on the full input set is the Gate 3 subject, so it is what the shuffle
         # control refits. Explicit rather than a max() over a predicate: that form returns
         # the first maximal element and so happens to be right only while ar20 precedes
-        # ar40 in the config list. `n_input_used` is excluded because `ar_attitude_only`
-        # also carries order 20; a control run on the ablation would test a model that is
-        # not the headline one and would depend on config order to notice. The fallback
-        # keeps the control running on a cut-down config that ships some other order.
+        # ar40 in the config list. `n_input_used` is excluded so that the control can never
+        # land on an information-set ablation whatever order that ablation is configured
+        # at -- `ar_attitude_only` carried order 20 until the capacity match moved it to 40,
+        # and a control run on the ablation would test a model that is not the headline one
+        # while depending on config order to notice. The fallback keeps the control running
+        # on a cut-down config that ships some other order.
         target = next(
             (m for m in ar_cfgs if int(m.params["order"]) == 20 and "n_input_used" not in m.params),
             ar_cfgs[0],

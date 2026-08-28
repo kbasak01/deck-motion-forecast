@@ -20,8 +20,19 @@ stochastic rows through it and passes deterministic rows around it.
 different columns. The first is seed-to-seed spread of the fitting procedure; the second is
 a bootstrap over held-out **realizations** (:func:`dmf.eval.runner.bootstrap_skill_ci`) and
 is the one that says whether a skill score near a gate threshold is distinguishable from it.
+
+**That second pair is a confidence interval only on a single-seed row.** The bootstrap runs
+per run, so aggregating over seeds has to combine finished intervals, and no arithmetic on
+finished intervals recovers a calibrated interval for the seed mean -- averaging them, which
+is what this module used to do, produces something narrower than any input interval's own
+coverage justifies and hides seed disagreement entirely. Multi-seed rows therefore carry the
+**envelope** (lowest low, highest high): conservative, contains every seed's interval, and it
+widens rather than hides when the seeds disagree. :func:`baselines_caveats` says so next to
+every rendered table. A calibrated seed-mean interval would have to pool the bootstrap
+resamples across seeds inside :mod:`dmf.eval.runner`, which is a re-run, not an aggregation.
 """
 
+import contextlib
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -31,11 +42,13 @@ import pandas as pd
 from dmf.data.channels import channel_aliases
 
 __all__ = [
+    "BASELINES_ARTIFACTS",
     "BASELINES_COLUMNS",
     "BASELINES_GROUP_COLS",
     "BASELINES_METRIC_COLS",
     "aggregate_over_seeds",
     "aggregate_results",
+    "baselines_caveats",
     "build_baselines_markdown",
     "build_baselines_table",
     "build_results_report",
@@ -75,31 +88,170 @@ BASELINES_COLUMNS: tuple[str, ...] = (
     "fit_time_s_mean",
 )
 
-#: Caveats that must travel with the baseline tables. Each one is a case where a number is
-#: real but means something other than what it looks like.
-BASELINES_CAVEATS: tuple[str, ...] = (
-    "**These are simulated results.** No real deck data is used anywhere in this project.",
-    "**`unseen_heading` pitch sits on the P1-D2 residual floor.** That regime's test set "
-    "*is* beam seas, where the pitch heading factor is floored at `eps = 0.05` -- about "
-    "26 dB below its maximum -- and is therefore driven by an engineering stand-in for hull "
-    "asymmetry rather than by the pitch physics. Its persistence RMSE is correspondingly "
-    "tiny and its skill is dominated by that stand-in. Never quote that cell without this "
-    "sentence.",
-    "**The `id` regime pools 4 headings x 4 sea states x 3 speeds**, and per P1-D2 roll in "
-    "head seas is on the same residual floor. A pooled roll skill of 0.85 could be 0.93 at "
-    "beam and 0.6 at head, or the reverse; `baselines_by_cell.csv` is what distinguishes "
-    "them, and the follow-on decision depends on which it is.",
-    "**`n_windows` is a window count, not an independent-sample count.** At `stride = 5` "
-    "with a 200-sample lookback, consecutive test windows overlap by 195/200 samples. The "
-    "441 984 windows of `id/test` come from 384 independently simulated realizations, which "
-    "is why `skill_ci_lo`/`skill_ci_hi` bootstrap whole realizations and never windows.",
-    "**`fit_time_s_mean` is not apples-to-apples.** It is CPU wall-clock for the "
-    "closed-form models and GPU wall-clock *including data loading* for the SGD-fitted "
-    "ones. No throughput claim is made from it.",
-    "**`imu` observation mode is not a drop-in comparison.** Per P1-D6/P2-D8, `imu` inputs "
-    "must be scored against `imu` targets, which changes the persistence denominator; skill "
-    "scores across observation modes are therefore not comparable.",
+#: The artifacts a baselines run writes, in the order the provenance line names them, each
+#: paired with what it holds. Single source of truth: the ``baselines.md`` provenance line is
+#: generated from this rather than written out in prose, so a renamed or added artifact
+#: cannot leave the document pointing at a file that no longer exists. The *directory* is
+#: supplied by the caller and is deliberately not baked in here -- a run writing to
+#: ``results/imu/`` used to emit a provenance line naming ``results/baselines*.csv``, i.e.
+#: the other observation mode's files, which the last caveat below explicitly warns against
+#: mixing with these numbers.
+BASELINES_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("baselines.csv", "aggregated"),
+    ("baselines_by_seed.csv", "one row per run, the source of truth"),
+    ("baselines_by_cell.csv", "per grid cell"),
+    ("baselines_controls.csv", "negative controls"),
 )
+
+#: Artifacts written only when the negative controls are run, so the provenance line must
+#: not name them otherwise.
+_CONTROL_ARTIFACTS: frozenset[str] = frozenset({"baselines_controls.csv"})
+
+
+def _grouped(count: int) -> str:
+    """Render an integer with space-separated thousands, e.g. ``1 234 567``.
+
+    Args:
+        count: A non-negative count.
+
+    Returns:
+        The digits grouped in threes by spaces, matching the style of the prose these
+        numbers are embedded in.
+    """
+    return f"{count:,}".replace(",", " ")
+
+
+def _display_dir(results_dir: Path) -> str:
+    """Render a results directory as a path prefix for the provenance line.
+
+    Args:
+        results_dir: Directory the artifacts were written to.
+
+    Returns:
+        A POSIX prefix ending in ``/`` (e.g. ``"results/imu/"``), relative to the current
+        working directory when it is below it so that a committed document names a
+        repo-relative path, and empty for the current directory itself.
+    """
+    path = Path(results_dir)
+    # Not below the CWD (absolute, or a sibling): name it as given rather than guess.
+    with contextlib.suppress(ValueError):
+        path = path.relative_to(Path.cwd())
+    text = path.as_posix().rstrip("/")
+    return "" if text in ("", ".") else f"{text}/"
+
+
+def _provenance_line(results_dir: Path | None, *, with_controls: bool) -> str:
+    """Render the sentence naming the files a rendered document was built from.
+
+    Args:
+        results_dir: Directory the artifacts were written to. ``None`` means the caller did
+            not say, in which case the files are named by bare filename and located
+            relative to the document -- true in any directory, where a guessed
+            ``results/`` prefix would be false in all but one.
+        with_controls: Whether the controls table was written. Naming a file that was not
+            written is the same defect as naming the wrong one.
+
+    Returns:
+        One Markdown sentence.
+    """
+    named = [
+        (name, what)
+        for name, what in BASELINES_ARTIFACTS
+        if with_controls or name not in _CONTROL_ARTIFACTS
+    ]
+    if results_dir is None:
+        where = "the CSVs beside this document"
+        prefix = ""
+    else:
+        where = "the CSVs it was written from"
+        prefix = _display_dir(results_dir)
+    rendered = [f"`{prefix}{name}` ({what})" for name, what in named]
+    joined = (
+        rendered[0] if len(rendered) == 1 else ", ".join(rendered[:-1]) + " and " + rendered[-1]
+    )
+    return f"Every number here traces to {where}: {joined}."
+
+
+def baselines_caveats(
+    table: pd.DataFrame | None = None, *, gate_regime: str = "id"
+) -> tuple[str, ...]:
+    """Caveats that must travel with the baseline tables.
+
+    Each one is a case where a number is real but means something other than what it looks
+    like. Two of them are **measured from** ``table`` rather than written as literals. That
+    is not fastidiousness: a window count pinned in this prose survived the P3-D4 task
+    revision that changed it (441 984 -> 434 304, P3-D6) and was rendered into every
+    committed ``baselines.md``. The table-free wording therefore carries no geometry number
+    at all, and the wording used when a table is supplied reads the number off the table it
+    is printed beside, so the two cannot disagree.
+
+    Args:
+        table: The aggregated table from :func:`build_baselines_table`. When given, the
+            window count and the interval caveat are derived from it.
+        gate_regime: Regime whose test-partition window count is quoted, matching the
+            document's gate cell. A count for another regime would be true but irrelevant.
+
+    Returns:
+        Markdown sentences, one caveat each, in rendering order.
+    """
+    scored = table if table is not None and not table.empty else None
+    counts: list[int] = []
+    if scored is not None and {"regime", "n_windows"} <= set(scored.columns):
+        counts = sorted({int(v) for v in scored.loc[scored["regime"] == gate_regime, "n_windows"]})
+    # One distinct count means every row of that regime was scored over one window set, which
+    # is what the single-pass runner guarantees. Anything else and quoting a single number
+    # would be a claim the table does not support, so the sentence drops the number instead.
+    scale = (
+        f"The {_grouped(counts[0])} windows of `{gate_regime}/test` reported here are"
+        if len(counts) == 1
+        else "Test windows are"
+    )
+    # Unknown means "assume it applies": a caveat printed unnecessarily costs a line, an
+    # omitted one costs a misread interval.
+    multi_seed = (
+        scored is None or "n_seeds" not in scored.columns or bool((scored["n_seeds"] > 1).any())
+    )
+    caveats = [
+        "**These are simulated results.** No real deck data is used anywhere in this project.",
+        "**`unseen_heading` pitch sits on the P1-D2 residual floor.** That regime's test set "
+        "*is* beam seas, where the pitch heading factor is floored at `eps = 0.05` -- about "
+        "26 dB below its maximum -- and is therefore driven by an engineering stand-in for hull "
+        "asymmetry rather than by the pitch physics. Its persistence RMSE is correspondingly "
+        "tiny and its skill is dominated by that stand-in. Never quote that cell without this "
+        "sentence.",
+        "**The `id` regime pools 4 headings x 4 sea states x 3 speeds**, and per P1-D2 roll in "
+        "head seas is on the same residual floor. A pooled roll skill of 0.85 could be 0.93 at "
+        "beam and 0.6 at head, or the reverse; `baselines_by_cell.csv` is what distinguishes "
+        "them, and the follow-on decision depends on which it is.",
+        "**`n_windows` is a window count, not an independent-sample count.** " + scale + " cut "
+        "at a stride far shorter than the lookback, so consecutive windows share almost all of "
+        "their input samples and their forecast targets overlap. They come from a much smaller "
+        "number of independently simulated realizations -- `baselines_by_seed.csv` carries that "
+        "count in `n_realizations` -- which is why `skill_ci_lo`/`skill_ci_hi` bootstrap whole "
+        "realizations and never windows.",
+    ]
+    if multi_seed:
+        caveats.append(
+            "**`skill_ci_lo`/`skill_ci_hi` is a confidence interval only on a single-seed "
+            "row.** The bootstrap over held-out realizations runs per *run*, so a row with "
+            "`n_seeds = 1` carries that run's interval unchanged, but a row with "
+            "`n_seeds > 1` can only combine finished intervals. It carries their **envelope** "
+            "-- lowest low, highest high -- which is conservative, contains every seed's own "
+            "interval, and widens when the seeds disagree instead of hiding it. It is *not* a "
+            "calibrated interval for the seed-mean skill: that would have to pool the "
+            "bootstrap resamples across seeds at scoring time. The per-run intervals are in "
+            "`baselines_by_seed.csv`; do not read a multi-seed row's interval as a 95% "
+            "statement."
+        )
+    caveats += [
+        "**`fit_time_s_mean` is not apples-to-apples.** It is CPU wall-clock for the "
+        "closed-form models and GPU wall-clock *including data loading* for the SGD-fitted "
+        "ones. No throughput claim is made from it.",
+        "**`imu` observation mode is not a drop-in comparison.** Per P1-D6/P2-D8, `imu` inputs "
+        "must be scored against `imu` targets, which changes the persistence denominator; skill "
+        "scores across observation modes are therefore not comparable.",
+    ]
+    return tuple(caveats)
 
 
 def write_table(df: pd.DataFrame, path: Path) -> Path:
@@ -337,7 +489,11 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
 
     Returns:
         One row per (model, regime, DOF, horizon), columns :data:`BASELINES_COLUMNS`,
-        sorted by ``regime, model, dof, horizon_samples``.
+        sorted by ``regime, model, dof, horizon_samples``. ``skill_ci_lo``/``skill_ci_hi``
+        are the per-run realization bootstrap interval for a single-seed row and the
+        **envelope** of the per-run intervals for a multi-seed one -- see the module
+        docstring and :func:`baselines_caveats`; they are not a calibrated interval for the
+        seed mean, and the per-run intervals stay available in ``baselines_by_seed.csv``.
 
     Raises:
         ValueError: If a required column is missing, or if ``rmse_persistence`` or
@@ -377,8 +533,16 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
         deterministic=("deterministic", "first"),
         n_windows=("n_windows", "first"),
         rmse_persistence=("rmse_persistence", "first"),
-        skill_ci_lo=("skill_ci_lo", "mean"),
-        skill_ci_hi=("skill_ci_hi", "mean"),
+        # Envelope, not mean. The bootstrap runs per run, so a multi-seed cell arrives here
+        # as several finished intervals and no arithmetic on finished intervals yields a
+        # calibrated interval for the seed mean. The mean of them, which this used to take,
+        # is narrower than any of its inputs justifies and is invariant to seed disagreement
+        # -- precisely the thing a reader would use the column to detect. min/max is
+        # conservative, contains every seed's interval, and widens when the seeds disagree.
+        # For a deterministic (n_seeds = 1) row it is that run's interval exactly, unchanged.
+        # `baselines_caveats` states this next to every rendered table.
+        skill_ci_lo=("skill_ci_lo", "min"),
+        skill_ci_hi=("skill_ci_hi", "max"),
         n_params=("n_params", "first"),
         fit_time_s_mean=("fit_time_s", "mean"),
     )
@@ -477,6 +641,7 @@ def build_baselines_markdown(
     *,
     controls: pd.DataFrame | None = None,
     by_heading: pd.DataFrame | None = None,
+    results_dir: Path | None = None,
     gate_regime: str = "id",
     gate_dof: str = "roll",
     gate_horizon_samples: int = 30,
@@ -494,6 +659,13 @@ def build_baselines_markdown(
         controls: Optional control rows from :func:`dmf.eval.controls.controls_table`.
         by_heading: Optional per-heading marginal of the gate regime, from
             :func:`dmf.eval.runner.marginalize_cells`.
+        results_dir: Directory the CSVs this document is built from were written to, used
+            for the provenance line. **Pass the same directory the document is written
+            to.** Left ``None`` the files are named by bare filename and located "beside
+            this document", which is true wherever the run wrote them; a hardcoded
+            ``results/`` prefix was not, and an ``imu`` run rendered into
+            ``results/imu/baselines.md`` used to cite the ``ideal`` run's four CSVs by name
+            -- the files its own last caveat says must not be mixed with these numbers.
         gate_regime: Regime the gate threshold applies to.
         gate_dof: DOF the gate threshold applies to, as a **logical** channel name. Under
             ``observation_mode: imu`` the table holds the noisy twin (``roll_imu``)
@@ -529,10 +701,7 @@ def build_baselines_markdown(
         f"({gate_horizon_samples} samples), `{gate_regime}` regime**, threshold "
         f"{gate_threshold:g} skill vs persistence.",
         "",
-        "Every number here traces to `results/baselines.csv` (aggregated), "
-        "`results/baselines_by_seed.csv` (one row per run, the source of truth), "
-        "`results/baselines_by_cell.csv` (per grid cell) and "
-        "`results/baselines_controls.csv` (negative controls).",
+        _provenance_line(results_dir, with_controls=controls is not None and not controls.empty),
         "",
         "## The gate cell",
         "",
@@ -555,7 +724,9 @@ def build_baselines_markdown(
         "",
         "`skill_std` is seed-to-seed spread; `skill_ci_lo`/`skill_ci_hi` are a bootstrap "
         "over held-out **realizations** and are what decide whether a value near the "
-        "threshold is distinguishable from it.",
+        "threshold is distinguishable from it -- on a single-seed row. On a multi-seed row "
+        "they are the envelope of the per-run intervals, not a calibrated interval for the "
+        "seed mean; see the caveats.",
         "",
     ]
     if by_heading is not None and not by_heading.empty:
@@ -616,7 +787,7 @@ def build_baselines_markdown(
             "",
         ]
     parts += ["## Caveats", ""]
-    parts += [f"- {caveat}" for caveat in BASELINES_CAVEATS]
+    parts += [f"- {caveat}" for caveat in baselines_caveats(table, gate_regime=gate_regime)]
     parts.append("")
     return "\n".join(parts)
 

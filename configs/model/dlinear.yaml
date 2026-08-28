@@ -9,11 +9,16 @@
 #
 # That channel independence is exactly what AR(p) does not have, so a DLinear-vs-AR gap
 # confounds architecture with per-output information set. The separation is made on the AR
-# side instead -- `ar_attitude_only` vs `ar20`, same architecture, same order, same ridge,
-# same solver, one input set apart. The multi-channel DLinear that used to serve that
+# side instead -- `ar_attitude_only` vs `ar20`, same architecture, same ridge, same solver,
+# same 120 features, one input set apart. The multi-channel DLinear that used to serve that
 # purpose was removed: at the P3 geometry it needed 2 161 800 fitted parameters against
 # this model's 60 300, so it answered "does the model mix channels?" and "does the model
 # have 36x the capacity?" in one number (docs/protocol.md P3).
+#
+# This row is fitted by SGD and is therefore the only row in the table that is not at a
+# known optimum. `configs/model/dlinear_ols.yaml` solves the same map exactly and ships
+# beside it, so the gap between the two measures the optimisation shortfall instead of
+# leaving it inside the architecture comparison.
 name: dlinear
 label: dlinear
 head: point

@@ -13,8 +13,14 @@ that confound is *not* closed by a multi-channel DLinear: at the P3 geometry (L=
 C_in=C_out=6) such a variant carries 2 161 800 fitted parameters against this one's 60 300,
 so it trades an information-set confound for a 36x capacity confound. The information set
 is isolated on the AR side instead, where it is free of both --
-``configs/model/ar_attitude_only.yaml`` is AR(20) on the three attitude channels, identical
-to ``ar20`` in order, ridge, solver and moments (docs/protocol.md P3).
+``configs/model/ar_attitude_only.yaml`` is AR(40) on the three attitude channels, matched
+to ``ar20`` in ridge, solver, moments and -- since 40 x 3 = 20 x 6 = 120 features -- in
+parameter count too (docs/protocol.md P3).
+
+This model's own optimisation gap is measured rather than assumed: ``dlinear_ols``
+(:mod:`dmf.models.dlinear_ols`) solves the identical map in closed form and is reported as
+its own row, so the difference between the two is the shortfall of 60 epochs of Adam and
+not part of any architecture comparison.
 """
 
 import torch

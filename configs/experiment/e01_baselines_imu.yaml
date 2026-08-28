@@ -3,7 +3,7 @@
 # The `ideal` twin of this file is e01_baselines.yaml. The pair differs only in the `data`
 # config it points at, which is what makes the Phase 6.3 observability ablation controlled.
 #
-# One experiment, one table, six models sharing one data pipeline, one normalisation,
+# One experiment, one table, nine models sharing one data pipeline, one normalisation,
 # one horizon definition and one early-stopping rule. Splitting them across runs is how
 # those four silently drift apart, which is the failure mode Gate 4's fairness requirement
 # exists to prevent.
@@ -11,22 +11,37 @@
 # Model order here is the table order. persistence is first because it is the skill-score
 # denominator, and `dmf.eval.runner.evaluate_models` requires it to be present.
 #
-# `ar_attitude_only` is read as a paired difference against `ar20`, not on its own: same
-# order, same ridge, same solver, same moments -- only the input information set differs,
-# so the two rows isolate the value of the rate channels with no capacity confound.
+# Three of the nine rows exist to make the other six readable, and each is a paired
+# comparison rather than a standalone entry:
+#
+#   window_mean vs persistence and damped_persistence -- the two trivial limits of damped
+#     persistence (tau -> inf and tau -> 0+) bracket the fitted one. window_mean beat the
+#     fitted damped_persistence in 54 of 144 cells on the previous sweep while appearing
+#     only in the controls file, so it is now scored as a row like everything else.
+#   dlinear_ols vs dlinear -- identical architecture, identical objective, exact optimum
+#     against 60 epochs of AdamW. The difference between them is the optimisation gap that
+#     a dlinear-vs-ar20 comparison would otherwise absorb into "architecture".
+#   ar_attitude_only vs ar20 -- same ridge, same solver, same moments, same 120 features
+#     and 108 900 parameters (40 lags x 3 channels against 20 x 6), one information set
+#     apart, so the pair isolates the value of the rate channels with no capacity
+#     confound.
 name: baselines_imu
 data: ../data/imu.yaml
 models:
   - ../model/persistence.yaml
+  - ../model/window_mean.yaml
   - ../model/damped_persistence.yaml
   - ../model/ar_p10.yaml
   - ../model/ar_p20.yaml
   - ../model/ar_p40.yaml
   - ../model/ar_attitude_only.yaml
   - ../model/dlinear.yaml
+  - ../model/dlinear_ols.yaml
 
-# Applies to the SGD models only. The closed-form models (persistence, damped persistence,
-# AR) ignore it: they are deterministic and emit one row each with skill_std = NaN.
+# Applies to `dlinear`, the one SGD model in this file. The parameter-free models
+# (persistence, window_mean) and the closed-form ones (damped_persistence, every ar*,
+# dlinear_ols) ignore it: they are deterministic and emit one row each with
+# skill_std = NaN.
 # Batch 1024, not the 256 of the plan's training defaults, and lr scaled with it.
 #
 # Measured, not guessed (docs/protocol.md P3-D17). The training step here is dominated by
@@ -42,10 +57,14 @@ models:
 # step, becomes the ceiling once the batch grows.
 #
 # lr 2e-3 is the square-root scaling of 1e-3 for a 4x batch -- the conservative choice over
-# linear scaling's 4e-3. Safe to change here in a way it would not be for a deep model:
-# DLinear under MSE is convex, its optimum is the closed-form least-squares solution, and
-# `test_dlinear_sgd_reaches_the_closed_form_optimum` asserts SGD actually reaches it. Batch
-# and lr therefore set how fast it converges, not where.
+# linear scaling's 4e-3. DLinear under MSE is convex, so batch and lr set how fast it
+# converges, not where it could converge to; `test_dlinear_sgd_reaches_the_closed_form_
+# optimum` asserts the loop reaches that optimum on a well-conditioned task. On this corpus
+# it does not quite reach it within the epoch budget: measured on `id`/val, 60 epochs land
+# at 0.432852 +- 0.000007 over three seeds against the solve's 0.431545, i.e. 0.30 % high.
+# That is small in loss and not small in skill (median +0.0052, up to +0.0758 on `id`/test),
+# which is why `dlinear_ols` ships beside this row and measures the shortfall instead of
+# leaving it to be inferred from wall-clock ratios.
 train:
   epochs: 60
   batch_size: 1024

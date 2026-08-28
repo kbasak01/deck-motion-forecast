@@ -1,0 +1,20 @@
+# The window-mean forecast -- predict the lookback window's own mean at every horizon step.
+#
+# The tau -> 0+ limit of damped persistence, and the second trivial baseline in the table
+# next to persistence (the tau -> inf limit). Zero parameters, no fitting, no seed, so
+# `params` is empty: the model's only inputs are the window geometry and the channel
+# counts, which dmf.train.registry.build_model supplies from the WindowSpec.
+#
+# It is here because it wins often enough that leaving it out flatters the fitted models.
+# Measured on the committed Phase 3 sweep, where it appeared only as the `skill_null`
+# column of results/baselines_controls.csv, it beats the *fitted* damped_persistence in 54
+# of 144 (regime, DOF, horizon) cells and the exact-optimum ar20 in 16 (ideal) / 19 (imu).
+# A trivial baseline that outperforms fitted ones, measured but kept out of the results
+# table, is CLAUDE.md non-negotiable 6 inverted. It is now scored in the same pass, over
+# the same windows, as every other model, and it is the same estimator the shuffle
+# control uses as its null -- asserted bitwise in tests/test_models.py.
+name: window_mean
+label: window_mean
+head: point
+quantiles: []
+params: {}

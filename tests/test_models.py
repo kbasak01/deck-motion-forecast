@@ -26,7 +26,20 @@ What is asserted here, and why each one is load-bearing:
   window-mean forecast, which is the correct null for the shuffle control.
 - **SGD reaches the closed-form optimum** for the one model whose optimum is computable,
   which converts "the training loop works" from a vibe into an assertion before Phase 4
-  inherits it.
+  inherits it. On the *corpus* it does not reach it -- the decomposed design is
+  rank-deficient by construction -- which is why ``dlinear_ols`` ships as its own row and is
+  asserted here to be at least as good as the SGD twin on identical windows. Without that
+  row, a DLinear-vs-AR comparison reads an optimisation gap as an architecture gap, since
+  every AR row is at its exact optimum.
+- **The budget-matched pairs are matched.** ``ar_attitude_only`` (40 lags x 3 channels) and
+  ``ar20`` (20 x 6) must carry the same parameter count, or their difference measures the
+  rate channels *plus* a 2x capacity step; ``dlinear`` and ``dlinear_ols`` must carry the
+  same kernel, or their difference stops being an optimisation gap. Both are asserted from
+  the shipped configs rather than described in them.
+- **``window_mean`` is the shuffle control's null, bitwise.** The trivial ``tau -> 0+``
+  forecast beats the fitted damped persistence in 54 of 144 cells, so it is a table row and
+  not only a control column -- and the row has to be the same estimator the control was read
+  against.
 - **Negative controls beside the positive ones**: an untrained DLinear must lose to
   persistence; AR before ``fit`` must raise; an order beyond the lookback must raise; a
   non-train partition must be refused; a duplicate registry key must raise.
@@ -59,6 +72,7 @@ from dmf.data.windows import window_spec_from_config
 from dmf.models.ar import ARForecaster, lag_features
 from dmf.models.base import BaseForecaster
 from dmf.models.dlinear import DLinear, moving_average, series_decompose
+from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.persistence import (
     TAU_WINDOW_MEAN,
     DampedPersistence,
@@ -68,12 +82,16 @@ from dmf.models.persistence import (
     fit_decay_constant,
     solve_decay_tau,
 )
+from dmf.models.window_mean import WindowMean
 from dmf.train.closed_form import (
+    DecompMoments,
     LagMoments,
     accumulate_training_moments,
     fit_ar,
     fit_damped_persistence,
+    fit_dlinear_ols,
     solve_ar_coefficients,
+    solve_decomp_coefficients,
     subset_columns,
 )
 from dmf.train.loop import EarlyStopper, fit, set_seed, validate
@@ -105,12 +123,18 @@ N_OUT = len(PRODUCTION_CFG.target_dofs)
 SYNTH_C_IN = 6
 SYNTH_C_OUT = 3
 
-#: The four baseline registry keys Phase 3 must supply.
+#: The baseline registry keys Phase 3 must supply. ``window_mean`` and ``dlinear_ols``
+#: are reference rows rather than candidate architectures -- the ``tau -> 0+`` limit of
+#: damped persistence, and the exact optimum of the SGD DLinear's own objective -- but they
+#: are scored in the same pass as everything else, so they are registered like everything
+#: else.
 BASELINE_KEYS: tuple[str, ...] = (
     "persistence",
+    "window_mean",
     "damped_persistence",
     "ar",
     "dlinear",
+    "dlinear_ols",
 )
 
 
@@ -183,7 +207,18 @@ def test_build_model_raises_on_an_unknown_constructor_argument() -> None:
         build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
 
 
-@pytest.mark.parametrize("stem", ["persistence", "damped_persistence", "ar_p20", "dlinear"])
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "persistence",
+        "window_mean",
+        "damped_persistence",
+        "ar_p20",
+        "ar_attitude_only",
+        "dlinear",
+        "dlinear_ols",
+    ],
+)
 def test_every_shipped_model_config_builds(stem: str) -> None:
     cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
     model = build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
@@ -198,22 +233,66 @@ def test_ar_configs_have_distinct_labels_but_share_a_registry_name() -> None:
 
 
 @pytest.mark.parametrize("stem", ["e01_baselines", "e01_baselines_imu"])
-def test_the_baselines_experiment_configs_load_with_six_models_and_three_seeds(
+def test_the_baselines_experiment_configs_load_with_nine_models_and_three_seeds(
     stem: str,
 ) -> None:
     """Both observation modes must ship the same model set, or the P6.3 ablation is not one."""
     cfg = load_experiment(CONFIG_ROOT / "experiment" / f"{stem}.yaml")
     assert [m.label for m in cfg.models] == [
         "persistence",
+        "window_mean",
         "damped_persistence",
         "ar10",
         "ar20",
         "ar40",
         "ar_attitude_only",
         "dlinear",
+        "dlinear_ols",
     ]
     assert len(cfg.seeds) >= 3
     assert set(cfg.regimes) == set(REGIMES)
+
+
+@pytest.mark.parametrize("stem", ["e01_baselines", "e01_baselines_imu"])
+def test_the_budget_matched_pair_really_is_budget_matched(stem: str) -> None:
+    """`ar_attitude_only` vs `ar20` must differ in the information set and nothing else.
+
+    The pair was introduced to *remove* a capacity confound (docs/protocol.md P3-D13) and
+    for one sweep it carried one: 20 lags x 3 channels is half the features of 20 x 6, so
+    54 900 parameters against 108 900. For scale, ar10 -> ar20 is the same 2x parameter
+    increase at a **fixed** information set and is worth a median +0.0064 skill -- the same
+    order as the ~0.01 median gap that was being read as the value of the rate channels.
+    40 x 3 = 20 x 6 = 120 features closes it exactly, so the arithmetic is asserted here
+    rather than described in the config comment that previously claimed it.
+    """
+    cfg = load_experiment(CONFIG_ROOT / "experiment" / f"{stem}.yaml")
+    by_label = {m.label: m for m in cfg.models}
+    full, ablated = by_label["ar20"], by_label["ar_attitude_only"]
+    n_in = len(cfg.data.input_channels)
+    assert "n_input_used" not in full.params
+    assert int(full.params["order"]) * n_in == int(ablated.params["order"]) * int(
+        ablated.params["n_input_used"]
+    )
+    assert full.params["ridge"] == ablated.params["ridge"]
+    assert full.name == ablated.name
+
+
+@pytest.mark.parametrize("stem", ["e01_baselines", "e01_baselines_imu"])
+def test_the_two_dlinear_rows_are_the_same_function_class(stem: str) -> None:
+    """`dlinear_ols` measures `dlinear`'s optimisation gap only if nothing else differs.
+
+    Same registry family, same decomposition kernel, same head. If the kernels drift apart
+    the difference between the two rows stops being an optimisation gap and becomes an
+    unlabelled architecture change.
+    """
+    cfg = load_experiment(CONFIG_ROOT / "experiment" / f"{stem}.yaml")
+    by_label = {m.label: m for m in cfg.models}
+    sgd, ols = by_label["dlinear"], by_label["dlinear_ols"]
+    assert sgd.params["kernel_size"] == ols.params["kernel_size"]
+    assert sgd.head == ols.head == "point"
+    assert MODEL_REGISTRY[sgd.name].FIT_KIND == "sgd"
+    assert MODEL_REGISTRY[ols.name].FIT_KIND == "closed_form"
+    assert issubclass(MODEL_REGISTRY[ols.name], MODEL_REGISTRY[sgd.name])
 
 
 @pytest.mark.parametrize("stem", ["e01_baselines", "e01_baselines_imu"])
@@ -999,6 +1078,235 @@ def test_untrained_dlinear_is_worse_than_persistence(
 
 
 # ---------------------------------------------------------------------------
+# DLinear, solved in closed form
+# ---------------------------------------------------------------------------
+
+
+def _decomp_moments(
+    x: torch.Tensor, y: torch.Tensor, kernel: int
+) -> tuple[DecompMoments, torch.Tensor, torch.Tensor]:
+    """Build DLinear moments from stacked windows, and return the design beside them.
+
+    Mirrors the accumulation in :func:`dmf.train.closed_form.accumulate_training_moments`
+    on data small enough to stack, so the test can compare the streamed solve against an
+    explicit ``lstsq`` on the very design the moments claim to summarise.
+    """
+    count, lookback, channels = x.shape
+    horizon = int(y.shape[1])
+    trend, remainder = series_decompose(x, kernel)
+    rows = count * channels
+    feats = torch.cat(
+        [
+            trend.transpose(1, 2).reshape(rows, lookback),
+            remainder.transpose(1, 2).reshape(rows, lookback),
+        ],
+        dim=1,
+    )
+    targets = y.permute(0, 2, 1).reshape(rows, horizon)
+    moments = DecompMoments(
+        n_windows=count,
+        n_rows=rows,
+        sx=feats.sum(dim=0).numpy(),
+        sy=targets.sum(dim=0).numpy(),
+        syy=torch.square(targets).sum(dim=0).numpy(),
+        gram=(feats.T @ feats).numpy(),
+        cross=(feats.T @ targets).numpy(),
+        kernel_size=kernel,
+        lookback=lookback,
+        max_horizon=horizon,
+        n_target_channels=channels,
+    )
+    return moments, feats, targets
+
+
+def test_the_decomposed_design_is_rank_deficient_by_construction(
+    rng: np.random.Generator,
+) -> None:
+    """``trend = A x`` and ``remainder = (I - A) x``, so 2L columns span at most L.
+
+    This is a property of the DLinear parameterisation, not of the corpus, and it is why
+    the closed-form solve needs the regularised path rather than a plain Cholesky. Asserted
+    on random data precisely because no data can make it false.
+    """
+    lookback, horizon, kernel = 12, 4, 5
+    x = torch.from_numpy(rng.normal(size=(200, lookback, SYNTH_C_OUT)))
+    y = torch.from_numpy(rng.normal(size=(200, horizon, SYNTH_C_OUT)))
+    moments, feats, _ = _decomp_moments(x, y, kernel)
+    assert feats.shape[1] == 2 * lookback
+    assert int(torch.linalg.matrix_rank(feats)) <= lookback
+    assert np.linalg.matrix_rank(moments.gram) <= lookback
+
+
+def test_dlinear_ols_matches_lstsq_on_the_same_design(rng: np.random.Generator) -> None:
+    """The oracle for the closed-form path: same residual as an explicit least squares.
+
+    ``DLinear(individual=False)`` is an affine map, so its MSE optimum is exact and
+    computable two independent ways -- streamed normal equations here, ``torch.linalg.
+    lstsq`` on the stacked design there. They must agree on the residual (they cannot agree
+    on the coefficients: the design is singular, so the minimiser is an affine family).
+    """
+    lookback, horizon, kernel, count = 24, 6, 5, 800
+    x = torch.from_numpy(rng.normal(size=(count, lookback, SYNTH_C_OUT)))
+    y = torch.from_numpy(rng.normal(size=(count, horizon, SYNTH_C_OUT)))
+    moments, feats, targets = _decomp_moments(x, y, kernel)
+
+    weight, bias, cond_r = solve_decomp_coefficients(moments, ridge=0.0)
+    assert cond_r > 1e12, cond_r
+    ours = float(np.mean(np.square(feats.numpy() @ weight + bias - targets.numpy())))
+
+    design = torch.cat([feats, torch.ones(feats.shape[0], 1, dtype=torch.float64)], dim=1)
+    reference = torch.linalg.lstsq(design, targets, driver="gelsd").solution
+    theirs = float(torch.mean(torch.square(design @ reference - targets)))
+    assert ours == pytest.approx(theirs, rel=1e-9, abs=1e-12)
+
+
+def test_dlinear_ols_installs_coefficients_the_forward_pass_reproduces(
+    rng: np.random.Generator,
+) -> None:
+    """A solve is only a fit if the model evaluates the map that was solved for.
+
+    The two biases are only ever used summed and ``nn.Linear`` applies ``x @ W.T``, so this
+    catches both an intercept written to the wrong layer and a missing transpose -- either
+    of which would leave a plausible-looking, wrong ``dlinear_ols`` row.
+    """
+    lookback, horizon, kernel, count = 24, 6, 5, 400
+    x = torch.from_numpy(rng.normal(size=(count, lookback, SYNTH_C_OUT)))
+    y = torch.from_numpy(rng.normal(size=(count, horizon, SYNTH_C_OUT)))
+    moments, feats, _ = _decomp_moments(x, y, kernel)
+    weight, bias, _ = solve_decomp_coefficients(moments, ridge=1e-8)
+
+    model = DLinearOLS(lookback, horizon, SYNTH_C_IN, SYNTH_C_OUT, kernel_size=kernel)
+    model.set_coefficients(weight, bias)
+    model.eval()
+    padded = torch.cat([x, torch.zeros(count, lookback, SYNTH_C_IN - SYNTH_C_OUT)], dim=2)
+    with torch.no_grad():
+        predicted = model(padded.float())
+    expected = torch.from_numpy(feats.numpy() @ weight + bias).view(count, SYNTH_C_OUT, horizon)
+    torch.testing.assert_close(predicted.double(), expected.permute(0, 2, 1), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("bad", ["missing", "kernel"])
+def test_fit_dlinear_ols_refuses_moments_it_cannot_read(
+    small_corpus: Path, small_data_cfg: DataConfig, bad: str
+) -> None:
+    """Solving a DLinear from a pass that never decomposed the design must fail loudly."""
+    train = _small_dataset(small_corpus, small_data_cfg, "id", "train")
+    spec = window_spec_from_config(small_data_cfg)
+    kernel = 9 if bad == "kernel" else 5
+    moments = accumulate_training_moments(
+        train,
+        max_order=10,
+        num_workers=0,
+        decompose_kernel=None if bad == "missing" else 5,
+    )
+    expected = "carry no decomposed design" if bad == "missing" else "kernel_size"
+    with pytest.raises(ValueError, match=expected):
+        fit_dlinear_ols(
+            moments,
+            kernel_size=kernel,
+            ridge=0.0,
+            lookback=spec.lookback,
+            n_input_channels=N_IN,
+            n_target_channels=N_OUT,
+        )
+
+
+@pytest.mark.slow
+def test_dlinear_ols_is_at_least_as_good_as_the_sgd_twin(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """The whole point of the row: the exact optimum cannot lose to SGD on the same task.
+
+    Both models see the same windows, the same normalisation, the same decomposition kernel
+    and the same loss, and the validation loss is computed by the same
+    :func:`dmf.train.loop.validate` call, so the comparison is of optimisation only. If this
+    ever fails, either the closed-form solve is not solving the training loop's objective or
+    the two rows are no longer the same function class -- and in both cases the gap between
+    them in ``results/baselines.csv`` stops meaning what the config says it means.
+    """
+    kernel = 25
+    train = _small_dataset(small_corpus, small_data_cfg, "id", "train")
+    val = _small_dataset(small_corpus, small_data_cfg, "id", "val")
+    spec = window_spec_from_config(small_data_cfg)
+    val_loader = make_dataloader(val, batch_size=512, shuffle=False, num_workers=0, seed=0)
+    train_loader = make_dataloader(train, batch_size=256, shuffle=True, num_workers=0, seed=0)
+    cfg = _train_cfg(epochs=4)
+
+    moments = accumulate_training_moments(
+        train, max_order=10, num_workers=0, decompose_kernel=kernel
+    )
+    exact, report = fit_dlinear_ols(
+        moments,
+        kernel_size=kernel,
+        ridge=1e-6,
+        lookback=spec.lookback,
+        n_input_channels=N_IN,
+        n_target_channels=N_OUT,
+    )
+    exact_val = validate(exact, val_loader, cfg)
+
+    set_seed(0)
+    sgd = DLinear(spec.lookback, spec.max_horizon, N_IN, N_OUT, kernel_size=kernel)
+    result = fit(sgd, train_loader, val_loader, cfg, 0, tmp_path)
+
+    assert exact_val <= result.best_val_loss, (
+        f"closed-form DLinear val MSE {exact_val:.6f} is worse than SGD's "
+        f"{result.best_val_loss:.6f}; the solve is not minimising the loop's objective"
+    )
+    assert report.n_fitted_parameters == sgd.n_fitted_parameters
+    assert report.residual_train_mse > 0.0
+
+
+# ---------------------------------------------------------------------------
+# The window-mean forecast
+# ---------------------------------------------------------------------------
+
+
+def test_window_mean_is_the_shuffle_controls_null_bitwise(rng: np.random.Generator) -> None:
+    """The table row and the control's null must be the same estimator, not two of them.
+
+    ``window_mean`` exists as a row because it beats the *fitted* damped persistence in 54
+    of 144 cells, which was measurable only inside ``baselines_controls.csv`` before. The
+    row is worth nothing if it is a second implementation that could drift from the null
+    the shuffle control is read against, so it is asserted to be bitwise the same forecast.
+    """
+    lookback, horizon = 50, 20
+    subject = WindowMean(lookback, horizon, SYNTH_C_IN, SYNTH_C_OUT).eval()
+    control_null = DampedPersistence(
+        lookback,
+        horizon,
+        SYNTH_C_IN,
+        SYNTH_C_OUT,
+        tau_samples=np.full(SYNTH_C_OUT, TAU_WINDOW_MEAN),
+    ).eval()
+    x = torch.from_numpy(rng.normal(size=(8, lookback, SYNTH_C_IN)).astype(np.float32))
+    with torch.no_grad():
+        predicted = subject(x)
+        reference = control_null(x)
+    assert torch.equal(predicted, reference)
+    # De-meaned input space: the window mean is exactly zero here, and
+    # `dmf.data.normalize.invert_norm` puts it back in corpus units downstream.
+    assert torch.equal(predicted, torch.zeros_like(predicted))
+
+
+def test_window_mean_fits_nothing_and_says_so() -> None:
+    """``n_params = 0``, against damped persistence's 6, is the honest count.
+
+    ``tau`` here is a defining limit, not a value estimated on the training split, and the
+    two rows are only readable as a pair if the parameter column says which one paid for
+    its fit.
+    """
+    lookback, horizon = 50, 20
+    subject = WindowMean(lookback, horizon, SYNTH_C_IN, SYNTH_C_OUT)
+    fitted = DampedPersistence(
+        lookback, horizon, SYNTH_C_IN, SYNTH_C_OUT, tau_samples=np.full(SYNTH_C_OUT, 5.0)
+    )
+    assert subject.FIT_KIND == "none"
+    assert subject.n_fitted_parameters == 0
+    assert fitted.n_fitted_parameters == SYNTH_C_OUT
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -1181,11 +1489,14 @@ def _train_cfg(*, epochs: int, lr: float = 1e-2):  # type: ignore[no-untyped-def
 
 
 def _smoke_experiment(data_cfg: DataConfig):  # type: ignore[no-untyped-def]
-    """Return a cut-down `e01_baselines` covering all three fit kinds.
+    """Return a cut-down `e01_baselines` covering every fit kind and every closed-form path.
 
-    One model of each ``FIT_KIND`` -- ``none`` (persistence), ``closed_form`` (damped
-    persistence and AR) and ``sgd`` (DLinear) -- so that every branch of ``_fit_one`` runs,
-    on the small-corpus window geometry and two epochs rather than sixty.
+    Both ``FIT_KIND = "none"`` models (persistence, window_mean), all three closed-form
+    branches of ``_fit_one`` (damped persistence, AR, the closed-form DLinear) and the SGD
+    branch, on the small-corpus window geometry and two epochs rather than sixty. The three
+    closed-form branches are enumerated deliberately: they dispatch on ``issubclass``, so a
+    config that reaches the wrong branch produces a fitted model under the wrong label
+    rather than an error.
 
     Args:
         data_cfg: The small-corpus task configuration (50-sample lookback).
@@ -1196,7 +1507,14 @@ def _smoke_experiment(data_cfg: DataConfig):  # type: ignore[no-untyped-def]
     from dmf.config import ExperimentConfig
 
     base = load_experiment(CONFIG_ROOT / "experiment" / "e01_baselines.yaml")
-    wanted = ("persistence", "damped_persistence", "ar10", "dlinear")
+    wanted = (
+        "persistence",
+        "window_mean",
+        "damped_persistence",
+        "ar10",
+        "dlinear",
+        "dlinear_ols",
+    )
     models = tuple(m for m in base.models if m.label in wanted)
     assert len(models) == len(wanted), [m.label for m in base.models]
     return ExperimentConfig(
@@ -1273,6 +1591,33 @@ def test_run_experiment_writes_a_joinable_gate3_artifact(
         )
         assert (reference[column] == 0.0).all(), reference[column].unique()
 
+    # S4: the optimisation state of every SGD run reaches the committed artifact. It was
+    # computed by `TrainResult` and discarded before this column set existed, which is why
+    # DLinear's under-convergence had to be inferred from wall-clock ratios instead of read
+    # off the table it was reported in.
+    by_seed = pd.read_csv(results / "baselines_by_seed.csv")
+    for column in ("best_epoch", "epochs_run", "best_val_loss"):
+        assert column in by_seed.columns, column
+    trained = by_seed[by_seed["model"] == "dlinear"]
+    assert trained["epochs_run"].notna().all()
+    assert (trained["epochs_run"] <= 2).all()
+    assert (trained["best_epoch"] < trained["epochs_run"]).all()
+    assert (trained["best_val_loss"] > 0.0).all()
+    # NaN, not zero, for everything that never ran an epoch: a 0 in this column would read
+    # as "stopped at epoch 0" rather than "has no epochs".
+    for label in ("persistence", "window_mean", "damped_persistence", "ar10", "dlinear_ols"):
+        rows = by_seed[by_seed["model"] == label]
+        assert not rows.empty, label
+        assert rows[["best_epoch", "epochs_run", "best_val_loss"]].isna().all().all(), label
+
+    # The exact optimum of DLinear's own objective cannot score worse than 60 epochs of
+    # Adam on it -- here, two. Read on the skill column so it is the same quantity the
+    # report ranks models by.
+    skills = baselines.set_index(["model", "regime", "dof", "horizon_samples"])["skill_mean"]
+    sgd = skills.xs("dlinear", level="model")
+    exact = skills.xs("dlinear_ols", level="model")
+    assert (exact >= sgd - 1e-9).all(), (exact - sgd).sort_values().head().to_dict()
+
     cells = pd.read_csv(results / "baselines_by_cell.csv")
     assert "seed" in cells.columns
     assert not cells["model"].astype(str).str.contains("@").any()
@@ -1295,6 +1640,11 @@ def test_the_ablation_adds_no_pass_over_the_training_split(
     second accumulation would make an ablation that is supposed to be free the most
     expensive model in the table. Asserted by counting calls rather than by timing, which
     would be flaky on a fixture corpus this small.
+
+    One call at ``max_order = 40``, not 20: the ablation is AR(40) on three channels, and
+    ``lag_features`` is prefix-nested in the order and channel-strided within each lag, so
+    ``ar20``'s six-channel design is a sub-block of the *same* accumulation. Whichever of
+    the two needs the deeper design sets the single pass's order.
     """
     from dmf.config import ExperimentConfig
     from dmf.train import experiment as experiment_module
@@ -1331,15 +1681,18 @@ def test_the_ablation_adds_no_pass_over_the_training_split(
         run_controls=False,
         checkpoint_root=tmp_path / "checkpoints",
     )
-    assert calls == [20], calls
+    assert calls == [40], calls
 
     params = per_run.groupby("model")["n_params"].nunique()
     assert (params == 1).all()
     counts = per_run.groupby("model")["n_params"].first()
-    # Same order, same horizon, same targets: the only difference is the input width, so
-    # the ratio of the coefficient blocks is exactly 6/3.
-    n_out = len(small_data_cfg.target_dofs) * max(small_data_cfg.horizons)
-    assert counts["ar20"] - n_out == 2 * (counts["ar_attitude_only"] - n_out)
+    # 40 lags x 3 channels == 20 lags x 6 channels == 120 features, and the horizon and
+    # target set are shared, so the two models are budget-matched *exactly* -- not to
+    # within a factor, to the parameter. This is the assertion the pair exists for: with
+    # it, `ar20` minus `ar_attitude_only` is the value of the rate channels; without it,
+    # it is that value plus whatever a 2x parameter budget is worth (measured at a median
+    # +0.0064 skill from `ar10` -> `ar20`).
+    assert counts["ar20"] == counts["ar_attitude_only"]
 
 
 # ---------------------------------------------------------------------------
@@ -1445,23 +1798,52 @@ AR20_NEGATIVE_SKILL_CELLS: frozenset[tuple[str, str, int]] = frozenset(
     + [("unseen_vessel", dof, 150) for dof in ("roll", "roll_rate")]
 )
 
+#: The same set for ``observation_mode: imu``, measured on the same corpus. **Thirteen
+#: cells, not twelve**: every ``ideal`` loss recurs under its ``*_imu`` spelling, and
+#: ``unseen_heading``/``pitch_rate_imu`` additionally loses at 10 samples (skill -3.25),
+#: where the ``ideal`` twin still scrapes +0.15. That one extra cell is the observation
+#: model doing exactly what P1-D6 predicts: the pitch heading factor is clamped at the
+#: P1-D2 floor in beam seas, so the ``unseen_heading`` test-set pitch rate is a small
+#: signal, and adding IMU noise to a small signal costs proportionally more than adding it
+#: to a large one. Pinned separately rather than folded in by channel alias, because a
+#: shared set would have to be permissive about which spellings appear and would then let
+#: an ``imu``-only regression pass silently -- which is how the thirteenth cell went
+#: unrecorded in the first place.
+AR20_NEGATIVE_SKILL_CELLS_IMU: frozenset[tuple[str, str, int]] = frozenset(
+    [("unseen_heading", "pitch_imu", h) for h in (20, 30, 50, 100, 150)]
+    + [("unseen_heading", "pitch_rate_imu", h) for h in (10, 20, 30, 50, 100, 150)]
+    + [("unseen_vessel", dof, 150) for dof in ("roll_imu", "roll_rate_imu")]
+)
+
+#: Task config and pinned loss set per observation mode. The two configs differ only in
+#: ``observation_mode`` (``configs/data/imu.yaml``), so parametrising over this mapping
+#: keeps one test covering both modes rather than one test covering the mode someone
+#: happened to run.
+AR20_LOSSES_BY_MODE: dict[str, tuple[DataConfig, frozenset[tuple[str, str, int]]]] = {
+    "ideal": (PRODUCTION_CFG, AR20_NEGATIVE_SKILL_CELLS),
+    "imu": (load_data(CONFIG_ROOT / "data" / "imu.yaml"), AR20_NEGATIVE_SKILL_CELLS_IMU),
+}
+
 
 @pytest.mark.slow
+@pytest.mark.parametrize("mode", sorted(AR20_LOSSES_BY_MODE))
 @pytest.mark.parametrize("regime", REGIMES)
 def test_real_corpus_ar_beats_persistence_at_every_horizon(
-    real_corpus: Path, regime: Regime
+    real_corpus: Path, regime: Regime, mode: str
 ) -> None:
     """AR(20) is the Gate 3 subject; a regime where it loses to persistence is a finding.
 
-    The finding is encoded, not worked around: :data:`AR20_NEGATIVE_SKILL_CELLS` lists the
-    losing cells and this test asserts the sign of **every** cell against it, so neither a
-    new loss nor a silent repair can slip through.
+    The finding is encoded, not worked around: :data:`AR20_LOSSES_BY_MODE` lists the losing
+    cells for each observation mode and this test asserts the sign of **every** cell against
+    it, so neither a new loss nor a silent repair can slip through -- in either mode. Both
+    modes are covered because they do not lose the same cells: ``imu`` loses thirteen and
+    ``ideal`` twelve.
     """
     from dmf.data.splits import load_manifest
     from dmf.eval.runner import evaluate_models
 
-    cfg = PRODUCTION_CFG
-    spec = PRODUCTION_SPEC
+    cfg, expected_cells = AR20_LOSSES_BY_MODE[mode]
+    spec = window_spec_from_config(cfg)
     split = build_split(load_manifest(real_corpus), regime)
     train = DeckMotionDataset(real_corpus, split, "train", cfg, spec)
     test = DeckMotionDataset(real_corpus, split, "test", cfg, spec, stats=train.norm_stats)
@@ -1490,9 +1872,7 @@ def test_real_corpus_ar_beats_persistence_at_every_horizon(
 
     ar_rows = table[table["model"] == "ar20"]
     assert len(ar_rows) == len(cfg.target_dofs) * len(cfg.horizons)
-    expected_losses = {
-        (dof, horizon) for r, dof, horizon in AR20_NEGATIVE_SKILL_CELLS if r == regime
-    }
+    expected_losses = {(dof, horizon) for r, dof, horizon in expected_cells if r == regime}
     measured_losses = {
         (str(row.dof), int(row.horizon_samples)) for row in ar_rows.itertuples() if row.skill <= 0.0
     }

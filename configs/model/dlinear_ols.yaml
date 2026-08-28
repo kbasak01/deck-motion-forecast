@@ -1,0 +1,56 @@
+# DLinear solved in closed form -- the optimisation-gap reference for the `dlinear` row.
+#
+# Same architecture, same decomposition kernel, same channel independence, same objective
+# as configs/model/dlinear.yaml. The only difference is how the coefficients are obtained:
+# `dlinear` runs 60 epochs of AdamW through dmf.train.loop.fit, this row is the exact
+# least-squares optimum of that same objective, solved from the streaming normal equations
+# in dmf.train.closed_form.fit_dlinear_ols.
+#
+# It ships because every ar* row is already at its exact global optimum while the SGD row
+# is wherever the epoch budget landed, so `dlinear` vs `ar20` currently mixes an
+# optimisation gap of unknown size into an architecture comparison. With both rows in the
+# table the difference between them *is* the optimisation shortfall, measured rather than
+# assumed, and the SGD row stays as the end-to-end evidence that the shared training loop
+# works on this corpus -- which is what Phase 4 inherits.
+#
+# The gap is real but small in loss and not small in skill. Measured on `id`/val with the
+# same dmf.train.loop.validate call: SGD 0.432852 +- 0.000007 over three seeds against
+# 0.431545 here, i.e. SGD sits 0.30 % above the solve. On `id`/test that is a median
+# +0.0052 skill (max +0.0758 on pitch_rate at 10 s), and it moves the median AR(20)
+# advantage over DLinear from +0.0194 to +0.0056 -- so most of what looked like an
+# architecture gap on `id` was the epoch budget.
+#
+# `kernel_size` is in **samples** and must equal the SGD twin's 25, or the two rows are not
+# the same function class and the difference between them stops being an optimisation gap.
+#
+# `ridge` is dimensionless, as for the ar* rows: the normal equations are solved centred
+# and whitened, so the penalty is added to a correlation matrix with unit diagonal, by the
+# same solver (dmf.train.closed_form._solve_centred_whitened). It is 1e-6, matching ar10,
+# ar20 and ar40, so that "closed-form" means the same thing in every closed-form row.
+#
+# The decomposed design is **exactly rank-deficient by construction**, not by accident:
+# series_decompose writes trend = A x and remainder = (I - A) x, so its 2L = 400 columns
+# span an at-most-L = 200-dimensional space. Measured cond(R) on `id`/train is 6.0e19.
+#
+# So `ridge` is load-bearing here in a way it is not for the ar* rows, and 0 is not the
+# "more honest" setting. Measured on `id`, both solved from the same moments:
+#
+#   ridge = 1e-6   train MSE 0.3761   val MSE 0.4315
+#   ridge = 0      train MSE 0.3182   val MSE 2539.8
+#
+# At ridge = 0 the lstsq fallback keeps directions whose singular values are at the
+# rcond cutoff and amplifies them by ~1e10, which fits the null-space noise of the
+# training split exactly as the numbers above show. The unregularised minimiser of the
+# training MSE therefore exists, is reachable, and is useless; this row reports the
+# ridge-regularised optimum instead, which is also what every ar* row reports.
+#
+# This costs no extra pass over the training split: the decomposed Gram and cross moments
+# are accumulated on the same batches as the AR moments, one pass per regime
+# (dmf.train.closed_form.accumulate_training_moments, `decompose_kernel`).
+name: dlinear_ols
+label: dlinear_ols
+head: point
+quantiles: []
+params:
+  kernel_size: 25
+  ridge: 1.0e-6

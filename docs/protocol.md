@@ -628,7 +628,24 @@ DOFs are pinned in `tests/test_models.py::PERSISTENCE_RMSE_ID_TEST`, together wi
 and an explicit assertion that roll at 100 samples is *below* roll at 50, so the non-monotonicity
 of P3-D5 is recorded as intended behaviour rather than rediscovered as a bug.
 
-**No `imu` denominator table is pinned anywhere yet.** Worth adding when someone measures it.
+**`imu` denominators**, measured on the completed sweep, same partition and window count
+(`id`/test, 384 realizations, 434 304 windows). Not interchangeable with the `ideal` table above:
+skill is always measured against persistence in the same observation mode (P1-D6), so the two are
+each internally valid and are not a common yardstick.
+
+| horizon (samples) | roll_imu | pitch_imu | heave_imu | roll_rate_imu | pitch_rate_imu | heave_rate_imu |
+|---|---|---|---|---|---|---|
+| 10 | 1.944871 | 0.896747 | 0.436086 | 1.067900 | 0.753420 | 0.283867 |
+| 20 | 3.744563 | 1.639890 | 0.827238 | 2.048611 | 1.341784 | 0.532558 |
+| 30 | 5.267439 | 2.122484 | 1.135577 | 2.866156 | 1.664371 | 0.717851 |
+| 50 | 7.087624 | 2.234428 | 1.419148 | 3.798464 | 1.549576 | 0.847150 |
+| 100 | 3.793831 | 1.559344 | 0.812388 | 1.958924 | 1.273527 | 0.474706 |
+| 150 | 5.252024 | 1.785355 | 1.093555 | 2.898274 | 1.308342 | 0.678040 |
+
+The attitude channels barely move from `ideal` (roll at 30 samples: 5.267439 vs 5.267361) because
+the IMU model's attitude noise is ~45 dB below the signal. `heave_imu` moves visibly (1.135577 vs
+1.151318) because its reconstruction is a two-stage causal high-pass, i.e. a deterministic phase
+and gain change rather than added noise (P1-D6, P3-D2).
 
 ### P3-D7 — Where AR(20) loses to persistence, recorded rather than dropped
 
@@ -750,55 +767,59 @@ which requires a gate change to be explicit rather than absorbed.
 
 **Phase 4 is unblocked by this entry.**
 
-### P3-D13 — `dlinear_mc` added, then removed; replaced by `ar_attitude_only`
+### P3-D13 — `dlinear_mc` removed; `ar_attitude_only` replaced it, and its first form was itself confounded
 
 `src/dmf/models/dlinear_mc.py` was added outside the plan's four baseline families to separate
 "DLinear loses to AR because it sees fewer channels" from "DLinear loses because it is a worse
-architecture": canonical DLinear is channel-independent and sees only the target channels, while
-AR(p) sees all six.
+architecture". At the P3-D4 geometry it needed **2 161 800** parameters against DLinear's **60 300**
+— a 36x capacity gap that confounded information set with capacity, which is the confound it
+existed to remove. Removed.
 
-The intent was sound; the instrument was not. At the revised geometry (P3-D4) its output layer
-scales with both `H` (50 -> 150) and `C_out` (3 -> 6), giving DLinear **60 300**, AR(20)
-**108 900**, AR(40) **216 900**, DLinear-MC **2 161 800**. A 36x capacity gap does not isolate the
-information set, it confounds it with capacity — which is precisely the confound the control was
-built to remove.
+**Its replacement repeated the same mistake at 2x, and that is worth recording.**
+`ar_attitude_only` was first specified as AR(**20**) on the three attitude channels: 20 lags x 3
+channels = 60 features = **54 900** parameters, against `ar20`'s 20 x 6 = 120 features =
+**108 900**. The pair introduced to eliminate a capacity confound carried one, and the config
+asserted "no capacity confound" while the parameter counts differed by exactly 2x. Caught by the
+Gate 3 adversarial audit, not by review.
 
-**Removed.** The same question is answered instead by `configs/model/ar_attitude_only.yaml`: AR(20)
-fitted on the three attitude channels only, against the existing six-channel `ar20`. Same
-architecture, same solver, same fit procedure — the only difference is the input information set,
-so the comparison is clean. It costs no extra pass over the training split: `lag_features` is
-lag-major with channels within each lag, so the three-channel design is a column subset of the
-six-channel one and its moments slice out of the cached six-channel accumulation, the same trick
-that already lets one pass at `p = 40` fit every order.
+Corrected to **AR(40) on three channels**: 40 x 3 = 120 features = 108 900 parameters, identical to
+`ar20`, same ridge, same solver, sliced from the same cached `p_max = 40` moments at no extra pass.
 
-Side effect worth recording: DLinear is now the only SGD-fitted model in `e01_baselines`, which
-halves the full sweep — 12 SGD runs (1 model x 3 seeds x 4 regimes) instead of 24.
+**The correction changes the conclusion, and the full sweep then changes it again by observation
+mode.** Median skill differences over all 144 cells of each mode:
 
-**Measured on `id` (closed-form slice, 1 465 776 training windows).** Dropping the three rate
-channels costs 0.002-0.09 skill: largest on `heave` at 10 s (0.086) and `pitch_rate` at 5 s
-(0.049), smallest on `roll` at every horizon (<= 0.031). So the rate channels carry real
-information, concentrated in heave and in the rate targets themselves, and almost none in roll —
-consistent with roll being the most narrowband channel and therefore the most self-predictable.
+| contrast | what it isolates | ideal | imu |
+|---|---|---|---|
+| `ar20` - `ar_attitude_only` (both 108 900) | rate channels, capacity held | +0.0046 | **+0.0091** |
+| `ar10` -> `ar20` (54 900 -> 108 900) | capacity, information set held | **+0.0063** | +0.0053 |
+| `ar20` -> `ar40` (108 900 -> 216 900) | capacity, information set held | +0.0017 | +0.0011 |
 
-A free second reading fell out of it. `ar_attitude_only` (20 lags x 3 channels) lands on exactly
-`ar10`'s parameter count (10 lags x 6 channels) — 54 900 either way — giving a budget-matched pair
-that was not designed for. `ar_attitude_only` loses to `ar10` on every DOF and horizon: **at fixed
-capacity the rate channels buy more than the extra lags do.**
+At the confounded 54 900 the rate-channel effect measured ~+0.01 — indistinguishable from the
+capacity step contaminating it. At matched capacity the two separate, **and they order differently
+in the two observation modes**: under `ideal` the rate channels are worth *less* than doubling the
+lag budget (+0.0046 vs +0.0063), under `imu` they are worth *more* (+0.0091 vs +0.0053).
 
-### P3-D16 — AR normal equations are severely ill-conditioned; forecasts are usable, coefficients are not
+That ordering is physically sensible and is the more interesting result. With clean attitude
+observations, a longer lag window recovers much of what the rate channels carry, since the rates are
+very nearly the derivative of the attitudes the model already sees. Once the attitudes are corrupted
+by the IMU model, the separately-measured rate channels stop being redundant with them and start
+carrying independent information — so their value roughly doubles while the value of extra lags
+falls.
 
-Measured on `id`/train: `cond(R)` for `ar20` is **1.45e19**, and 2.45e18 for `ar_attitude_only`.
-Both are past float64 resolution for an unregularised solve — `ridge = 1e-6` on the whitened
-correlation matrix is what makes the Cholesky succeed at all, and the coefficients it returns are
-substantially determined by that regularisation rather than by the data alone.
+**The earlier universal claim is withdrawn.** The rate channels are not simply "worth more than
+extra lags"; whether they are depends on the observation mode, and the effect is small in both
+(under 0.01 median) relative to what the confounded pair appeared to show. Note also that an
+earlier draft of this entry recorded +0.0033 vs +0.0044 from an `id`-only slice and concluded the
+rate channels were worth uniformly less; that slice was one regime of one mode and did not support
+the generalisation.
 
-This is expected for a 240-feature design built from 200 samples of a narrowband, heavily
-oversampled signal: adjacent lags are nearly collinear. It does not invalidate the forecasts —
-those are measured directly on held-out realizations and are what every table in this project
-reports — but it does mean **AR coefficient values must not be read structurally**. No claim of the
-form "the model learned the roll period" or "lag k dominates" is supportable from these
-coefficients. Recorded because the temptation to interpret a linear model's weights is exactly
-where this would go wrong.
+The earlier claim that `ar_attitude_only` "loses to `ar10` on every DOF and horizon" is also
+withdrawn — it was false even at the old parametrisation (122/144 across regimes, not 144/144;
+`heave_rate` @ 150 on ideal `id` had 0.63532 vs 0.63518), and at AR(40) it now beats `ar10` in most
+cells, as a doubled feature count should.
+
+Training MSE on `id`, for the record: ar10 0.30037, ar_attitude_only 0.29307, ar20 0.27801,
+ar40 0.25835.
 
 ### P3-D14 — `src/dmf/data/channels.py` added
 
@@ -862,11 +883,23 @@ Step cost is nearly flat in batch size, so 4x the batch is ~3.6x less wall time.
 7.9 s/epoch on 16 workers, the two overlap at ~11-13 s/epoch against ~68 before: roughly **5x**,
 ~13 min per seed, ~3 h per observation mode.
 
-**Why changing lr is safe here and would not be for a deep model.** DLinear under MSE is convex;
-its optimum is the closed-form least-squares solution, and
-`tests/test_models.py::test_dlinear_sgd_reaches_the_closed_form_optimum` asserts SGD reaches it.
-Batch and lr therefore govern how fast it converges, not where — the oracle test is the guard, and
-it passes at the new settings. `lr = 2e-3` is square-root scaling for a 4x batch, chosen over
+**The stated justification for changing lr was wrong, and is corrected here rather than edited
+away.** It read: "DLinear under MSE is convex; its optimum is the closed-form least-squares
+solution, and `test_dlinear_sgd_reaches_the_closed_form_optimum` asserts SGD reaches it. Batch and
+lr therefore govern how fast it converges, not where — the oracle test is the guard."
+
+The oracle test disclaims exactly that use in its own docstring: it runs on a **well-conditioned
+synthetic task and deliberately not on the corpus**, because the corpus lag design is numerically
+rank-deficient (`cond` past 1e16), so "SGD falls short of the closed-form optimum by orders of
+magnitude *while working correctly*". It records that 120 epochs of Adam reach ~5e-2 against an
+exact optimum of ~1e-6, still falling. Production runs 60. On a problem this ill-conditioned, under
+a fixed epoch budget, *how fast* **is** *where* — so the oracle test is not the guard for this
+change, and the convexity argument does not carry.
+
+The batch/lr change itself stands: the measurements above are unaffected, and the wall-time
+argument was never in doubt. What was unsupported was the claim that convergence quality was
+unaffected. That question is now answered directly by P3-D19 rather than argued from a test that
+does not apply. `lr = 2e-3` is square-root scaling for a 4x batch, chosen over
 linear scaling's 4e-3 as the conservative option. 4096 was not taken despite being faster still:
 at 358 steps/epoch the schedule has too few steps for warmup and cosine decay to mean much.
 
@@ -875,13 +908,228 @@ fairness requirement is unaffected. **Phase 4 must re-derive these numbers befor
 this measurement is for a 60 300-parameter linear map, and a TCN or Transformer will not be
 fixed-overhead-bound in the same way.
 
+### P3-D18 — The shuffle control's large negative excess is the P1-D2 floor, not an anomaly
+
+On the full sweep the shuffle control's worst *negative* excess is -0.195 (`ideal`) / -0.215
+(`imu`), against ~0.004 on the `id`-only slices measured earlier. Negative excess means the
+shuffled model did **worse** than the window-mean null, which is the safe direction and passes a
+one-sided criterion — but the size warranted an explanation rather than a shrug.
+
+It is entirely concentrated in `unseen_heading` x {pitch, pitch_rate}. All ten of the largest
+negative values are those cells; every other regime lies within +/-0.01, and `id` within +/-0.004,
+matching the earlier slices exactly.
+
+Same cause as the negative-skill cells in P3-D7. The `unseen_heading` test set *is* beam seas,
+where the pitch heading factor is clamped at `eps = 0.05` (~26 dB down), so test-set pitch is
+residual floor rather than pitch physics. The shuffled model was still fitted on 45/135/180 deg
+training data where pitch is a real signal, so it carries a fitted amplitude and imposes it on a
+signal that has none. The window-mean null has no fitted amplitude to get wrong, so it wins. The
+control is measuring a genuine train/test amplitude mismatch, not a pipeline defect.
+
+Worth stating because the earlier `id`-only measurement would have set a misleading expectation for
+the tolerance: 2% is comfortable on `id`, and the control legitimately swings twenty times that far
+in the safe direction on a held-out-heading cut. The failing direction — a shuffled model doing
+*better* than the null, which is the only outcome that indicates leakage — did not occur in any of
+the 288 rows across both modes.
+
+### P3-D19 — `dlinear_ols` added: the DLinear optimisation gap is now measured, not assumed
+
+Every `ar*` row is at the exact optimum of its ridge-regularised objective (closed-form Cholesky).
+`dlinear` is wherever 60 epochs of AdamW landed. Comparing them conflated an optimisation gap of
+unknown size with an architecture gap, and nothing committed recorded which. The wall-clock
+signature showed `id` — the gate regime — was the one regime that hit the 60-epoch cap
+(1.018 s per training realization against 0.83 for the other three), i.e. it stopped with the
+validation loss still falling.
+
+`DLinear(individual=False)` is a linear map, so its optimum is computable. `dlinear_ols` solves it
+closed-form by streaming the decomposed design's normal equations on the **same per-regime pass**
+the AR moments already use: one 400x400 Cholesky, 0.18 s on top of a 41 s pass. Both rows ship, so
+the difference between them **is** the optimisation shortfall.
+
+Measured on `id` (ideal), identical windows and `validate()` call:
+
+| row | n_params | val MSE |
+|---|---|---|
+| `dlinear` (60 epochs AdamW, 3 seeds) | 60 300 | 0.432852 +/- 0.000007 |
+| `dlinear_ols` (ridge 1e-6) | 60 300 | **0.431545** |
+
+**0.30% of the loss — and it moves the conclusion.** The median AR(20)-over-DLinear advantage on
+`id` falls from **+0.0194 to +0.0056**, and AR(20) wins **28 of 36 cells instead of 35 of 36**. Most
+of the apparent DLinear-vs-AR architecture gap was the epoch budget. Per-cell the OLS row is up to
++0.0758 better (`pitch_rate` @ 100) and, in 5 of 36 test cells, *worse* — it is the exact optimum on
+train/val, which carries no guarantee on held-out realizations.
+
+The tiny seed spread (+/- 7e-6) is not evidence against this: three seeds under the same epoch
+budget on a convex problem stop in the same place. `skill_std` measures initialisation and shuffle
+noise; the optimisation shortfall is systematic and invisible to it.
+
+**The full sweep localises the gap precisely, via the `epochs_run` column P3-D23 added.** Under
+`ideal`, all twelve DLinear runs report `epochs_run = 60`: early stopping never fired in any regime,
+so every run stopped at the cap with the validation loss still falling. Under `imu`, `epochs_run` is
+43, 45 and 60 — early stopping did fire. The consequence is visible in the tables:
+
+| | ideal | imu |
+|---|---|---|
+| `dlinear_ols` - `dlinear`, median | **+0.0047** | +0.0000 |
+| cells where OLS wins | **110/144** | 78/144 |
+| `ar20` beats `dlinear` | 107/144 | 102/144 |
+| `ar20` beats `dlinear_ols` | **89/144** | 102/144 |
+
+So the optimisation gap is real where the budget bound and absent where it did not, which is exactly
+the shape the diagnosis predicts. Under `ideal` it accounts for 18 of the 107 cells in which AR(20)
+appeared to beat DLinear; under `imu`, where DLinear largely converged, removing the gap changes
+nothing (102 both ways). Any DLinear-vs-AR statement must therefore name the mode.
+
+The per-cell spread is wide in both directions (`ideal` min -0.3496, max +0.1270): `dlinear_ols` is
+the exact optimum of the regularised *training* objective, which carries no guarantee on held-out
+realizations, and in the residual-floor cells it overfits a signal that is mostly floor.
+
+**A second finding, unexpected.** The decomposed design is rank-deficient *by construction* —
+`trend = Ax` and `remainder = (I - A)x`, so `[trend, remainder]` spans rank `L`, not `2L`; measured
+`cond(R) = 6.0e19`. At `ridge = 0` the unregularised minimiser is reachable and useless: train MSE
+0.3182, **validation MSE 2539.8**, the lstsq fallback retaining directions at the rcond cutoff and
+amplifying them by ~1e10. At `ridge = 1e-6`: train 0.3761, val 0.4315. So `dlinear_ols` reports the
+exact optimum of the *regularised* objective, the same treatment every `ar*` row receives. Stated
+here rather than glossed, because "closed-form optimum" without the qualifier would be false.
+
+### P3-D20 — `window_mean` promoted to a baseline row; it beats persistence in 107 of 144 cells
+
+`DampedPersistence(tau -> 0+)` was instantiated in every run as the shuffle control's null (P3-D8)
+and its skill recorded only in `baselines_controls.csv`. Measured there on the completed 7-model
+sweep, it beats:
+
+| beaten by `window_mean` | ideal | imu |
+|---|---|---|
+| `persistence` (the skill denominator) | **107/144** | 107/144 |
+| `damped_persistence` (fitted, `n_params = 6`) | 54/144 | 55/144 |
+| `ar20` | 16/144 | 19/144 |
+| `dlinear` | 6/144 | 17/144 |
+
+A zeroth-order baseline beating the reference in 74% of cells, and beating a fitted model in 37%,
+while living only in a controls file is CLAUDE.md non-negotiable 6 inverted — not an underperforming
+model dropped, but an over-performing trivial one kept out of the table. It is now `window_mean`, a
+ninth row in `baselines.csv`.
+
+This also gives P3-D5 its practical remedy. Persistence is a treacherous reference on a narrowband
+signal because its error tracks the autocorrelation and is non-monotone in horizon; the window mean
+is monotone and is the honest "did the model learn anything beyond the window's level" bar at the
+horizons where persistence collapses.
+
+`damped_persistence` is left at one `tau` per channel for all 150 horizon steps (`n_params = 6`) in
+this phase. Its fitted `tau` on `id` is 9.3-15.5 samples (0.93-1.55 s), and beyond 100 samples it
+sits within 1e-4 skill of its own `tau -> 0` limit, which is where the 54 near-ties come from. A
+per-horizon `tau` would be strictly better and is still trivially cheap; not changed here so the
+comparison against the completed sweeps stays like-for-like.
+
+### P3-D21 — the gate cell in the generated report, and the report's own provenance
+
+Two defects in `baselines.md`, both found by the Gate 3 audit, both of which made the committed
+artifact contradict the repository around it.
+
+**The report declared the superseded gate.** It led with `Gate cell: roll at 3 s (30 samples)` and
+showed AR(20) at 0.9987 — the *original* criterion, failing by 0.20 — while `README.md` said the
+gate was restated and passing. `build_baselines_markdown` defaulted to roll/30 and `run_experiment`
+never passed anything else. The gate cell is now `GATE_DOF = "pitch"` / `GATE_HORIZON_SAMPLES = 100`
+as named constants in `dmf.train.experiment`, citing P3-D12, and `_gate_horizon` resolves to 100 on
+the production horizon list.
+
+**The `imu` report cited the `ideal` run's files.** Its provenance line named
+`results/baselines.csv` and siblings, which are the other mode's artifacts — pointing a reader at
+exactly the files the same document's cross-mode caveat warns against mixing. The line is now
+generated from the directory the run actually wrote to. Its default when the directory is unknown
+is a bare filename located "beside this document", deliberately not the old `results/` literal: a
+forgotten argument now degrades to a true-but-vaguer statement rather than a false one.
+
+Same class, also fixed: `BASELINES_CAVEATS` rendered "441 984 windows" into every artifact, a count
+superseded by P3-D6 (434 304). The window count is now derived from the table being rendered, and
+the remaining geometry literals in `report.py` and `runner.py` docstrings — `384 x 50 x 3`,
+"28 evaluation passes (7 models x 4 regimes)" — are stated structurally. A source-level test now
+fails if a live line asserts a window count.
+
+### P3-D22 — `skill_ci_lo`/`skill_ci_hi` on multi-seed rows was the mean of intervals; now the envelope
+
+`build_baselines_table` aggregated the per-seed bootstrap intervals with `mean`. The mean of three
+intervals is not an interval for anything: it excludes seed variance, and — the reason it matters —
+it is **invariant to seed disagreement**, which is the one thing a reader would consult it to
+detect.
+
+Now aggregated as `min`/`max`, the envelope of the per-run intervals. For `n_seeds = 1` that is
+bitwise the per-run interval, so every deterministic row keeps a genuine realization bootstrap CI,
+including the gate row. For multi-seed rows it is conservative and monotone in seed disagreement,
+and a caveat renders beside the table stating that it is an envelope, not a calibrated interval for
+the seed mean, pointing at `baselines_by_seed.csv` for the per-run intervals.
+
+Measured on the 7-model sweep's 144 `dlinear` cells: the envelope is a median 7% wider than the
+mean-of-intervals and up to **16.5x** wider in the `unseen_heading` @ 10-sample cells where the
+seeds genuinely disagree. That widening is the finding the mean was suppressing.
+
+A properly calibrated seed-mean interval would have to pool the bootstrap *resamples* across seeds,
+which needs the per-realization SSE tensors at scoring time — a re-run, not an aggregation, so it
+cannot be recovered in `report.py` from finished intervals.
+
+**Related, implemented but not wired.** `dmf.eval.runner.paired_skill_difference_ci` computes a
+paired bootstrap of `skill(a) - skill(b)` over common realization resamples. Model-vs-model claims
+in this protocol — P3-D13's rate-channel effect above all — are currently judged by eye against two
+*unpaired* marginal intervals, which is far too loose for effects of this size on models scored over
+identical realizations with strongly correlated errors. Choosing which pairs to report is a
+`run_experiment` decision and was not taken in this pass.
+
+### P3-D23 — DLinear's optimisation state is now recorded
+
+`FitResult` carried `best_epoch`, `epochs_run` and `best_val_loss`; `run_experiment` read only
+`wall_time_s` and discarded them, and the sweep logs are empty. That is why P3-D19's finding had to
+be inferred from wall-clock ratios rather than read off a column. All three now ship as columns on
+`baselines_by_seed.csv` (NaN for closed-form rows), which is the traceability both experiment configs
+already claimed to provide when they described "one early-stopping rule" as a fairness guarantee.
+
 ### Gate 3 evidence
 
-| Criterion | Where | Evidence |
-|---|---|---|
-| `results/baselines.csv` exists with skill vs persistence for every baseline / horizon / DOF / regime | `dmf.train.experiment.run_experiment` | Closed-form subset measured on `id` in both observation modes; **the full 7-model x 4-regime sweep has not been run** |
-| Gate cell read and acted on | P3-D1 .. P3-D4 | AR(20) 0.9987 (`ideal`) / 0.9958 (`imu`) at 3 s roll `id`, against a 0.8 threshold; task revised (P3-D4); gate restated and applied in P3-D12, measured 0.545 / 0.513 against 0.8 |
-| Result not attributable to leakage | `baselines_controls.csv`, P3-D1 | Shuffle control: 36/36 rows pass in both modes, `|excess| <= 0.0043` against a 2% tolerance |
-| Persistence denominator correct | P3-D6 | Re-measured on 434 304 windows, verified two independent ways, all six DOFs pinned in tests |
-| Underperforming cells reported, not dropped | P3-D7 | 12 of 144 cells negative, pinned as an exact set that fails on both a new loss and a silent repair |
-| Normalisation provenance | P3-D11 | Asserted at scoring time, fails closed |
+Final sweep, nine models: `ideal` 2026-08-28 09:11 -> 12:50 (exit 0), `imu` 12:50 -> 16:20 (exit 0).
+Artifacts in `results/` and `results/imu/`, five files each. Supersedes the seven-model sweep of
+2026-08-27, which was regenerated after the audit findings recorded in P3-D19 .. P3-D23.
+
+| Criterion | Evidence |
+|---|---|
+| `baselines.csv` covers every baseline / horizon / DOF / regime | **1296 rows per mode** = 4 regimes x 9 models x 6 DOFs x 6 horizons; schema equals `BASELINES_COLUMNS` |
+| Gate cell read and acted on | Original gate (roll @ 3 s, `id`) **failed** at 0.9987 / 0.9958 against 0.8; task revised (P3-D4); gate restated to pitch @ 10 s and applied (P3-D12). Final: **AR(20) 0.5446 (`ideal`) / 0.5132 (`imu`)** — passes |
+| Reference is exact | Persistence **bitwise 0.0** in all 144 rows of both modes; `rmse_persistence` identical across all nine models in every cell |
+| Not attributable to leakage | Shuffle control **0 rows in the failing direction of 288**; worst positive excess 0.0095 (`ideal`) / 0.0064 (`imu`) against a 2% tolerance. Large negative excursions explained in P3-D18 |
+| Denominators correct | `ideal` reproduces the P3-D6 table to 4.7e-07; `imu` table pinned from the same 434 304-window partition |
+| Underperforming cells reported | AR(20) negative in **12/144** (`ideal`), **13/144** (`imu`), matching the sets pinned in `tests/test_models.py` |
+| Per-cell table decomposes the headline | Joins to `baselines.csv` with **0 unmatched of 47 520**, both modes |
+| Optimisation state traceable | `epochs_run` / `best_epoch` / `best_val_loss` on `baselines_by_seed.csv` (P3-D23); this is what localised P3-D19 |
+| Normalisation provenance | Asserted at scoring time, fails closed (P3-D11) |
+
+### What the gate does *not* say
+
+Gate 3 passing is one cell of 36, and the honest reading needs the surrounding count. On the final
+tables, AR(20) on `id`:
+
+- exceeds 0.8 skill in **28 of 36 cells**, in both modes;
+- at the gate's own 10 s horizon exceeds 0.8 on **roll (0.926) and roll_rate (0.883)** — the gate
+  passes only because the restatement names pitch, which is the argmin at that horizon;
+- across the **1-5 s operational band** (`CLAUDE.md` §1, P3-D4) exceeds 0.8 in **89 of 96 cells**
+  (`ideal`) and **87 of 96** (`imu`) over all four regimes. The exceptions are entirely the
+  `unseen_heading` pitch/pitch_rate residual-floor artifact (P1-D2), not difficulty.
+
+**The task is easy by construction (P3-D1). The gate documents where it stops being easy, not that
+it is hard.** Any sentence claiming Gate 3 passes must carry that, or it misrepresents the corpus.
+
+The trivial-baseline result belongs here too: `window_mean`, with **zero parameters**, beats
+persistence — the denominator of every skill score in the project — in **107 of 144 cells** in both
+modes (P3-D20). Skill vs persistence is the metric the plan mandates, and on this signal the
+reference is weak in three quarters of the table.
+
+### Phase 3 findings worth carrying into Phase 4
+
+1. **A converged linear model is competitive with AR and beats it on parameters.** At the gate cell,
+   `dlinear_ols` scores 0.5683 with 60 300 parameters against `ar20`'s 0.5446 with 108 900 and
+   `ar40`'s 0.5765 with 216 900. This is the plan's §0.3 prediction — "include a linear model you
+   might lose to" — landing, and it was invisible until P3-D19 removed the optimisation gap. It does
+   **not** hold under `imu`, where `dlinear_ols` scores 0.4762 against `ar20`'s 0.5132.
+2. **Deep models must be selected on the operational metric, not `id` RMSE.** 28 of 36 `id` cells are
+   already above 0.8 skill; the discrimination lives in the OOD regimes and in quiescence detection,
+   which is Phase 6 work that should move ahead of Phase 4.
+3. **The training budget is not adequate and must be re-derived.** All twelve `ideal` DLinear runs hit
+   the 60-epoch cap. A TCN or Transformer on a `cond`-1e19 design will not be fixed-overhead-bound the
+   way a 60 300-parameter linear map is (P3-D17), and `epochs_run` must be checked rather than assumed.

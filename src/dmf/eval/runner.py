@@ -8,22 +8,24 @@ flattering a model is for the denominator to be measured over a different window
 a different partition, a different batch order, a different ``drop_last``. Here every model
 is scored inside the same batch loop against the same ``y``, and ``rmse_persistence`` for
 every row is read out of ``accumulators[persistence_key]``. There is no code path in which
-the two could be different window sets. It also collapses 28 evaluation passes
-(7 models x 4 regimes) to 4, which is the cheap part of the argument.
+the two could be different window sets. It also collapses ``n_models x n_regimes``
+evaluation passes to ``n_regimes``, which is the cheap part of the argument.
 
 **Errors accumulate per realization key, not globally.** ``EvalAccumulator.sse`` is
-``(n_keys, H, C_out)`` -- for the ``id`` test partition that is 384 x 50 x 3 x 8 B = 461 kB
-per accumulator, so per-key accumulation is free. It buys three things at zero runtime
+``(n_keys, H, C_out)`` float64 -- a few megabytes per accumulator at any corpus geometry
+this project will use, so per-key accumulation is free. It buys three things at zero runtime
 cost: the per-cell breakdown (:func:`per_cell_metrics`), the realization-level bootstrap
 confidence interval (:func:`bootstrap_skill_ci`), and the realization-level checks Phase 6
 needs -- none of which then requires re-evaluating anything.
 
-**``n_windows`` is a window count, not an independent-sample count.** At the production
-geometry (``lookback = 200``, ``stride = 5``) consecutive windows overlap by 195/200
-samples, so the 441 984 windows of ``id/test`` carry roughly 384 x 50 = 19 200 independent
-window-equivalents, and only 384 independent *realizations*. Every uncertainty statement in
-this module therefore resamples whole realizations. Treating ``n_windows`` as a sample size
-would understate every interval by more than an order of magnitude.
+**``n_windows`` is a window count, not an independent-sample count.** Windows are cut at a
+stride far shorter than the lookback, so consecutive windows share almost all of their input
+samples and their forecast targets overlap; a test partition holds two to three orders of
+magnitude more windows than it holds independently simulated realizations. Every uncertainty
+statement in this module therefore resamples whole realizations. Treating ``n_windows`` as a
+sample size would understate every interval by more than an order of magnitude. (No literal
+count appears here on purpose: the one that used to sit in this paragraph was superseded by
+the P3-D4 horizon change and went stale in place. Counts are measured, never narrated.)
 
 **Horizon convention.** "Horizon ``h``" is the error at lead time exactly ``h`` samples, so
 it reads element ``h - 1`` of the horizon axis. See :mod:`dmf.eval.metrics`.
@@ -49,6 +51,7 @@ __all__ = [
     "bootstrap_skill_ci",
     "evaluate_models",
     "marginalize_cells",
+    "paired_skill_difference_ci",
     "per_cell_metrics",
 ]
 
@@ -68,8 +71,11 @@ _KEY_FIELD_INDEX: dict[str, int] = {"ss": 0, "heading_deg": 1, "speed_kn": 2, "v
 class EvalAccumulator:
     """Per-realization error sums for one model over one partition.
 
-    Sums rather than arrays: a production test partition is ~442 000 windows, so storing
-    the predictions would cost ~0.5 GB per model per regime while the sums cost ~0.5 MB.
+    Sums rather than arrays: a production test partition holds hundreds of thousands of
+    windows, so storing the predictions would cost gigabytes per model per regime while
+    these sums cost megabytes. The exact counts are measured and written to
+    ``baselines_by_seed.csv``; they are not narrated here, because the last narrated one
+    went stale in place when P3-D4 changed the horizon set.
 
     Attributes:
         sse: Summed squared error per realization, shape ``(n_keys, H, C_out)``, float64,
@@ -434,6 +440,97 @@ def _in_row_order(values: FloatArray, n_dofs: int, n_horizons: int) -> FloatArra
     return np.asarray(values.T.reshape(-1), dtype=np.float64)
 
 
+def _check_bootstrap_args(
+    shapes: Sequence[tuple[int, ...]], *, horizons: tuple[int, ...], n_boot: int, ci_level: float
+) -> None:
+    """Validate the arguments every realization bootstrap in this module shares.
+
+    Args:
+        shapes: Shapes of the per-realization SSE tensors, which must all be equal and
+            three-dimensional ``(n_keys, H, C_out)``.
+        horizons: Horizons to report, samples, each in ``[1, H]``.
+        n_boot: Number of bootstrap resamples.
+        ci_level: Central confidence level.
+
+    Raises:
+        ValueError: If the shapes disagree or are not ``(n_keys, H, C_out)``, if ``n_boot``
+            is not positive, if ``ci_level`` is outside ``(0, 1)``, or if a horizon is out
+            of range.
+    """
+    first = shapes[0]
+    if any(shape != first for shape in shapes):
+        raise ValueError(
+            f"every SSE tensor must cover the same realizations and windows, got {list(shapes)}"
+        )
+    if len(first) != 3:
+        raise ValueError(f"expected (n_keys, H, C_out), got {first}")
+    if n_boot < 1:
+        raise ValueError(f"n_boot must be positive, got {n_boot}")
+    if not 0.0 < ci_level < 1.0:
+        raise ValueError(f"ci_level must be in (0, 1), got {ci_level}")
+    bad = [h for h in horizons if h < 1 or h > first[1]]
+    if bad:
+        raise ValueError(f"horizons {bad} are outside [1, {first[1]}]")
+
+
+def _horizon_slice(sse: Tensor, horizons: tuple[int, ...]) -> FloatArray:
+    """Select the reported horizons and flatten to ``(n_keys, len(horizons) * C_out)``.
+
+    Args:
+        sse: Per-realization summed squared error, ``(n_keys, H, C_out)``, squared corpus
+            units.
+        horizons: Horizons to report, samples. "Horizon ``h``" reads element ``h - 1``.
+
+    Returns:
+        Float64 array, rows realizations, columns horizon-major then channel.
+    """
+    index = [h - 1 for h in horizons]
+    n_keys = int(sse.shape[0])
+    return np.asarray(sse[:, index, :].reshape(n_keys, -1).numpy(), dtype=np.float64)
+
+
+def _bootstrap_counts(n_keys: int, n_boot: int, seed: int) -> FloatArray:
+    """Draw multinomial resample counts over realizations.
+
+    ``skill`` is a ratio of sums over realizations, so a resample is exactly a
+    count-weighted sum and 1000 resamples are one small matrix product. The counts are a
+    pure function of ``(n_keys, n_boot, seed)``, so two models scored over the same
+    partition with the same ``seed`` are resampled **identically** -- which is what makes a
+    paired difference (:func:`paired_skill_difference_ci`) possible without re-drawing.
+
+    Args:
+        n_keys: Number of realizations in the partition.
+        n_boot: Number of bootstrap resamples.
+        seed: Seed for the resampling generator.
+
+    Returns:
+        Counts, shape ``(n_boot, n_keys)``, float64, each row summing to ``n_keys``.
+    """
+    rng = np.random.default_rng(seed)
+    return np.asarray(
+        rng.multinomial(n_keys, np.full(n_keys, 1.0 / n_keys), size=n_boot), dtype=np.float64
+    )
+
+
+def _percentile_interval(
+    draws: FloatArray, *, ci_level: float, shape: tuple[int, int]
+) -> tuple[FloatArray, FloatArray]:
+    """Take a central percentile interval over the bootstrap axis.
+
+    Args:
+        draws: Bootstrap draws, shape ``(n_boot, len(horizons) * C_out)``.
+        ci_level: Central confidence level, e.g. 0.95 for a 2.5/97.5 percentile interval.
+        shape: ``(len(horizons), C_out)`` to reshape each bound to.
+
+    Returns:
+        Tuple ``(lo, hi)``, each of shape ``shape``, dimensionless.
+    """
+    tail = (1.0 - ci_level) / 2.0
+    lo = np.quantile(draws, tail, axis=0).reshape(shape)
+    hi = np.quantile(draws, 1.0 - tail, axis=0).reshape(shape)
+    return np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+
+
 def bootstrap_skill_ci(
     sse_model: Tensor,
     sse_persistence: Tensor,
@@ -476,39 +573,108 @@ def bootstrap_skill_ci(
         ValueError: If the two arrays disagree in shape, if ``n_boot`` is not positive, if
             ``ci_level`` is not in ``(0, 1)``, or if a resampled persistence SSE is zero.
     """
-    if sse_model.shape != sse_persistence.shape:
-        raise ValueError(
-            f"sse_model {tuple(sse_model.shape)} and sse_persistence "
-            f"{tuple(sse_persistence.shape)} must cover the same realizations and windows"
-        )
-    if sse_model.ndim != 3:
-        raise ValueError(f"expected (n_keys, H, C_out), got {tuple(sse_model.shape)}")
-    if n_boot < 1:
-        raise ValueError(f"n_boot must be positive, got {n_boot}")
-    if not 0.0 < ci_level < 1.0:
-        raise ValueError(f"ci_level must be in (0, 1), got {ci_level}")
-    max_horizon = int(sse_model.shape[1])
-    bad = [h for h in horizons if h < 1 or h > max_horizon]
-    if bad:
-        raise ValueError(f"horizons {bad} are outside [1, {max_horizon}]")
-
-    index = [h - 1 for h in horizons]
+    _check_bootstrap_args(
+        [tuple(sse_model.shape), tuple(sse_persistence.shape)],
+        horizons=horizons,
+        n_boot=n_boot,
+        ci_level=ci_level,
+    )
     n_keys = int(sse_model.shape[0])
     n_targets = int(sse_model.shape[2])
-    model = sse_model[:, index, :].reshape(n_keys, -1).numpy().astype(np.float64)
-    reference = sse_persistence[:, index, :].reshape(n_keys, -1).numpy().astype(np.float64)
-    rng = np.random.default_rng(seed)
-    counts = rng.multinomial(n_keys, np.full(n_keys, 1.0 / n_keys), size=n_boot).astype(np.float64)
+    model = _horizon_slice(sse_model, horizons)
+    reference = _horizon_slice(sse_persistence, horizons)
+    counts = _bootstrap_counts(n_keys, n_boot, seed)
     denominator = counts @ reference
     if np.any(denominator == 0.0):
         raise ValueError(
             "a bootstrap resample produced zero persistence SSE; the skill score is undefined there"
         )
     skill = 1.0 - (counts @ model) / denominator
-    tail = (1.0 - ci_level) / 2.0
-    lo = np.quantile(skill, tail, axis=0).reshape(len(horizons), n_targets)
-    hi = np.quantile(skill, 1.0 - tail, axis=0).reshape(len(horizons), n_targets)
-    return np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+    return _percentile_interval(skill, ci_level=ci_level, shape=(len(horizons), n_targets))
+
+
+def paired_skill_difference_ci(
+    sse_a: Tensor,
+    sse_b: Tensor,
+    sse_persistence: Tensor,
+    *,
+    horizons: tuple[int, ...],
+    n_boot: int = 1000,
+    ci_level: float = 0.95,
+    seed: int = 0,
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Bootstrap a **paired** interval for ``skill(a) - skill(b)``.
+
+    Every model in a pass is scored on the same realizations, so their errors are strongly
+    correlated: on a narrowband corpus a rough realization is rough for all of them. Two
+    *unpaired* marginal intervals overlapping therefore says nothing about whether the
+    difference is distinguishable from zero -- the shared realization-to-realization
+    variation, which dominates both marginals, cancels in the difference. Judging a
+    model-vs-model effect by eye from two overlapping marginal intervals is the specific
+    error this function exists to remove.
+
+    The pairing is exact rather than approximate: the same resample weights are applied to
+    both models and to the reference in the same expression, because
+    ``skill(a) - skill(b) = (SSE_b - SSE_a) / SSE_persistence`` under one resample. The
+    reference cancels out of the numerator entirely, so the difference does not inherit the
+    non-monotonic persistence denominator behaviour of P3-D5 in the *numerator* -- it is
+    still divided by it, so it is still a skill-scale quantity and still not comparable
+    across horizons.
+
+    **Not wired into the sweep.** :func:`evaluate_models` already holds every model's
+    per-realization accumulator in one pass, so this costs one extra matrix product per
+    pair; it needs a caller to decide which pairs to report and where to write them.
+
+    Args:
+        sse_a: Per-realization summed squared error of the first model, shape
+            ``(n_keys, H, C_out)``, squared corpus units (degrees squared for attitudes,
+            metres squared for heave).
+        sse_b: The same for the second model, over the same realizations and windows.
+        sse_persistence: The same for the persistence reference, likewise.
+        horizons: Horizons to report, samples, each in ``[1, H]``.
+        n_boot: Number of bootstrap resamples.
+        ci_level: Central confidence level, e.g. 0.95 for a 2.5/97.5 percentile interval.
+        seed: Seed for the resampling generator. The same value used by
+            :func:`bootstrap_skill_ci` draws the same resamples, so the paired interval and
+            the marginals in one table are computed on one common set of resamples.
+
+    Returns:
+        Tuple ``(difference, lo, hi)``, each of shape ``(len(horizons), C_out)`` and
+        dimensionless. ``difference`` is the point estimate on the full sample, positive
+        when model ``a`` has the higher skill; ``lo``/``hi`` are the percentile interval of
+        the paired bootstrap. An interval excluding zero is the claim "``a`` beats ``b`` on
+        these realizations"; the point estimate is *not* the centre of the interval and is
+        reported separately for that reason.
+
+    Raises:
+        ValueError: If the three arrays disagree in shape, if ``n_boot`` is not positive, if
+            ``ci_level`` is not in ``(0, 1)``, if a horizon is out of range, or if a
+            resampled persistence SSE is zero.
+    """
+    _check_bootstrap_args(
+        [tuple(sse_a.shape), tuple(sse_b.shape), tuple(sse_persistence.shape)],
+        horizons=horizons,
+        n_boot=n_boot,
+        ci_level=ci_level,
+    )
+    n_keys = int(sse_a.shape[0])
+    shape = (len(horizons), int(sse_a.shape[2]))
+    a = _horizon_slice(sse_a, horizons)
+    b = _horizon_slice(sse_b, horizons)
+    reference = _horizon_slice(sse_persistence, horizons)
+    total = reference.sum(axis=0)
+    if np.any(total == 0.0):
+        raise ValueError("persistence SSE is zero; the skill difference is undefined there")
+    point = np.asarray(((b.sum(axis=0) - a.sum(axis=0)) / total).reshape(shape), dtype=np.float64)
+    counts = _bootstrap_counts(n_keys, n_boot, seed)
+    denominator = counts @ reference
+    if np.any(denominator == 0.0):
+        raise ValueError(
+            "a bootstrap resample produced zero persistence SSE; the skill score is undefined there"
+        )
+    draws = (counts @ b - counts @ a) / denominator
+    lo, hi = _percentile_interval(draws, ci_level=ci_level, shape=shape)
+    return point, lo, hi
 
 
 def per_cell_metrics(
