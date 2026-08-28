@@ -334,6 +334,43 @@ This gate is where you decide whether the rest of the project is worth building 
 
 ### Phase 4 — Deep models (1 day)
 
+> **Before you start — carried forward from Gate 3. Read `docs/protocol.md` §Phase 3 first.**
+>
+> Phase 3 measured things that change this section. The text below is the original plan and has
+> **not** been rewritten; these are the deltas.
+>
+> **1. Do quiescence detection before the deep models.** Implement `src/dmf/eval/quiescence.py`
+> (Phase 6.2, seven stubbed functions) and validate it against the AR baseline *first*. AR(20)
+> already exceeds 0.8 skill in 28 of 36 `id` cells and 89 of 96 across the 1–5 s band, so selecting
+> architectures on `id` RMSE tunes against a metric that cannot separate them. The discrimination is
+> in the OOD regimes and in the landing decision at SS5/SS6 (base rates 0.27 and 0.058).
+>
+> **2. Gate 4 as written is a weak bar in a saturated cell.** It asks that deep models beat
+> `damped_persistence` at 3 s on `id`. That cell is saturated (AR(20) 0.9987), and
+> `damped_persistence` loses to the zero-parameter `window_mean` in 54 of 144 cells (P3-D20). If
+> Gate 4 is kept as-is it will pass on models that have learned nothing useful. Restate it at the
+> decision horizon against the strongest trivial baseline, and record the change per CLAUDE.md
+> §Gates.
+>
+> **3. The stated training defaults are wrong for this corpus.** "batch 256 … expect minutes per
+> run" — measured 22 min/seed for a 60 300-parameter linear map. Committed configs use batch 1024,
+> lr 2e-3, `num_workers` 16 (P3-D17). More important: the 60-epoch cap bound in **22 of 24** DLinear
+> runs, i.e. early stopping almost never fired and no run converged (P3-D19, P3-D23). Check
+> `epochs_run` on every deep model; do not inherit the budget, and do not compare a converged deep
+> model against the under-converged `dlinear` row.
+>
+> **4. Two prerequisites before any model-vs-model claim.** Neither exists yet, and the absence of
+> the first has already produced a wrong published conclusion (P3-D13):
+> - wire `dmf.eval.runner.paired_skill_difference_ci` — implemented, unwired. Unpaired marginal CIs
+>   are far too loose for effects of this size on models scored over identical realizations.
+> - add the normalised-RMSE column P3-D5 mandates twice and no artifact carries. Skill vs
+>   persistence is not comparable across horizons here; the denominator oscillates with the roll
+>   period.
+>
+> **5. Geometry changed (P3-D4).** Six target channels, horizons `[10, 20, 30, 50, 100, 150]`, so
+> `max_horizon` is 150, not 50. The TCN receptive-field arithmetic below still holds (lookback is
+> unchanged at 200), but output shapes and parameter counts do not match anything quoted here.
+
 Shared interface: `forward(x: Tensor[B, L, C_in]) -> Tensor[B, H, C_out]` (point) or `[B, H, C_out, Q]` (quantile).
 
 **TCN** — dilated causal 1-D convolutions, dilations `[1,2,4,8,16,32]`, kernel 3, 64 channels, residual blocks with weight norm and dropout. Receptive field must cover the full lookback: `1 + 2*(k-1)*sum(dilations) = 1 + 2*2*63 = 253 ≥ 200`. State this calculation in a docstring; getting it wrong is a common and invisible bug.

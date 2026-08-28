@@ -56,6 +56,12 @@ Each phase ends with a gate defined in the implementation plan. Do not start pha
 gate N passes. When a gate fails, fix it — do not work around it and do not relax the threshold
 without saying so explicitly and recording it in `docs/protocol.md`.
 
+**Read `docs/protocol.md` for the phases already completed before starting a new one.** It is not
+only an audit trail: earlier phases measure things that invalidate later ones, and
+`IMPLEMENTATION_PLAN.md` is the *original* plan and is not rewritten as they do. Where the two
+disagree, the protocol is what actually happened. Completed phases leave a "Before you start" block
+at the head of the next phase in the plan; if you are starting a phase that has one, read it.
+
 ## Specialists
 
 Delegate to these agents rather than doing their work in the main thread:
