@@ -5,11 +5,20 @@ giving 20 tokens for the default ``lookback = 200``. Patching is not an optimisa
 detail: token-per-sample attention over 200 steps is quadratic in a length that carries
 very little information per step, and it trains measurably worse on a narrowband signal
 than the patched form.
+
+**Where the capacity sits.** The flatten-and-project head maps ``n_tokens * d_model``
+(20 x 128 = 2560) to ``H * C_out`` (150 x 6 = 900), which is 2 304 900 of the model's
+2 712 708 parameters -- 85% of the model, and 38x the whole of DLinear. That is the head
+the implementation plan specifies and it ships as specified; the resulting capacity spread
+across the Phase 4 line-up is a caveat to report beside the results table, not something to
+engineer away by quietly substituting a pooled or last-token head.
 """
 
+import torch
 from torch import Tensor, nn
 
 from dmf.models.base import BaseForecaster
+from dmf.train.registry import register_model
 
 __all__ = ["PatchEmbedding", "TransformerForecaster"]
 
@@ -27,7 +36,11 @@ class PatchEmbedding(nn.Module):
                 channels.
             d_model: Embedding width.
         """
-        raise NotImplementedError
+        super().__init__()
+        self.patch_len = patch_len
+        self.n_input_channels = n_input_channels
+        self.d_model = d_model
+        self.projection = nn.Linear(patch_len * n_input_channels, d_model)
 
     def forward(self, x: Tensor) -> Tensor:
         """Embed a batch of windows into a token sequence.
@@ -42,15 +55,31 @@ class PatchEmbedding(nn.Module):
         Raises:
             ValueError: If ``L`` is not a multiple of ``patch_len``.
         """
-        raise NotImplementedError
+        lookback = int(x.shape[1])
+        if lookback % self.patch_len != 0:
+            raise ValueError(
+                f"lookback ({lookback}) must be a multiple of patch_len ({self.patch_len})"
+            )
+        n_tokens = lookback // self.patch_len
+        patches = x.reshape(x.shape[0], n_tokens, self.patch_len * self.n_input_channels)
+        embedded: Tensor = self.projection(patches)
+        return embedded
 
 
+@register_model("transformer")
 class TransformerForecaster(BaseForecaster):
     """Encoder-only transformer with learned positional encoding.
 
     Flatten-and-project head rather than a decoder: the horizon is emitted in one pass,
     consistent with every other model here.
+
+    No causal mask is applied. The encoder reads the lookback only, every sample of which
+    is in the past of the forecast origin, so masking would restrict the encoder without
+    removing any leak -- unlike the TCN's causal padding, which is load-bearing because its
+    convolutions are applied at every step of the window.
     """
+
+    FIT_KIND = "sgd"
 
     def __init__(
         self,
@@ -86,7 +115,33 @@ class TransformerForecaster(BaseForecaster):
             ValueError: If ``lookback`` is not a multiple of ``patch_len``, or ``d_model``
                 is not divisible by ``n_heads``.
         """
-        raise NotImplementedError
+        super().__init__(lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles)
+        if patch_len < 1:
+            raise ValueError(f"patch_len must be positive, got {patch_len}")
+        if lookback % patch_len != 0:
+            raise ValueError(
+                f"lookback ({lookback}) must be a multiple of patch_len ({patch_len}); "
+                f"a ragged final patch would silently drop the oldest samples"
+            )
+        if n_heads < 1 or d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.patch_len = patch_len
+        self.d_model = d_model
+        self.n_tokens = lookback // patch_len
+        self.patch_embed = PatchEmbedding(patch_len, n_input_channels, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(self.n_tokens, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.embed_dropout = nn.Dropout(dropout)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self._head_width = max_horizon * n_target_channels * max(n_quantiles, 1)
+        self.head = nn.Linear(self.n_tokens * d_model, self._head_width)
 
     def forward(self, x: Tensor) -> Tensor:
         """Embed, attend over patches, and project to the horizon.
@@ -97,4 +152,10 @@ class TransformerForecaster(BaseForecaster):
         Returns:
             Forecasts, shape ``(B, H, C_out)`` or ``(B, H, C_out, Q)``, dimensionless.
         """
-        raise NotImplementedError
+        tokens: Tensor = self.embed_dropout(self.patch_embed(x) + self.pos_embed)
+        encoded: Tensor = self.encoder(tokens)
+        out: Tensor = self.head(encoded.reshape(x.shape[0], self.n_tokens * self.d_model))
+        # out: (B, H * C_out * max(Q, 1)) -> (B, H, C_out[, Q])
+        if self.n_quantiles > 0:
+            return out.view(x.shape[0], self.max_horizon, self.n_target_channels, self.n_quantiles)
+        return out.view(x.shape[0], self.max_horizon, self.n_target_channels)

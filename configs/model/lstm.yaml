@@ -1,0 +1,22 @@
+# LSTM encoder with a direct multi-horizon linear head.
+#
+# The recurrence encodes the 200-sample lookback; the top layer's final hidden state is
+# projected to all H steps in one pass. The decoder is deliberately not recurrent: an
+# autoregressive rollout would compound error over 150 steps and would put a loop in the
+# Phase 7 ONNX graph, which is what the project-wide direct-multi-horizon rule exists to
+# avoid.
+#
+# 317 828 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6): 201 728 in the two
+# recurrent layers and 116 100 in the head, Linear(128 -> H*C_out). Between `tcn` (196 804)
+# and `transformer` (2 712 708).
+#
+# `dropout` is applied by nn.LSTM to the output of every layer but the last, so it is a
+# between-layer regulariser here and has no effect at num_layers=1.
+name: lstm
+label: lstm
+head: point
+quantiles: []
+params:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.1

@@ -17,6 +17,12 @@ Covered here:
 - Per-cell sums marginalise back to the pooled numbers exactly, so the cell breakdown and
   the headline table cannot disagree.
 - The bootstrap resamples **realizations**, not windows, and brackets the point estimate.
+- ``nrmse`` is anchored at its two definitional points -- exactly 0.0 for a perfect forecast
+  and exactly 1.0 for a forecast of the partition mean -- and its denominator ``signal_std``
+  is checked against a direct NumPy standard deviation of the same targets, because the
+  sum-of-squares form the streaming path has to use is the numerically risky one. The target
+  sums are accumulated once per pass and shared, so ``signal_std`` is asserted **bitwise**
+  identical whether one model was scored or three.
 - ``aggregate_over_seeds`` refuses a group with fewer than three seeds; ``aggregate_results``
   routes deterministic rows around it with ``n_seeds = 1`` and a **NaN** std.
 - The rendered ``baselines.md`` cites the directory it was written from, so an ``imu`` run
@@ -31,6 +37,14 @@ Covered here:
 - ``paired_skill_difference_ci`` resamples both models under one set of realization weights,
   so a model-vs-model difference is judged on its own interval rather than by eye from two
   overlapping marginals.
+- The **Gate 4 read-out** (:mod:`dmf.eval.gate`) computes both readings of the gate from a
+  committed table: the original criterion (3 s vs ``damped_persistence``) and the restated
+  one the gate is read at (10 s on pitch vs the stronger of ``damped_persistence`` and
+  ``window_mean``, resolved per cell, P4-D1). The margin rule is strict -- ``margin ==
+  skill_std`` is a FAIL -- a NaN ``skill_std`` on a deep model is UNVERIFIED and never a
+  PASS, the reference resolution is exercised in both directions because P3-D20 records
+  both occurring, the paired-bootstrap join is optional, and a missing gate cell raises
+  rather than returning an empty verdict.
 
 Controls, from the validation protocol:
 
@@ -65,14 +79,35 @@ from dmf.data.normalize import is_train_partition
 from dmf.data.splits import Regime, build_split
 from dmf.data.windows import window_spec_from_config
 from dmf.eval.controls import persistence_pipeline_sanity, shuffle_control, untrained_control
+from dmf.eval.gate import (
+    GATE4_COLUMNS,
+    GATE4_DEEP_MODELS,
+    PAIRED_ABSENT,
+    PAIRED_BELOW_ZERO,
+    PAIRED_EXCEEDS_ZERO,
+    PAIRED_SPANS_ZERO,
+    READING_B,
+    VERDICT_FAIL,
+    VERDICT_PASS,
+    VERDICT_UNVERIFIED,
+    build_gate4_markdown,
+    gate4_readout,
+    read_gate4_inputs,
+    reading_passes,
+    write_gate4_report,
+)
 from dmf.eval.metrics import (
     mae,
     metrics_table_from_sums,
+    nrmse,
     per_dof_horizon_metrics,
     rmse,
+    signal_std,
     skill_score,
 )
 from dmf.eval.report import (
+    _CONTRAST_ARTIFACTS,
+    _CONTROL_ARTIFACTS,
     BASELINES_ARTIFACTS,
     BASELINES_COLUMNS,
     aggregate_over_seeds,
@@ -90,6 +125,7 @@ from dmf.eval.runner import (
     paired_skill_difference_ci,
     per_cell_metrics,
 )
+from dmf.typedefs import FloatArray
 
 #: Horizons reported by the small-corpus fixture geometry, samples.
 SMALL_REPORTED_HORIZONS: tuple[int, ...] = (5, 10, 20)
@@ -268,12 +304,15 @@ def test_horizon_metric_is_per_step_not_cumulative() -> None:
     is exactly 3.
     """
     per_step = np.asarray([1.0, 2.0, 3.0])[:, None]
-    pred = np.zeros((1, 3, 1))
-    target = per_step[None, :, :]
+    pred = np.zeros((2, 3, 1))
+    # Two windows of opposite sign rather than one. The per-step RMSE is identical -- the
+    # squared errors are the same -- but a single-window partition has zero target variance
+    # at every lead time, and `signal_std` refuses that rather than dividing by zero.
+    target = np.stack([per_step, -per_step])
     table = per_dof_horizon_metrics(
         pred=pred,
         target=target,
-        persistence_pred=np.zeros((1, 3, 1)),
+        persistence_pred=np.zeros((2, 3, 1)),
         dof_names=("roll",),
         horizons=(1, 2, 3),
         fs_hz=FS_HZ,
@@ -288,6 +327,8 @@ def test_horizon_seconds_come_from_the_sampling_rate() -> None:
         sse=np.full((50, 1), 2.0),
         sae=np.full((50, 1), 1.0),
         sse_persistence=np.full((50, 1), 4.0),
+        sy=np.zeros((50, 1)),
+        syy=np.full((50, 1), 2.0),
         n=2,
         dof_names=("roll",),
         horizons=(10, 30, 50),
@@ -309,6 +350,8 @@ def test_metrics_table_from_sums_matches_the_array_path(rng: np.random.Generator
         sse=np.square(pred - target).sum(axis=0),
         sae=np.abs(pred - target).sum(axis=0),
         sse_persistence=np.square(reference - target).sum(axis=0),
+        sy=target.sum(axis=0),
+        syy=np.square(target).sum(axis=0),
         n=64,
         dof_names=("roll", "pitch", "heave"),
         horizons=(1, 4, 8),
@@ -320,7 +363,15 @@ def test_metrics_table_from_sums_matches_the_array_path(rng: np.random.Generator
 def test_metrics_table_rejects_a_horizon_beyond_the_forecast() -> None:
     with pytest.raises(ValueError, match=r"outside \[1, 8\]"):
         metrics_table_from_sums(
-            np.ones((8, 1)), np.ones((8, 1)), np.ones((8, 1)), 1, ("roll",), (9,), FS_HZ
+            sse=np.ones((8, 1)),
+            sae=np.ones((8, 1)),
+            sse_persistence=np.ones((8, 1)),
+            sy=np.zeros((8, 1)),
+            syy=np.full((8, 1), 2.0),
+            n=2,
+            dof_names=("roll",),
+            horizons=(9,),
+            fs_hz=FS_HZ,
         )
 
 
@@ -334,6 +385,192 @@ def test_per_dof_horizon_metrics_rejects_a_different_persistence_window_set() ->
             horizons=(1,),
             fs_hz=FS_HZ,
         )
+
+
+# ---------------------------------------------------------------------------
+# Normalised RMSE (docs/protocol.md P3-D5)
+#
+# Skill's denominator is persistence, whose error tracks the autocorrelation and is
+# non-monotone in lead time on this signal: `tests/test_models.py::PERSISTENCE_RMSE_ID_TEST`
+# pins roll persistence *lower* at 100 samples (3.79 deg) than at 50 (7.09 deg). nrmse
+# divides by the target's own spread instead, which depends on nothing but the targets.
+# ---------------------------------------------------------------------------
+
+
+def _unit_variance_sums(n: int, n_horizons: int = 3, n_channels: int = 1) -> dict[str, FloatArray]:
+    """Sums for a target of alternating ``+1``/``-1``, i.e. mean 0 and population std 1.
+
+    Chosen so the two definitional anchors are exact rather than approximate. ``signal_std``
+    is ``sqrt(1 - 0)`` and the partition-mean forecast's RMSE is ``sqrt(n/n)``: both are
+    1.0 with no rounding, so ``nrmse == 1.0`` can be asserted bitwise. On arbitrary targets
+    the same identity holds only to within a few ULP, because the streaming variance takes
+    ``syy/n - mean**2`` while the RMSE takes ``sse/n`` -- different arithmetic, same
+    quantity.
+
+    Args:
+        n: Number of windows, at least 2.
+        n_horizons: Forecast length ``H``.
+        n_channels: Target channel count ``C``.
+
+    Returns:
+        Mapping with ``sy`` and ``syy``, each shape ``(H, C)``, and ``sse_mean_forecast``,
+        the summed squared error of a forecast that always emits the partition mean (0).
+    """
+    shape = (n_horizons, n_channels)
+    return {
+        "sy": np.zeros(shape) if n % 2 == 0 else np.ones(shape),
+        "syy": np.full(shape, float(n)),
+        "sse_mean_forecast": np.full(shape, float(n)),
+    }
+
+
+def test_nrmse_of_a_perfect_forecast_is_exactly_zero() -> None:
+    """The lower anchor. Zero error over a signal that varies is nrmse 0, not ~0."""
+    sums = _unit_variance_sums(n=8)
+    table = metrics_table_from_sums(
+        sse=np.zeros((3, 1)),
+        sae=np.zeros((3, 1)),
+        sse_persistence=np.full((3, 1), 4.0),
+        sy=sums["sy"],
+        syy=sums["syy"],
+        n=8,
+        dof_names=("roll",),
+        horizons=(1, 2, 3),
+        fs_hz=FS_HZ,
+    )
+    assert (table["nrmse"].to_numpy() == 0.0).all()
+    assert (table["signal_std"].to_numpy() == 1.0).all()
+
+
+def test_nrmse_of_a_constant_mean_forecast_is_exactly_one() -> None:
+    """The definitional anchor, and it must be exact.
+
+    nrmse is *defined* as "1.0 means no better than predicting the partition mean". A
+    forecast that emits the mean has RMSE equal to the signal's own standard deviation, so
+    the ratio is 1 by construction; an implementation that divided by, say, the training
+    normalisation scale or the persistence RMSE would land near 1 on some cells and be
+    wrong everywhere. ``==``, not ``approx``, is what distinguishes the two.
+    """
+    sums = _unit_variance_sums(n=8)
+    table = metrics_table_from_sums(
+        sse=sums["sse_mean_forecast"],
+        sae=np.full((3, 1), 8.0),
+        sse_persistence=np.full((3, 1), 4.0),
+        sy=sums["sy"],
+        syy=sums["syy"],
+        n=8,
+        dof_names=("roll",),
+        horizons=(1, 2, 3),
+        fs_hz=FS_HZ,
+    )
+    assert (table["nrmse"].to_numpy() == 1.0).all()
+    assert table["rmse"].to_numpy().tolist() == table["signal_std"].to_numpy().tolist()
+
+
+def test_nrmse_is_the_rmse_column_divided_by_the_signal_std_column(
+    rng: np.random.Generator,
+) -> None:
+    """No third quantity: what is rendered must be the ratio of what is rendered."""
+    target = rng.normal(size=(64, 8, 3)) * np.asarray([5.0, 1.0, 0.5])
+    pred = target + rng.normal(size=(64, 8, 3))
+    table = per_dof_horizon_metrics(
+        pred, target, np.zeros_like(target), ("roll", "pitch", "heave"), (1, 4, 8), FS_HZ
+    )
+    assert np.array_equal(
+        table["nrmse"].to_numpy(), table["rmse"].to_numpy() / table["signal_std"].to_numpy()
+    )
+
+
+def test_signal_std_matches_a_direct_numpy_standard_deviation(rng: np.random.Generator) -> None:
+    """Positive control on the sum-of-squares form, which is the numerically risky one.
+
+    ``syy/n - mean**2`` cancels, and the cancellation costs about ``(mean/std)**2 * eps``
+    of relative accuracy. The reference is NumPy's two-pass ``std``, which does not have
+    that problem but needs every window in memory -- at the corpus geometry that is
+    hundreds of thousands of windows x 150 lead times x 6 channels, the multi-gigabyte
+    array this whole module exists to avoid, so the streaming form is used and its error is
+    measured rather than assumed.
+
+    Both regimes are exercised on purpose. The zero-mean channel -- what a deck motion
+    channel actually is, since roll, pitch and heave oscillate about zero -- agrees to
+    1e-12. The deliberately adversarial channel offset to 2000 standard deviations agrees
+    only to ~4e-9, which is the measured price and is recorded here rather than hidden by a
+    single loose tolerance covering both.
+    """
+    scales = np.asarray([5.0, 1.0, 0.5])
+    offsets = np.asarray([0.0, 30.0, 1000.0])
+    target = rng.normal(size=(512, 6, 3)) * scales + offsets
+    got = signal_std(target.sum(axis=0), np.square(target).sum(axis=0), 512)
+    reference = target.std(axis=0)
+    assert got[:, 0] == pytest.approx(reference[:, 0], rel=1e-12)
+    assert got == pytest.approx(reference, rel=1e-7)
+
+
+def test_signal_std_refuses_a_constant_channel() -> None:
+    """A channel that never moves is a corpus bug, not a perfectly easy forecast."""
+    with pytest.raises(ValueError, match="zero or non-finite"):
+        signal_std(np.full((3, 1), 4.0), np.full((3, 1), 8.0), 2)
+
+
+def test_the_metrics_table_refuses_a_constant_channel() -> None:
+    """And the refusal survives to the table builder rather than emitting inf."""
+    with pytest.raises(ValueError, match="zero or non-finite"):
+        metrics_table_from_sums(
+            sse=np.ones((3, 1)),
+            sae=np.ones((3, 1)),
+            sse_persistence=np.ones((3, 1)),
+            sy=np.full((3, 1), 4.0),
+            syy=np.full((3, 1), 8.0),
+            n=2,
+            dof_names=("roll",),
+            horizons=(1, 2, 3),
+            fs_hz=FS_HZ,
+        )
+
+
+def test_a_constant_channel_outside_the_reported_horizons_does_not_fail_the_table() -> None:
+    """Same rule skill_score already follows: only the cells actually reported are checked."""
+    sy = np.zeros((3, 1))
+    syy = np.full((3, 1), 4.0)
+    sy[2, 0], syy[2, 0] = 8.0, 32.0  # Constant at h=3, which is not reported.
+    table = metrics_table_from_sums(
+        sse=np.ones((3, 1)),
+        sae=np.ones((3, 1)),
+        sse_persistence=np.ones((3, 1)),
+        sy=sy,
+        syy=syy,
+        n=4,
+        dof_names=("roll",),
+        horizons=(1, 2),
+        fs_hz=FS_HZ,
+    )
+    assert len(table) == 2
+
+
+def test_nrmse_refuses_a_denominator_it_did_not_compute_itself() -> None:
+    with pytest.raises(ValueError, match="zero or non-finite"):
+        nrmse(np.ones((2,)), np.asarray([1.0, 0.0]))
+
+
+def test_signal_std_does_not_depend_on_the_error_it_is_reported_beside() -> None:
+    """It is a property of the targets: two models over one partition share one value."""
+    sums = _unit_variance_sums(n=8)
+    tables = [
+        metrics_table_from_sums(
+            sse=np.full((3, 1), factor),
+            sae=np.full((3, 1), factor),
+            sse_persistence=np.full((3, 1), 4.0),
+            sy=sums["sy"],
+            syy=sums["syy"],
+            n=8,
+            dof_names=("roll",),
+            horizons=(1, 2, 3),
+            fs_hz=FS_HZ,
+        )
+        for factor in (1.0, 100.0)
+    ]
+    assert tables[0]["signal_std"].tolist() == tables[1]["signal_std"].tolist()
+    assert tables[0]["nrmse"].tolist() != tables[1]["nrmse"].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +831,84 @@ def test_accumulator_attributes_error_to_the_right_realization(
     assert torch.equal(counts, torch.full_like(counts, per_realization))
 
 
+def test_accumulated_signal_std_matches_a_direct_standard_deviation_of_the_targets(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """Positive control on the streaming target sums, against a two-pass NumPy reference.
+
+    The accumulator adds ``y`` and ``y**2`` per batch into a per-realization tensor and the
+    table divides at the end; NumPy holds every window and makes two passes. The
+    sum-of-squares form is the numerically fragile one -- a real channel with a non-zero
+    mean is where ``syy/n - mean**2`` loses digits -- so it is checked against the form
+    that does not have that problem rather than against itself.
+    """
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "id", "test")
+    table, _ = evaluate_models(
+        _baseline_models(dataset),
+        dataset,
+        persistence_key="persistence",
+        horizons=SMALL_REPORTED_HORIZONS,
+        fs_hz=FS_HZ,
+        batch_size=256,
+        num_workers=0,
+        n_boot=8,
+    )
+    targets = torch.stack([dataset[i][1] for i in range(len(dataset))]).double().numpy()
+    direct = targets.std(axis=0)
+    for row in table.itertuples():
+        channel = dataset.target_columns.index(row.dof)
+        step = row.horizon_samples - 1
+        assert row.signal_std == pytest.approx(float(direct[step, channel]), rel=1e-9)
+        assert row.nrmse == pytest.approx(row.rmse / float(direct[step, channel]), rel=1e-9)
+
+
+def test_signal_std_is_bitwise_identical_however_many_models_were_scored(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """The target sums are accumulated once per pass and shared, not once per model.
+
+    Accumulating them per model would sum the same float64 values in as many different
+    orders as there are models, so two rows of one table could report two different
+    denominators for the same partition -- small, invisible, and a contradiction. The
+    assertion is ``==`` on the float, and identity on the tensor the sums live in.
+    """
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "id", "test")
+    horizon = dataset.window_spec.max_horizon
+    targets = len(dataset.target_columns)
+    scored = {}
+    for models in (
+        {"persistence": _Persistence(horizon, targets)},
+        {
+            "persistence": _Persistence(horizon, targets),
+            "window_mean": _WindowMean(horizon, targets),
+            "scaled": _Scaled(horizon, targets, 0.5),
+        },
+    ):
+        table, accumulators = evaluate_models(
+            models,
+            dataset,
+            persistence_key="persistence",
+            horizons=SMALL_REPORTED_HORIZONS,
+            fs_hz=FS_HZ,
+            batch_size=256,
+            num_workers=0,
+            n_boot=8,
+        )
+        # One tensor per pass, shared by every model in it.
+        first = next(iter(accumulators.values()))
+        for accumulator in accumulators.values():
+            assert accumulator.sy is first.sy
+            assert accumulator.syy is first.syy
+        # Every model's rows carry the same denominator within the pass, too.
+        for column in ("signal_std",):
+            per_model = table.groupby(["dof", "horizon_samples"])[column].nunique()
+            assert (per_model == 1).all()
+        scored[len(models)] = table[table["model"] == "persistence"].reset_index(drop=True)
+    one, three = scored[1], scored[3]
+    assert one["signal_std"].tolist() == three["signal_std"].tolist()
+    assert one["nrmse"].tolist() == three["nrmse"].tolist()
+
+
 def test_per_cell_metrics_marginalise_back_to_the_pooled_table(
     small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
 ) -> None:
@@ -621,6 +936,11 @@ def test_per_cell_metrics_marginalise_back_to_the_pooled_table(
     assert len(merged) == len(table)
     assert np.allclose(merged["rmse"], merged["rmse_cell"], rtol=1e-12)
     assert np.allclose(merged["skill"], merged["skill_cell"], rtol=1e-12, atol=1e-15)
+    # The pooled signal_std is re-derived from the summed sy/syy, never averaged over cells:
+    # the standard deviation of a union of grid cells is not the mean of their standard
+    # deviations, and on a grid of different sea states it is substantially larger.
+    assert np.allclose(merged["signal_std"], merged["signal_std_cell"], rtol=1e-12)
+    assert np.allclose(merged["nrmse"], merged["nrmse_cell"], rtol=1e-12)
     assert merged["n_windows"].equals(merged["n_windows_cell"])
 
 
@@ -984,6 +1304,10 @@ def _seeded_frame(n_seeds: int, deterministic: bool = False) -> pd.DataFrame:
             "mae": [0.5] * n_seeds,
             "skill": [0.8] * n_seeds,
             "rmse_persistence": [2.0] * n_seeds,
+            # A property of the targets, so constant across the runs of a cell by
+            # construction; `nrmse` moves with `rmse` because it is that run's error.
+            "signal_std": [4.0] * n_seeds,
+            "nrmse": [(1.0 + 0.1 * i) / 4.0 for i in range(n_seeds)],
             "skill_ci_lo": [0.7] * n_seeds,
             "skill_ci_hi": [0.9] * n_seeds,
             "n_params": [0] * n_seeds,
@@ -1070,6 +1394,38 @@ def test_build_baselines_table_emits_the_gate_schema() -> None:
     stochastic_row = table[table["model"] == "dlinear"].iloc[0]
     assert int(stochastic_row["n_seeds"]) == 3
     assert float(stochastic_row["rmse_std"]) == pytest.approx(0.1)
+
+
+def test_build_baselines_table_aggregates_nrmse_over_seeds() -> None:
+    """P3-D5's column reaches the Gate artifact as mean +/- std, like every other metric."""
+    frame = pd.concat(
+        [
+            _seeded_frame(1, deterministic=True),
+            _seeded_frame(3).assign(model="dlinear"),
+        ],
+        ignore_index=True,
+    )
+    table = build_baselines_table(frame)
+    assert {"signal_std", "nrmse_mean", "nrmse_std"} <= set(table.columns)
+    stochastic = table[table["model"] == "dlinear"].iloc[0]
+    assert float(stochastic["nrmse_mean"]) == pytest.approx(1.1 / 4.0)
+    assert float(stochastic["nrmse_std"]) == pytest.approx(0.1 / 4.0)
+    assert float(stochastic["signal_std"]) == 4.0
+    deterministic = table[table["model"] == "m"].iloc[0]
+    assert np.isnan(float(deterministic["nrmse_std"]))
+
+
+def test_build_baselines_table_rejects_a_moving_signal_std() -> None:
+    """The nrmse denominator is a property of the targets; it cannot differ between seeds.
+
+    Without this check `_carry_constant_columns` would silently drop the column, and the
+    schema selection would then fail with a missing-column error that says nothing about
+    the cause.
+    """
+    frame = _seeded_frame(3)
+    frame.loc[2, "signal_std"] = 4.5
+    with pytest.raises(ValueError, match="varies between the runs"):
+        build_baselines_table(frame)
 
 
 def test_build_baselines_table_rejects_a_moving_persistence_denominator() -> None:
@@ -1225,6 +1581,32 @@ def test_build_baselines_markdown_rejects_a_dof_that_is_not_a_corpus_channel() -
         build_baselines_markdown(_gate_table("ideal"), gate_dof="yaw")
 
 
+def test_the_full_table_renders_the_normalised_rmse() -> None:
+    """Every per-regime table carries `nrmse_mean`, not only the CSV.
+
+    The document is what the horizon comparison is read from, and P3-D5's whole point is
+    that a skill-vs-horizon reading of it is wrong without this column beside it.
+    """
+    rendered = build_baselines_markdown(
+        _gate_table("ideal"),
+        gate_dof="pitch",
+        gate_horizon_samples=100,
+    )
+    assert "nrmse_mean" in rendered.split("## Full table")[1]
+
+
+def test_the_caveats_explain_why_the_normalised_rmse_is_there() -> None:
+    """A column a reader cannot interpret is a column that gets misread.
+
+    The caveat has to say what the denominator is *and* why skill's is not comparable
+    across horizons, citing the measured non-monotonicity rather than asserting it.
+    """
+    caveat = next(c for c in baselines_caveats(_gate_table("ideal")) if "nrmse_mean" in c)
+    assert "signal_std" in caveat
+    assert "P3-D5" in caveat
+    assert "7.09" in caveat and "3.79" in caveat
+
+
 def test_to_markdown_renders_nan_as_not_measured() -> None:
     rendered = to_markdown(pd.DataFrame({"skill_std": [np.nan], "ok": [True]}))
     assert "n/a" in rendered
@@ -1248,6 +1630,13 @@ def test_write_table_creates_its_parent_directory(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------
 
 
+#: Artifacts a run writes only under a condition, taken as the union of the two sets
+#: `report.py` filters the provenance line by rather than re-listed here: a third
+#: conditional artifact then cannot slip past these provenance tests by being spelled
+#: differently in the test file than in the source.
+_CONDITIONAL_ARTIFACTS = _CONTROL_ARTIFACTS | _CONTRAST_ARTIFACTS
+
+
 def _multi_mode_frames() -> dict[str, pd.DataFrame]:
     """Build one minimal aggregated table per observation mode's results directory."""
     return {"results": _gate_table("ideal"), "results/imu": _gate_table("imu")}
@@ -1265,8 +1654,8 @@ def test_baselines_markdown_cites_the_directory_it_was_written_from(results_dir:
     table = _multi_mode_frames()[results_dir]
     rendered = build_baselines_markdown(table, results_dir=Path(results_dir))
     for name, _what in BASELINES_ARTIFACTS:
-        if name == "baselines_controls.csv":
-            continue  # No controls passed; asserted separately below.
+        if name in _CONDITIONAL_ARTIFACTS:
+            continue  # Not written by this call; each is asserted separately below.
         assert f"`{results_dir}/{name}`" in rendered
     if results_dir == "results/imu":
         # The regression itself: no bare `results/<file>` path may survive anywhere.
@@ -1287,7 +1676,9 @@ def test_baselines_markdown_names_every_artifact_it_was_built_from() -> None:
             "passed": [True],
         }
     )
-    rendered = build_baselines_markdown(table, controls=controls, results_dir=Path("results/imu"))
+    rendered = build_baselines_markdown(
+        table, controls=controls, with_contrasts=True, results_dir=Path("results/imu")
+    )
     for name, what in BASELINES_ARTIFACTS:
         assert f"`results/imu/{name}` ({what})" in rendered
 
@@ -1300,6 +1691,22 @@ def test_baselines_markdown_does_not_cite_a_controls_file_that_was_not_written()
     rendered = build_baselines_markdown(_gate_table("ideal"), results_dir=Path("results"))
     assert "baselines_controls.csv" not in rendered
     assert "`results/baselines_by_seed.csv`" in rendered
+
+
+def test_baselines_markdown_cites_paired_contrasts_only_when_the_run_wrote_it() -> None:
+    """`run_experiment` writes `paired_contrasts.csv` only when a contrast pair was present.
+
+    A baselines-only run writes none, so naming it unconditionally would make every such
+    document assert a file that is not beside it -- the P3-D21 defect again. The default is
+    the safe direction: a caller that does not say makes no claim.
+    """
+    table = _gate_table("ideal")
+    assert "paired_contrasts.csv" not in build_baselines_markdown(
+        table, results_dir=Path("results")
+    )
+    assert "`results/paired_contrasts.csv`" in build_baselines_markdown(
+        table, with_contrasts=True, results_dir=Path("results")
+    )
 
 
 def test_baselines_markdown_without_a_directory_makes_no_claim_about_one() -> None:
@@ -1375,14 +1782,26 @@ def test_no_hardcoded_window_count_survives_in_the_reporting_modules() -> None:
     Lines citing a decision record are exempt: naming the superseded number *as history*
     ("441 984 -> 434 304, P3-D6") is the opposite of the defect. What is forbidden is a
     live sentence that asserts a count nothing measured.
+
+    The module list is **globbed, not enumerated**. It was previously the two-item literal
+    ``(report.py, runner.py)``, and a stale "442 000-window / half-gigabyte" sentence
+    survived in ``dmf/eval/__init__.py`` precisely because that file was not on the list --
+    the guard reproduced, in miniature, the duplication defect it exists to catch (compare
+    P2-D5, P3-D15). Every module in the subpackage is now covered, including ones not yet
+    written.
     """
-    for module in ("src/dmf/eval/report.py", "src/dmf/eval/runner.py"):
-        text = Path(module).read_text(encoding="utf-8")
+    modules = sorted(Path("src/dmf/eval").glob("*.py"))
+    assert len(modules) >= 6, f"expected the eval subpackage to be discovered, found {modules}"
+    for module in modules:
+        text = module.read_text(encoding="utf-8")
         body = "\n".join(
             line for line in text.splitlines() if "P3-D" not in line and "superseded" not in line
         )
-        assert "441 984" not in body
-        assert "434 304" not in body
+        # 441 984 is the P2-D9 count and 442 000 its rounding; 434 304 is the current
+        # one (P3-D6). All three are forbidden as live claims -- quoting today's count is
+        # no safer than quoting yesterday's, because the next horizon change moves it too.
+        for literal in ("441 984", "442 000", "434 304"):
+            assert literal not in body, f"{module} states a window count as a live claim: {literal}"
 
 
 # --------------------------------------------------------------------------------------
@@ -1592,3 +2011,476 @@ def test_the_paired_difference_rejects_mismatched_inputs() -> None:
         paired_skill_difference_ci(a, a, reference, horizons=(1,), ci_level=1.0)
     with pytest.raises(ValueError, match="persistence SSE is zero"):
         paired_skill_difference_ci(a, a, torch.zeros_like(reference), horizons=(1,))
+
+
+# --------------------------------------------------------------------------------------
+# Gate 4 read-out: two readings, the margin criterion, and the paired corroboration.
+# --------------------------------------------------------------------------------------
+
+
+#: Default aggregated skill for the models the Gate 4 fixtures build: (skill_mean,
+#: skill_std, n_seeds). The deep models sit well clear of both references and carry a real
+#: three-seed spread; the two trivial references are deterministic, so their std is NaN and
+#: their `n_seeds` is 1 (P3-D10).
+_GATE4_DEFAULTS: dict[str, tuple[float, float, int]] = {
+    "tcn": (0.90, 0.01, 3),
+    "transformer": (0.90, 0.01, 3),
+    "lstm": (0.90, 0.01, 3),
+    "damped_persistence": (0.50, float("nan"), 1),
+    "window_mean": (0.40, float("nan"), 1),
+}
+
+
+def _gate4_table(
+    overrides: dict[tuple[str, str, int], tuple[float, float, int]] | None = None,
+    *,
+    dofs: Sequence[str] = ("pitch",),
+    horizons: Sequence[int] = (30, 100),
+    regime: str = "id",
+    models: Sequence[str] = tuple(_GATE4_DEFAULTS),
+    with_nrmse: bool = True,
+) -> pd.DataFrame:
+    """Build a minimal aggregated table in the shape `gate4_readout` reads.
+
+    Built directly rather than through :func:`build_baselines_table` because these tests
+    have to set ``skill_std`` to exact values -- including exactly equal to the margin, and
+    including NaN on a deep model, which no run of the aggregator would produce.
+
+    Args:
+        overrides: ``(model, dof, horizon_samples) -> (skill_mean, skill_std, n_seeds)``,
+            replacing :data:`_GATE4_DEFAULTS` for that one cell.
+        dofs: DOF spellings to emit, corpus names.
+        horizons: Horizons to emit, samples.
+        regime: Regime label written into every row.
+        models: Model labels to emit.
+        with_nrmse: Whether to carry the P4-D3 ``nrmse_mean`` column. Phase 3 artifacts do
+            not (P4-D3), and the read-out has to degrade rather than fail on them.
+
+    Returns:
+        One row per (model, dof, horizon). Skill and nrmse are dimensionless.
+    """
+    chosen = dict(overrides or {})
+    rows = []
+    for model, dof, horizon in itertools.product(models, dofs, horizons):
+        skill, std, n_seeds = chosen.get((model, dof, horizon), _GATE4_DEFAULTS[model])
+        row: dict[str, object] = {
+            "model": model,
+            "regime": regime,
+            "dof": dof,
+            "horizon_samples": horizon,
+            "horizon_s": horizon / FS_HZ,
+            "n_seeds": n_seeds,
+            "deterministic": n_seeds == 1,
+            "skill_mean": skill,
+            "skill_std": std,
+        }
+        if with_nrmse:
+            row["nrmse_mean"] = 1.0 - skill / 2.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _contrast_rows(
+    *,
+    model_a: str,
+    model_b: str,
+    bounds: Sequence[tuple[float, float]],
+    dof: str = "pitch",
+    horizon: int = 100,
+    regime: str = "id",
+    diff: float = 0.30,
+) -> pd.DataFrame:
+    """Build `paired_contrasts.csv` rows, one per seed, in that file's schema.
+
+    Args:
+        model_a: The deep model; ``skill_diff`` is ``skill(a) - skill(b)``.
+        model_b: The reference.
+        bounds: One ``(ci_lo, ci_hi)`` per seed, dimensionless.
+        dof: DOF spelling.
+        horizon: Horizon, samples.
+        regime: Regime label.
+        diff: Point estimate written into every seed's row.
+
+    Returns:
+        One row per seed.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "regime": regime,
+                "model_a": model_a,
+                "model_b": model_b,
+                "seed": seed,
+                "dof": dof,
+                "horizon_samples": horizon,
+                "horizon_s": horizon / FS_HZ,
+                "skill_diff": diff,
+                "ci_lo": lo,
+                "ci_hi": hi,
+            }
+            for seed, (lo, hi) in enumerate(bounds)
+        ]
+    )
+
+
+def _row(readout: pd.DataFrame, reading: str, model: str, dof: str = "pitch") -> pd.Series:
+    """Return the single verdict row for one (reading, model, DOF)."""
+    subset = readout[
+        (readout["reading"] == reading) & (readout["model"] == model) & (readout["dof"] == dof)
+    ]
+    assert len(subset) == 1, f"expected one row, got {len(subset)}"
+    return subset.iloc[0]
+
+
+def test_gate4_readout_emits_both_readings_with_the_documented_schema() -> None:
+    """Both readings ship (P4-D1): the restated cell is the gate, the original is reported."""
+    readout = gate4_readout(_gate4_table())
+    assert list(readout.columns) == list(GATE4_COLUMNS)
+    assert set(readout["reading"]) == {"A", "B"}
+    assert set(readout[readout["reading"] == "A"]["horizon_samples"]) == {30}
+    assert set(readout[readout["reading"] == "B"]["horizon_samples"]) == {100}
+    assert set(readout["model"]) == set(GATE4_DEEP_MODELS)
+
+
+def test_gate4_deep_models_are_the_models_the_contrasts_are_written_for() -> None:
+    """The tuple is stated twice -- here and in `dmf.train.experiment` -- so it is checked.
+
+    `dmf.eval.gate` cannot import it: that module pulls in torch and the whole training
+    stack, and this is a pandas-only reading layer (the P3-D14 argument). The duplication
+    is therefore pinned by this test, which is the P4-D4 pattern.
+    """
+    from dmf.train.experiment import CONTRAST_DEEP_MODELS
+
+    assert GATE4_DEEP_MODELS == CONTRAST_DEEP_MODELS
+
+
+def test_a_margin_larger_than_the_seed_std_passes() -> None:
+    readout = gate4_readout(_gate4_table())
+    row = _row(readout, "B", "tcn")
+    assert float(row["margin"]) == pytest.approx(0.40)
+    assert float(row["skill_std"]) == pytest.approx(0.01)
+    assert row["verdict"] == VERDICT_PASS
+    assert reading_passes(readout, "B")
+
+
+def test_a_margin_smaller_than_the_seed_std_fails_and_stays_in_the_table() -> None:
+    """CLAUDE.md non-negotiable 6: the failing row is reported, not dropped or footnoted."""
+    table = _gate4_table({("transformer", "pitch", 100): (0.505, 0.02, 3)})
+    readout = gate4_readout(table)
+    row = _row(readout, "B", "transformer")
+    assert float(row["margin"]) == pytest.approx(0.005)
+    assert row["verdict"] == VERDICT_FAIL
+    assert not reading_passes(readout, "B")
+    # Present in the frame, in the rendered table body, and named in the headline.
+    rendered = build_gate4_markdown(readout)
+    assert "| transformer | pitch |" in rendered
+    assert rendered.count(VERDICT_FAIL) >= 2
+    assert "`transformer`/pitch" in rendered
+
+
+def test_a_margin_exactly_equal_to_the_seed_std_fails() -> None:
+    """The boundary is resolved against the model: `margin == skill_std` is a FAIL.
+
+    The criterion is a margin "exceeding the seed-to-seed standard deviation", and
+    exceeding is strict. The values are chosen to be exactly representable in binary so
+    the equality is genuine and not an approximation: 0.75 - 0.5 == 0.25 exactly.
+    """
+    table = _gate4_table({("lstm", "pitch", 100): (0.75, 0.25, 3)})
+    readout = gate4_readout(table)
+    row = _row(readout, "B", "lstm")
+    assert float(row["margin"]) == 0.25
+    assert float(row["margin"]) == float(row["skill_std"])
+    assert row["verdict"] == VERDICT_FAIL
+    assert "exceeding" in str(row["verdict_reason"])
+
+
+def test_a_deep_model_with_a_nan_std_is_never_a_pass() -> None:
+    """NaN std must not be read as zero, which would make every positive margin pass.
+
+    A deterministic row carries `skill_std = NaN` by design (P3-D10); a deep model is
+    stochastic, so a NaN there means the quantity the criterion compares against was never
+    measured. That is UNVERIFIED -- not a pass, and not a silent fail either.
+    """
+    table = _gate4_table({("tcn", "pitch", 100): (0.99, float("nan"), 1)})
+    readout = gate4_readout(table)
+    row = _row(readout, "B", "tcn")
+    assert float(row["margin"]) > 0.0  # It would have "passed" against a std of 0.0.
+    assert row["verdict"] == VERDICT_UNVERIFIED
+    assert row["verdict"] != VERDICT_PASS
+    assert not reading_passes(readout, "B")
+    rendered = build_gate4_markdown(readout)
+    assert "UNVERIFIED is not a pass" in rendered
+
+
+def test_a_deep_model_below_the_three_seed_minimum_is_unverified() -> None:
+    """A two-seed spread is not a seed-to-seed standard deviation (non-negotiable 5)."""
+    table = _gate4_table({("lstm", "pitch", 100): (0.90, 0.01, 2)})
+    row = _row(gate4_readout(table), "B", "lstm")
+    assert row["verdict"] == VERDICT_UNVERIFIED
+    assert "non-negotiable 5" in str(row["verdict_reason"])
+
+
+def test_a_negative_seed_std_raises() -> None:
+    table = _gate4_table({("tcn", "pitch", 100): (0.90, -0.01, 3)})
+    with pytest.raises(ValueError, match="negative skill_std"):
+        gate4_readout(table)
+
+
+def test_reading_b_takes_window_mean_when_it_beats_damped_persistence() -> None:
+    """P3-D20 measures `window_mean` beating `damped_persistence` in 54 of 144 cells."""
+    table = _gate4_table({("window_mean", "pitch", 100): (0.62, float("nan"), 1)})
+    row = _row(gate4_readout(table), "B", "tcn")
+    assert row["reference"] == "window_mean"
+    assert float(row["reference_skill_mean"]) == pytest.approx(0.62)
+    assert float(row["margin"]) == pytest.approx(0.90 - 0.62)
+    assert "damped_persistence=0.5000" in str(row["reference_pool"])
+    assert "window_mean=0.6200" in str(row["reference_pool"])
+
+
+def test_reading_b_takes_damped_persistence_when_it_beats_window_mean() -> None:
+    """The other 90 of 144 cells. Which one wins is measured per cell, never assumed."""
+    row = _row(gate4_readout(_gate4_table()), "B", "tcn")
+    assert row["reference"] == "damped_persistence"
+    assert float(row["reference_skill_mean"]) == pytest.approx(0.50)
+
+
+def test_reading_b_resolves_the_reference_cell_by_cell_not_once_for_the_grid() -> None:
+    """Both directions inside one table: the stronger baseline differs between DOFs."""
+    table = _gate4_table(
+        {("window_mean", "roll", 100): (0.70, float("nan"), 1)},
+        dofs=("pitch", "roll"),
+    )
+    readout = gate4_readout(
+        table, readings=(dataclasses.replace(READING_B, dofs=("pitch", "roll")),)
+    )
+    assert _row(readout, "B", "tcn", dof="pitch")["reference"] == "damped_persistence"
+    assert _row(readout, "B", "tcn", dof="roll")["reference"] == "window_mean"
+
+
+def test_reading_a_stays_on_damped_persistence_even_where_window_mean_is_stronger() -> None:
+    """Reading A is the plan's criterion verbatim; it does not inherit the restatement."""
+    table = _gate4_table({("window_mean", "pitch", 30): (0.95, float("nan"), 1)})
+    row = _row(gate4_readout(table), "A", "tcn")
+    assert row["reference"] == "damped_persistence"
+    assert "window_mean" not in str(row["reference_pool"])
+
+
+def test_reading_a_covers_every_dof_the_table_reports_at_its_cell() -> None:
+    """Coverage of "each of the six DOFs" is read off the table, not mirrored as a literal here."""
+    cfg = _production_data_cfg()
+    table = _gate4_table(dofs=cfg.target_dofs, horizons=(30, 100))
+    readout = gate4_readout(table)
+    reading_a = readout[readout["reading"] == "A"]
+    assert set(reading_a["dof"]) == set(cfg.target_dofs)
+    assert len(reading_a) == len(cfg.target_dofs) * len(GATE4_DEEP_MODELS)
+    # Reading B is the binding DOF only.
+    assert set(readout[readout["reading"] == "B"]["dof"]) == {"pitch"}
+
+
+@pytest.mark.parametrize("mode", ["ideal", "imu"])
+def test_reading_b_resolves_the_gate_dof_across_observation_modes(
+    mode: ObservationMode,
+) -> None:
+    """`observation_mode: imu` renames pitch to pitch_imu; the gate cell is the same cell."""
+    cfg = _production_data_cfg()
+    expected = resolve_columns(("pitch",), mode)[0]
+    table = _gate4_table(dofs=resolve_columns(cfg.target_dofs, mode))
+    readout = gate4_readout(table)
+    assert set(readout[readout["reading"] == "B"]["dof"]) == {expected}
+
+
+def test_reading_b_does_not_fall_back_to_a_neighbouring_dof() -> None:
+    """`pitch_rate_imu` is the near-miss a suffix or substring rule would take for pitch."""
+    cfg = _production_data_cfg()
+    dofs = [
+        column
+        for column in resolve_columns(cfg.target_dofs, "imu")
+        if column != resolve_columns(("pitch",), "imu")[0]
+    ]
+    assert "pitch_rate_imu" in dofs
+    with pytest.raises(ValueError, match="absent from the table"):
+        gate4_readout(_gate4_table(dofs=dofs))
+
+
+def test_a_missing_gate_cell_raises_rather_than_returning_an_empty_verdict() -> None:
+    """A gap has to be fatal: "no rows" and "nothing failed" render identically."""
+    with pytest.raises(ValueError, match="absent from the table"):
+        gate4_readout(_gate4_table(horizons=(30,)))  # The restated horizon not reported.
+    with pytest.raises(ValueError, match="absent from the table"):
+        gate4_readout(_gate4_table(dofs=("roll",)))  # Pitch not scored.
+    with pytest.raises(ValueError, match="absent from the table"):
+        gate4_readout(_gate4_table(regime="unseen_vessel"))  # The gate regime not scored.
+    with pytest.raises(ValueError, match="is absent from the table"):
+        gate4_readout(_gate4_table(models=("tcn", "transformer", "damped_persistence")))
+
+
+def test_a_missing_reference_candidate_raises_rather_than_lowering_the_bar() -> None:
+    """The restated gate is the max over both candidates; one of them missing is not it."""
+    table = _gate4_table(models=("tcn", "transformer", "lstm", "damped_persistence"))
+    with pytest.raises(ValueError, match="'window_mean' is absent"):
+        gate4_readout(table)
+
+
+def test_a_duplicated_cell_raises_rather_than_reporting_one_of_the_two_runs() -> None:
+    table = pd.concat([_gate4_table(), _gate4_table()], ignore_index=True)
+    with pytest.raises(ValueError, match="more than one run's table"):
+        gate4_readout(table)
+
+
+def test_the_readout_carries_nrmse_beside_the_skill() -> None:
+    """P3-D5: a cell cannot be read from skill alone when the horizon moves."""
+    row = _row(gate4_readout(_gate4_table()), "B", "tcn")
+    assert float(row["nrmse_mean"]) == pytest.approx(1.0 - 0.90 / 2.0)
+    assert "nrmse_mean" in build_gate4_markdown(gate4_readout(_gate4_table()))
+
+
+def test_a_table_without_the_nrmse_column_degrades_and_says_so() -> None:
+    """Every artifact written before P4-D3 predates the column; that is a note, not a stop."""
+    readout = gate4_readout(_gate4_table(with_nrmse=False))
+    assert bool(readout["nrmse_mean"].isna().all())
+    assert "`nrmse_mean` is empty for every row" in build_gate4_markdown(readout)
+
+
+def test_the_paired_contrast_join_is_optional() -> None:
+    """`paired_contrasts.csv` absent degrades the corroboration; it does not fail the gate."""
+    readout = gate4_readout(_gate4_table(), contrasts=None)
+    assert set(readout["paired_verdict"]) == {PAIRED_ABSENT}
+    assert bool(readout["paired_skill_diff"].isna().all())
+    # The margin verdicts are untouched, and the document says the corroboration is missing.
+    assert reading_passes(readout, "B")
+    assert "carry no paired contrast" in build_gate4_markdown(readout)
+
+
+def test_the_paired_contrast_join_matches_on_the_resolved_reference() -> None:
+    """The join is against whichever baseline won the cell, not against a fixed one."""
+    table = _gate4_table({("window_mean", "pitch", 100): (0.62, float("nan"), 1)})
+    contrasts = pd.concat(
+        [
+            _contrast_rows(model_a="tcn", model_b="damped_persistence", bounds=[(0.9, 0.95)]),
+            _contrast_rows(
+                model_a="tcn",
+                model_b="window_mean",
+                bounds=[(0.20, 0.31), (0.24, 0.36), (0.22, 0.33)],
+                diff=0.28,
+            ),
+        ],
+        ignore_index=True,
+    )
+    row = _row(gate4_readout(table, contrasts=contrasts), "B", "tcn")
+    assert row["reference"] == "window_mean"
+    assert row["paired_model_b"] == "window_mean"
+    assert float(row["paired_skill_diff"]) == pytest.approx(0.28)
+    # Envelope over seeds, never a mean of finished intervals (the P3-D22 defect).
+    assert float(row["paired_ci_lo"]) == pytest.approx(0.20)
+    assert float(row["paired_ci_hi"]) == pytest.approx(0.36)
+    assert int(row["paired_n_seeds"]) == 3
+    assert row["paired_verdict"] == PAIRED_EXCEEDS_ZERO
+
+
+def test_the_margin_test_and_the_paired_interval_are_not_collapsed() -> None:
+    """A margin can exceed the seed std while the paired interval still spans zero.
+
+    They answer different questions -- spread of the fitting procedure across seeds, versus
+    survival of a resample of held-out realizations -- so they are two columns and two
+    verdicts.
+    """
+    contrasts = _contrast_rows(
+        model_a="tcn", model_b="damped_persistence", bounds=[(-0.05, 0.40)], diff=0.40
+    )
+    row = _row(gate4_readout(_gate4_table(), contrasts=contrasts), "B", "tcn")
+    assert row["verdict"] == VERDICT_PASS
+    assert row["paired_verdict"] == PAIRED_SPANS_ZERO
+
+
+def test_one_seed_spanning_zero_makes_the_envelope_span_zero() -> None:
+    """`excludes 0` on the envelope means every seed excluded it, which is the point."""
+    contrasts = _contrast_rows(
+        model_a="tcn",
+        model_b="damped_persistence",
+        bounds=[(0.10, 0.30), (-0.01, 0.28), (0.12, 0.33)],
+    )
+    row = _row(gate4_readout(_gate4_table(), contrasts=contrasts), "B", "tcn")
+    assert float(row["paired_ci_lo"]) == pytest.approx(-0.01)
+    assert row["paired_verdict"] == PAIRED_SPANS_ZERO
+
+
+def test_a_paired_interval_below_zero_names_the_reference_as_the_winner() -> None:
+    contrasts = _contrast_rows(
+        model_a="tcn", model_b="damped_persistence", bounds=[(-0.30, -0.10)], diff=-0.20
+    )
+    row = _row(gate4_readout(_gate4_table(), contrasts=contrasts), "B", "tcn")
+    assert row["paired_verdict"] == PAIRED_BELOW_ZERO
+
+
+def test_a_contrast_file_missing_its_schema_is_ignored_rather_than_joined_on_a_guess() -> None:
+    contrasts = _contrast_rows(
+        model_a="tcn", model_b="damped_persistence", bounds=[(0.1, 0.2)]
+    ).drop(columns=["ci_lo"])
+    readout = gate4_readout(_gate4_table(), contrasts=contrasts)
+    assert set(readout["paired_verdict"]) == {PAIRED_ABSENT}
+
+
+def test_reading_passes_refuses_a_reading_that_was_never_computed() -> None:
+    """An absent reading must not vacuously pass."""
+    readout = gate4_readout(_gate4_table(), readings=(READING_B,))
+    assert reading_passes(readout, "B")
+    with pytest.raises(ValueError, match="absent from the read-out"):
+        reading_passes(readout, "A")
+
+
+def test_the_rendered_document_leads_with_the_outcome_of_both_readings() -> None:
+    table = _gate4_table({("transformer", "pitch", 30): (0.51, 0.02, 3)})
+    rendered = build_gate4_markdown(gate4_readout(table))
+    assert "**Reading A -- NOT PASSED**" in rendered
+    assert "**Reading B -- PASS**" in rendered
+    assert "Simulated results only" in rendered
+    assert "does not exceed skill_std" in rendered
+
+
+def test_the_rendered_document_refuses_to_be_empty() -> None:
+    with pytest.raises(ValueError, match="empty Gate 4 read-out"):
+        build_gate4_markdown(gate4_readout(_gate4_table()).iloc[:0])
+
+
+def test_the_document_cites_only_the_files_its_numbers_come_from() -> None:
+    """The sentence "every number here traces to" is a claim about the files it names (P3-D21)."""
+    readout = gate4_readout(_gate4_table())
+    rendered = build_gate4_markdown(readout, results_dir=Path("results/imu"))
+    assert "`results/imu/baselines.csv`" in rendered
+    # No contrast was joined, so the provenance line must not claim one.
+    assert "results/imu/paired_contrasts.csv" not in rendered
+    # And it never names a file it does not read.
+    assert "baselines_by_cell.csv" not in rendered
+    joined = build_gate4_markdown(
+        gate4_readout(
+            _gate4_table(),
+            contrasts=_contrast_rows(
+                model_a="tcn", model_b="damped_persistence", bounds=[(0.1, 0.2)]
+            ),
+        ),
+        results_dir=Path("results/imu"),
+    )
+    assert "`results/imu/paired_contrasts.csv`" in joined
+
+
+def test_write_gate4_report_round_trips_through_the_committed_artifacts(tmp_path: Path) -> None:
+    """The gate is computed from committed CSVs by repo code, not by an ad-hoc script."""
+    _gate4_table().to_csv(tmp_path / "baselines.csv", index=False)
+    _contrast_rows(model_a="tcn", model_b="damped_persistence", bounds=[(0.3, 0.5)]).to_csv(
+        tmp_path / "paired_contrasts.csv", index=False
+    )
+    readout, csv_path, markdown_path = write_gate4_report(tmp_path)
+    assert list(pd.read_csv(csv_path).columns) == list(GATE4_COLUMNS)
+    assert markdown_path.read_text(encoding="utf-8").startswith("# Gate 4 read-out")
+    assert _row(readout, "B", "tcn")["paired_verdict"] == PAIRED_EXCEEDS_ZERO
+
+
+def test_write_gate4_report_without_the_contrasts_file(tmp_path: Path) -> None:
+    _gate4_table().to_csv(tmp_path / "baselines.csv", index=False)
+    readout, _csv_path, _markdown_path = write_gate4_report(tmp_path)
+    assert set(readout["paired_verdict"]) == {PAIRED_ABSENT}
+
+
+def test_read_gate4_inputs_refuses_a_directory_with_no_baselines_table(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="baselines.csv"):
+        read_gate4_inputs(tmp_path)

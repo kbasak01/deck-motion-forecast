@@ -1,0 +1,28 @@
+# Encoder-only transformer over patched lookback, direct multi-horizon.
+#
+# `patch_len` is in **samples**: 10 samples at 10 Hz is 1 s, so a 200-sample lookback
+# becomes 20 tokens, each the 10 x 6 = 60 raw values of its patch linearly embedded to
+# d_model. Token-per-sample attention over 200 steps is quadratic in a length that carries
+# almost no information per step on a narrowband signal; patching is the plan's choice and
+# is kept. There is no causal mask -- the encoder reads only the lookback, all of which is
+# in the past of the forecast origin.
+#
+# 2 712 708 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6), and the capacity is
+# overwhelmingly in the **head**: Linear(20*128=2560 -> 150*6=900) is 2 304 900 of them,
+# 85% of the model, against 397 440 in the three encoder layers and 10 368 in the patch and
+# positional embeddings. That is the flatten-and-project head the implementation plan
+# specifies (§Phase 4) and it ships as specified. It also means this row is 14x `tcn` and
+# 45x `dlinear` on parameters, so the Phase 4 table is NOT budget-matched across models;
+# that spread is reported as a caveat beside the results rather than removed by swapping in
+# a pooled or last-token head, which would silently change the architecture being compared.
+name: transformer
+label: transformer
+head: point
+quantiles: []
+params:
+  patch_len: 10
+  d_model: 128
+  n_layers: 3
+  n_heads: 4
+  d_ff: 256
+  dropout: 0.1

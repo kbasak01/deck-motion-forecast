@@ -62,8 +62,11 @@ MIN_SEEDS = 3
 #: Grouping that identifies one comparison cell in ``results/baselines.csv``.
 BASELINES_GROUP_COLS: tuple[str, ...] = ("model", "regime", "dof", "horizon_samples")
 
-#: Metrics aggregated to mean and std over seeds.
-BASELINES_METRIC_COLS: tuple[str, ...] = ("rmse", "mae", "skill")
+#: Metrics aggregated to mean and std over seeds. ``nrmse`` rides with them because it is a
+#: per-run model quantity like the other three; its denominator ``signal_std`` is *not* here,
+#: because that is a property of the targets and is constant across the runs of a cell --
+#: :func:`build_baselines_table` asserts that and carries it through unaggregated.
+BASELINES_METRIC_COLS: tuple[str, ...] = ("rmse", "mae", "skill", "nrmse")
 
 #: Exact column order of ``results/baselines.csv``, the Gate 3 artifact.
 BASELINES_COLUMNS: tuple[str, ...] = (
@@ -84,14 +87,21 @@ BASELINES_COLUMNS: tuple[str, ...] = (
     "skill_std",
     "skill_ci_lo",
     "skill_ci_hi",
+    "signal_std",
+    "nrmse_mean",
+    "nrmse_std",
     "n_params",
     "fit_time_s_mean",
 )
 
 #: The artifacts a baselines run writes, in the order the provenance line names them, each
-#: paired with what it holds. Single source of truth: the ``baselines.md`` provenance line is
-#: generated from this rather than written out in prose, so a renamed or added artifact
-#: cannot leave the document pointing at a file that no longer exists. The *directory* is
+#: paired with what it holds. An entry whose contents are not rendered into the document
+#: says so: the sentence these are embedded in is "every number here traces to", so a file
+#: no number here is read from must not be left implying otherwise.
+#:
+#: Single source of truth: the ``baselines.md`` provenance line is generated from this
+#: rather than written out in prose, so a renamed or added artifact cannot leave the
+#: document pointing at a file that no longer exists. The *directory* is
 #: supplied by the caller and is deliberately not baked in here -- a run writing to
 #: ``results/imu/`` used to emit a provenance line naming ``results/baselines*.csv``, i.e.
 #: the other observation mode's files, which the last caveat below explicitly warns against
@@ -100,12 +110,20 @@ BASELINES_ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("baselines.csv", "aggregated"),
     ("baselines_by_seed.csv", "one row per run, the source of truth"),
     ("baselines_by_cell.csv", "per grid cell"),
+    ("paired_contrasts.csv", "paired model-vs-model skill differences, not rendered here"),
     ("baselines_controls.csv", "negative controls"),
 )
 
 #: Artifacts written only when the negative controls are run, so the provenance line must
 #: not name them otherwise.
 _CONTROL_ARTIFACTS: frozenset[str] = frozenset({"baselines_controls.csv"})
+
+#: Artifacts written only when at least one configured model-vs-model contrast pair was
+#: present in the run, so the provenance line must not name them otherwise. Same rule as
+#: :data:`_CONTROL_ARTIFACTS`, for the same reason: a baselines-only run writes no
+#: ``paired_contrasts.csv``, and a document asserting a file that is not beside it is the
+#: P3-D21 defect in a second instance.
+_CONTRAST_ARTIFACTS: frozenset[str] = frozenset({"paired_contrasts.csv"})
 
 
 def _grouped(count: int) -> str:
@@ -140,7 +158,7 @@ def _display_dir(results_dir: Path) -> str:
     return "" if text in ("", ".") else f"{text}/"
 
 
-def _provenance_line(results_dir: Path | None, *, with_controls: bool) -> str:
+def _provenance_line(results_dir: Path | None, *, with_controls: bool, with_contrasts: bool) -> str:
     """Render the sentence naming the files a rendered document was built from.
 
     Args:
@@ -150,15 +168,19 @@ def _provenance_line(results_dir: Path | None, *, with_controls: bool) -> str:
             ``results/`` prefix would be false in all but one.
         with_controls: Whether the controls table was written. Naming a file that was not
             written is the same defect as naming the wrong one.
+        with_contrasts: Whether ``paired_contrasts.csv`` was written, i.e. whether the run
+            held at least one configured contrast pair. Same rule as ``with_controls``: a
+            baselines-only run writes no such file and this document must not name it.
 
     Returns:
         One Markdown sentence.
     """
-    named = [
-        (name, what)
-        for name, what in BASELINES_ARTIFACTS
-        if with_controls or name not in _CONTROL_ARTIFACTS
-    ]
+    omitted: set[str] = set()
+    if not with_controls:
+        omitted |= _CONTROL_ARTIFACTS
+    if not with_contrasts:
+        omitted |= _CONTRAST_ARTIFACTS
+    named = [(name, what) for name, what in BASELINES_ARTIFACTS if name not in omitted]
     if results_dir is None:
         where = "the CSVs beside this document"
         prefix = ""
@@ -244,6 +266,17 @@ def baselines_caveats(
             "statement."
         )
     caveats += [
+        "**`nrmse_mean` is there because skill is not comparable across horizons on this "
+        "signal.** Persistence error tracks the target's autocorrelation, so the skill "
+        "denominator oscillates with the signal's own period instead of growing with lead "
+        "time: on `id`/test in the `ideal` mode, persistence RMSE for roll *falls* from "
+        "7.09 deg at 50 samples (5 s) to 3.79 deg at 100 (10 s), because 10 s is about one "
+        "roll period (P3-D5/P3-D6). A skill-vs-horizon curve therefore has dips that belong "
+        "to the reference and not to the model. `nrmse_mean` is `rmse_mean / signal_std`, "
+        "where `signal_std` is the standard deviation of the held-out target itself at that "
+        "lead time in corpus units: 1.0 means no better than predicting the partition mean, "
+        "lower is better, and it is the column to read when the horizon or the vessel "
+        "varies.",
         "**`fit_time_s_mean` is not apples-to-apples.** It is CPU wall-clock for the "
         "closed-form models and GPU wall-clock *including data loading* for the SGD-fitted "
         "ones. No throughput claim is made from it.",
@@ -484,8 +517,8 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
     Args:
         by_seed: Per-run results. Must carry ``model``, ``regime``, ``dof``,
             ``horizon_samples``, ``horizon_s``, ``seed``, ``deterministic``, ``n_windows``,
-            ``rmse``, ``mae``, ``rmse_persistence``, ``skill``, ``skill_ci_lo``,
-            ``skill_ci_hi``, ``n_params`` and ``fit_time_s``.
+            ``rmse``, ``mae``, ``rmse_persistence``, ``skill``, ``nrmse``, ``signal_std``,
+            ``skill_ci_lo``, ``skill_ci_hi``, ``n_params`` and ``fit_time_s``.
 
     Returns:
         One row per (model, regime, DOF, horizon), columns :data:`BASELINES_COLUMNS`,
@@ -496,10 +529,11 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
         seed mean, and the per-run intervals stay available in ``baselines_by_seed.csv``.
 
     Raises:
-        ValueError: If a required column is missing, or if ``rmse_persistence`` or
-            ``n_windows`` varies between the runs of one cell -- that would mean the skill
-            denominator was measured over different window sets for different seeds, which
-            is exactly the failure the single-pass runner exists to make impossible.
+        ValueError: If a required column is missing, or if ``rmse_persistence``,
+            ``signal_std`` or ``n_windows`` varies between the runs of one cell -- that
+            would mean the skill or nrmse denominator was measured over different window
+            sets for different seeds, which is exactly the failure the single-pass runner
+            exists to make impossible.
     """
     required = {
         *BASELINES_GROUP_COLS,
@@ -508,6 +542,7 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
         "deterministic",
         "n_windows",
         "rmse_persistence",
+        "signal_std",
         "skill_ci_lo",
         "skill_ci_hi",
         "n_params",
@@ -518,7 +553,11 @@ def build_baselines_table(by_seed: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"by_seed is missing columns {missing}")
     keys = list(BASELINES_GROUP_COLS)
-    for name in ("rmse_persistence", "n_windows"):
+    # `signal_std` is here rather than assumed constant: it is a property of the targets
+    # alone, so it cannot legitimately differ between the runs of one cell, and
+    # `_carry_constant_columns` would silently *drop* it if it did -- leaving the schema
+    # selection below to fail with a missing-column error that says nothing about the cause.
+    for name in ("rmse_persistence", "signal_std", "n_windows"):
         spread = by_seed.groupby(keys, sort=False)[name].nunique(dropna=False)
         varying = spread[spread > 1]
         if not varying.empty:
@@ -641,6 +680,7 @@ def build_baselines_markdown(
     *,
     controls: pd.DataFrame | None = None,
     by_heading: pd.DataFrame | None = None,
+    with_contrasts: bool = False,
     results_dir: Path | None = None,
     gate_regime: str = "id",
     gate_dof: str = "roll",
@@ -659,6 +699,13 @@ def build_baselines_markdown(
         controls: Optional control rows from :func:`dmf.eval.controls.controls_table`.
         by_heading: Optional per-heading marginal of the gate regime, from
             :func:`dmf.eval.runner.marginalize_cells`.
+        with_contrasts: Whether the run wrote ``paired_contrasts.csv`` beside this
+            document, which it does only when at least one configured model-vs-model
+            contrast pair was present -- a baselines-only run writes none. The provenance
+            line names the file only when this is ``True``; defaulting to ``False`` keeps
+            a caller that does not say from asserting a file that is not there, which is
+            the P3-D21 defect. Not otherwise rendered: the contrasts are read from the CSV,
+            not from this document.
         results_dir: Directory the CSVs this document is built from were written to, used
             for the provenance line. **Pass the same directory the document is written
             to.** Left ``None`` the files are named by bare filename and located "beside
@@ -701,7 +748,11 @@ def build_baselines_markdown(
         f"({gate_horizon_samples} samples), `{gate_regime}` regime**, threshold "
         f"{gate_threshold:g} skill vs persistence.",
         "",
-        _provenance_line(results_dir, with_controls=controls is not None and not controls.empty),
+        _provenance_line(
+            results_dir,
+            with_controls=controls is not None and not controls.empty,
+            with_contrasts=with_contrasts,
+        ),
         "",
         "## The gate cell",
         "",
@@ -779,6 +830,7 @@ def build_baselines_markdown(
                         "skill_std",
                         "skill_ci_lo",
                         "skill_ci_hi",
+                        "nrmse_mean",
                         "n_params",
                         "fit_time_s_mean",
                     ]

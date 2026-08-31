@@ -27,6 +27,14 @@ sample size would understate every interval by more than an order of magnitude. 
 count appears here on purpose: the one that used to sit in this paragraph was superseded by
 the P3-D4 horizon change and went stale in place. Counts are measured, never narrated.)
 
+**The target's own sums are accumulated once, not once per model.** ``sy`` and ``syy``
+feed ``signal_std`` and the normalised RMSE, and they are a property of the targets alone:
+scoring nine models would otherwise accumulate the same nine times, and nine float64
+reductions of the same windows in a different order are nine chances for the reported
+denominators to disagree by a few ULP. One pair of tensors is accumulated per batch and
+*shared* by every accumulator in the pass, so ``signal_std`` is identical across models by
+object identity rather than by agreement.
+
 **Horizon convention.** "Horizon ``h``" is the error at lead time exactly ``h`` samples, so
 it reads element ``h - 1`` of the horizon axis. See :mod:`dmf.eval.metrics`.
 """
@@ -41,7 +49,7 @@ from torch import Tensor, nn
 
 from dmf.data.dataset import DeckMotionDataset, make_dataloader
 from dmf.data.normalize import invert_norm, is_train_partition
-from dmf.eval.metrics import METRIC_COLUMNS, metrics_table_from_sums
+from dmf.eval.metrics import METRIC_COLUMNS, metrics_table_from_sums, nrmse, signal_std
 from dmf.models.base import ForecastModel
 from dmf.typedefs import FloatArray
 
@@ -83,6 +91,15 @@ class EvalAccumulator:
             for heave).
         sae: Summed absolute error per realization, shape ``(n_keys, H, C_out)``, float64,
             in corpus units.
+        sy: Summed **target** per realization, shape ``(n_keys, H, C_out)``, float64, in
+            corpus units. Model independent: every accumulator produced by one
+            :func:`evaluate_models` pass holds the *same tensor object*, accumulated once
+            per batch, so the ``signal_std`` reported for two models over one partition
+            cannot differ.
+        syy: Summed squared target per realization, same shape and sharing, float64, in
+            squared corpus units. With ``sy`` it gives the population variance of the
+            target at each lead time, which is the denominator of the normalised RMSE
+            (``docs/protocol.md`` P3-D5).
         n_per_key: Windows scored per realization, shape ``(n_keys,)``, int64. Uniform
             across a partition by construction; :func:`evaluate_models` raises if it is
             not, since a non-uniform count means the window-index-to-key mapping is wrong.
@@ -90,6 +107,8 @@ class EvalAccumulator:
 
     sse: Tensor
     sae: Tensor
+    sy: Tensor
+    syy: Tensor
     n_per_key: Tensor
 
     @property
@@ -114,22 +133,65 @@ class EvalAccumulator:
             self.sae.sum(dim=0).numpy().astype(np.float64),
         )
 
+    def target_totals(self) -> tuple[FloatArray, FloatArray]:
+        """Reduce the target sums over realizations.
 
-def _empty_accumulator(n_keys: int, max_horizon: int, n_targets: int) -> EvalAccumulator:
+        Separate from :meth:`totals` because these are not errors: they describe the signal
+        being forecast, not any model's disagreement with it.
+
+        Returns:
+            Tuple ``(sy, syy)``, each of shape ``(H, C_out)``, in corpus units and squared
+            corpus units respectively.
+        """
+        return (
+            self.sy.sum(dim=0).numpy().astype(np.float64),
+            self.syy.sum(dim=0).numpy().astype(np.float64),
+        )
+
+
+def _empty_accumulator(
+    n_keys: int,
+    max_horizon: int,
+    n_targets: int,
+    *,
+    target_sums: tuple[Tensor, Tensor] | None = None,
+) -> EvalAccumulator:
     """Allocate a zeroed accumulator.
 
     Args:
         n_keys: Number of realizations in the partition.
         max_horizon: Forecast length ``H``, samples.
         n_targets: Target channel count ``C_out``.
+        target_sums: Existing ``(sy, syy)`` tensors to **share** rather than allocate. This
+            is how one pass gives every model the same target sums: they are accumulated
+            once per batch outside the model loop, so passing them in is what makes
+            "accumulate once, not once per model" expressible rather than a convention the
+            caller has to remember. ``None`` allocates a private pair of zeros.
 
     Returns:
-        An accumulator of zeros.
+        An accumulator of zeros, whose ``sy``/``syy`` are ``target_sums`` when given.
+
+    Raises:
+        ValueError: If ``target_sums`` does not match ``(n_keys, max_horizon, n_targets)``
+            in shape or is not float64.
     """
     shape = (n_keys, max_horizon, n_targets)
+    if target_sums is None:
+        sy = torch.zeros(shape, dtype=torch.float64)
+        syy = torch.zeros(shape, dtype=torch.float64)
+    else:
+        sy, syy = target_sums
+        for name, tensor in (("sy", sy), ("syy", syy)):
+            if tuple(tensor.shape) != shape or tensor.dtype != torch.float64:
+                raise ValueError(
+                    f"target_sums[{name!r}] has shape {tuple(tensor.shape)} and dtype "
+                    f"{tensor.dtype}, expected {shape} and torch.float64"
+                )
     return EvalAccumulator(
         sse=torch.zeros(shape, dtype=torch.float64),
         sae=torch.zeros(shape, dtype=torch.float64),
+        sy=sy,
+        syy=syy,
         n_per_key=torch.zeros((n_keys,), dtype=torch.int64),
     )
 
@@ -247,6 +309,12 @@ def evaluate_models(
     and this function raises if it is not -- a free check that catches any accidental
     divergence between the reference accumulator and the reference model's own row.
 
+    The target sums behind ``signal_std`` and ``nrmse`` are accumulated **once per batch**
+    and shared by every accumulator, because they describe the targets and not any model.
+    This function raises if that sharing was broken, for the same reason it checks the
+    reference model's own skill: two models scored over one partition reporting two
+    different signal standard deviations would be a contradiction, not a rounding question.
+
     Args:
         models: Models to score, keyed by the label used in the results table. Every model
             must accept ``(B, L, C_in)`` and return ``(B, H, C_out)``. ``nn.Module``
@@ -318,8 +386,16 @@ def evaluate_models(
         )
 
     stats = dataset.norm_stats.subset(dof_names)
+    # Allocated here and handed to every accumulator, not allocated per accumulator: the
+    # target signal is model-independent, so it is summed once per batch below.
+    target_shape = (n_keys, spec.max_horizon, n_targets)
+    target_sy = torch.zeros(target_shape, dtype=torch.float64)
+    target_syy = torch.zeros(target_shape, dtype=torch.float64)
     accumulators = {
-        name: _empty_accumulator(n_keys, spec.max_horizon, n_targets) for name in models
+        name: _empty_accumulator(
+            n_keys, spec.max_horizon, n_targets, target_sums=(target_sy, target_syy)
+        )
+        for name in models
     }
     torch_device = torch.device(device)
     previous_modes: dict[str, bool] = {}
@@ -339,6 +415,10 @@ def evaluate_models(
                 batch = int(y.shape[0])
                 keys = _key_index(offset, batch, per_realization)
                 target = y.double()
+                # Once per batch, before the model loop: nine models would otherwise sum
+                # the same targets nine times, in nine float64 reduction orders.
+                target_sy.index_add_(0, keys, target)
+                target_syy.index_add_(0, keys, target.square())
                 mean = window_mean.double()
                 inputs = x.to(torch_device)
                 for name, model in models.items():
@@ -378,8 +458,17 @@ def evaluate_models(
                 f"window-index-to-realization mapping is wrong"
             )
 
+    for name, accumulator in accumulators.items():
+        if accumulator.sy is not target_sy or accumulator.syy is not target_syy:
+            raise RuntimeError(
+                f"model {name!r} does not share this pass's target sums; signal_std and "
+                f"nrmse would then be per-model quantities, which they are not -- the "
+                f"targets do not depend on the model that was scored against them"
+            )
+
     reference = accumulators[persistence_key]
     reference_sse, _ = reference.totals()
+    sum_y, sum_yy = reference.target_totals()
     tables: list[pd.DataFrame] = []
     for name, accumulator in accumulators.items():
         sse, sae = accumulator.totals()
@@ -387,6 +476,8 @@ def evaluate_models(
             sse=sse,
             sae=sae,
             sse_persistence=reference_sse,
+            sy=sum_y,
+            syy=sum_yy,
             n=accumulator.n_windows,
             dof_names=dof_names,
             horizons=horizons,
@@ -621,9 +712,18 @@ def paired_skill_difference_ci(
     still divided by it, so it is still a skill-scale quantity and still not comparable
     across horizons.
 
-    **Not wired into the sweep.** :func:`evaluate_models` already holds every model's
-    per-realization accumulator in one pass, so this costs one extra matrix product per
-    pair; it needs a caller to decide which pairs to report and where to write them.
+    **Called from** :func:`dmf.train.experiment.run_experiment`, once per configured
+    ``(model_a, model_b)`` pair, regime, DOF and horizon, from the per-realization
+    accumulators :func:`evaluate_models` already holds after its single scoring pass -- so
+    a pair costs one extra matrix product, with no second evaluation and no second
+    bootstrap draw. The caller writes one row per contrast to ``paired_contrasts.csv`` in
+    its results directory, carrying ``skill_diff`` with ``ci_lo``/``ci_hi`` and the
+    ``n_realizations``/``n_boot``/``ci_level``/``bootstrap_seed`` the interval was drawn
+    under. A run configuring no pair present in it writes no such file.
+
+    That wiring is what ``docs/protocol.md`` P3-D22 asked for and P3-D13 is the reason:
+    the rate-channel conclusion there was published wrong twice, the second time from the
+    medians of two separate unpaired marginals read as if they were a paired contrast.
 
     Args:
         sse_a: Per-realization summed squared error of the first model, shape
@@ -698,9 +798,10 @@ def per_cell_metrics(
     - ``id`` pools 4 headings x 4 sea states x 3 speeds, and roll in head seas is on the
       same residual floor.
 
-    The raw ``sse``/``sae``/``sse_persistence``/``n_windows`` sums are emitted alongside the
-    derived metrics so that any coarser marginal can be recomputed exactly with
-    :func:`marginalize_cells`; averaging the per-cell RMSE column instead would be wrong.
+    The raw ``sse``/``sae``/``sse_persistence``/``sy``/``syy``/``n_windows`` sums are emitted
+    alongside the derived metrics so that any coarser marginal can be recomputed exactly with
+    :func:`marginalize_cells`; averaging the per-cell RMSE column instead would be wrong, and
+    so would averaging the per-cell ``signal_std``.
 
     Args:
         accumulators: Per-realization sums from :func:`evaluate_models`.
@@ -741,6 +842,8 @@ def per_cell_metrics(
     for cell_values, positions in sorted(groups.items(), key=repr):
         selector = torch.as_tensor(positions, dtype=torch.int64)
         reference_sse = reference.sse[selector].sum(dim=0).numpy().astype(np.float64)
+        cell_sy = reference.sy[selector].sum(dim=0).numpy().astype(np.float64)
+        cell_syy = reference.syy[selector].sum(dim=0).numpy().astype(np.float64)
         n = int(reference.n_per_key[selector].sum().item())
         for name, accumulator in accumulators.items():
             sse = accumulator.sse[selector].sum(dim=0).numpy().astype(np.float64)
@@ -749,6 +852,8 @@ def per_cell_metrics(
                 sse=sse,
                 sae=sae,
                 sse_persistence=reference_sse,
+                sy=cell_sy,
+                syy=cell_syy,
                 n=n,
                 dof_names=dof_names,
                 horizons=horizons,
@@ -761,6 +866,8 @@ def per_cell_metrics(
             table["sse"] = _cell_sums(sse, dof_names, horizons)
             table["sae"] = _cell_sums(sae, dof_names, horizons)
             table["sse_persistence"] = _cell_sums(reference_sse, dof_names, horizons)
+            table["sy"] = _cell_sums(cell_sy, dof_names, horizons)
+            table["syy"] = _cell_sums(cell_syy, dof_names, horizons)
             frames.append(table)
     combined = pd.concat(frames, ignore_index=True)
     ordered = [
@@ -775,9 +882,13 @@ def per_cell_metrics(
         "mae",
         "rmse_persistence",
         "skill",
+        "signal_std",
+        "nrmse",
         "sse",
         "sae",
         "sse_persistence",
+        "sy",
+        "syy",
     ]
     return combined[ordered].sort_values(
         [*by, "model", "dof", "horizon_samples"], ignore_index=True
@@ -805,7 +916,9 @@ def marginalize_cells(cells: pd.DataFrame, by: Sequence[str]) -> pd.DataFrame:
 
     Sums the squared and absolute errors and re-derives the metrics, rather than averaging
     the RMSE column: ``mean(sqrt(x))`` is not ``sqrt(mean(x))``, and the cells differ in
-    window count.
+    window count. ``signal_std`` is re-derived the same way from the summed ``sy``/``syy``
+    -- the standard deviation of a union of cells is not the mean of their standard
+    deviations, and on a grid whose cells are different sea states it is much larger.
 
     Args:
         cells: Output of :func:`per_cell_metrics`.
@@ -815,7 +928,8 @@ def marginalize_cells(cells: pd.DataFrame, by: Sequence[str]) -> pd.DataFrame:
         One row per (model, kept axes, DOF, horizon), with the same metric columns.
 
     Raises:
-        ValueError: If a required column is missing from ``cells``.
+        ValueError: If a required column is missing from ``cells``, or if the pooled target
+            has zero variance at some cell.
     """
     required = {
         "model",
@@ -826,16 +940,27 @@ def marginalize_cells(cells: pd.DataFrame, by: Sequence[str]) -> pd.DataFrame:
         "sse",
         "sae",
         "sse_persistence",
+        "sy",
+        "syy",
     }
     missing = sorted(required - set(cells.columns))
     if missing:
         raise ValueError(f"cells is missing columns {missing}; pass the per_cell_metrics table")
     group = ["model", *by, "dof", "horizon_samples", "horizon_s"]
     summed = cells.groupby(group, as_index=False, sort=True)[
-        ["n_windows", "n_realizations", "sse", "sae", "sse_persistence"]
+        ["n_windows", "n_realizations", "sse", "sae", "sse_persistence", "sy", "syy"]
     ].sum()
     summed["rmse"] = np.sqrt(summed["sse"] / summed["n_windows"])
     summed["mae"] = summed["sae"] / summed["n_windows"]
     summed["rmse_persistence"] = np.sqrt(summed["sse_persistence"] / summed["n_windows"])
     summed["skill"] = 1.0 - summed["sse"] / summed["sse_persistence"]
+    summed["signal_std"] = signal_std(
+        summed["sy"].to_numpy(dtype=np.float64),
+        summed["syy"].to_numpy(dtype=np.float64),
+        summed["n_windows"].to_numpy(dtype=np.float64),
+    )
+    summed["nrmse"] = nrmse(
+        summed["rmse"].to_numpy(dtype=np.float64),
+        summed["signal_std"].to_numpy(dtype=np.float64),
+    )
     return summed

@@ -19,17 +19,26 @@ from dmf.models.ar import ARForecaster
 from dmf.models.base import BaseForecaster, ForecastModel, QuantileForecastModel
 from dmf.models.dlinear import DLinear
 from dmf.models.dlinear_ols import DLinearOLS
+from dmf.models.lstm import LSTMForecaster
 from dmf.models.persistence import DampedPersistence, Persistence
+from dmf.models.tcn import TCN, TemporalBlock, receptive_field
+from dmf.models.transformer import PatchEmbedding, TransformerForecaster
 from dmf.models.window_mean import WindowMean
 
 __all__ = [
+    "TCN",
     "ARForecaster",
     "BaseForecaster",
     "DLinear",
     "DLinearOLS",
     "DampedPersistence",
     "ForecastModel",
+    "LSTMForecaster",
+    "PatchEmbedding",
     "Persistence",
     "QuantileForecastModel",
+    "TemporalBlock",
+    "TransformerForecaster",
     "WindowMean",
+    "receptive_field",
 ]

@@ -1,0 +1,27 @@
+# TCN -- WaveNet-style dilated causal convolutions, direct multi-horizon.
+#
+# `kernel_size` is in taps and `dilations` in **samples** between taps, so the stack's
+# receptive field is 1 + 2*(3-1)*(1+2+4+8+16+32) = 253 samples = 25.3 s at 10 Hz, against a
+# 200-sample (20 s) lookback. That inequality is a constructor precondition, not a comment:
+# dmf.models.tcn.TCN raises ValueError if it fails, and tests/test_windows.py asserts both
+# the arithmetic and the raise. A short receptive field is invisible in the loss curve --
+# the model simply never sees the oldest part of its own window.
+#
+# 196 804 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6). 138 304 of them are
+# in the six residual blocks and 58 500 in the head, which is Linear(64 -> H*C_out) on the
+# **last** encoded step only. Reading one step is not a saving: because the receptive field
+# already covers the whole lookback, that step is a function of every input sample, so
+# flattening all 200 steps would multiply the head by 200 without adding information. The
+# result is a head the same order as `dlinear`'s 60 300, which keeps this row roughly
+# budget-matched to the linear baseline instead of an order above it.
+#
+# `dropout` applies after each of the two convolutions in a block, per Bai et al.
+name: tcn
+label: tcn
+head: point
+quantiles: []
+params:
+  n_filters: 64
+  kernel_size: 3
+  dilations: [1, 2, 4, 8, 16, 32]
+  dropout: 0.1

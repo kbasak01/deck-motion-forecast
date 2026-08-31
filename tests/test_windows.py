@@ -21,9 +21,13 @@ Also covered here:
   into module constants is what let the Gate 3 revision of ``horizons`` and ``target_dofs``
   break this file silently (``docs/protocol.md`` P3).
 
-Deferred to Phase 4, per the plan: the **TCN receptive field** check
-(``receptive_field(3, (1, 2, 4, 8, 16, 32)) == 253 >= lookback``), which needs
-``dmf.models.tcn`` to exist.
+- The **TCN receptive field**, which the plan lists here and which was deferred while
+  ``dmf.models.tcn`` was a stub. ``receptive_field(3, (1, 2, 4, 8, 16, 32)) == 253`` is
+  hand-checkable arithmetic (``1 + 2*2*63``) and is asserted as a literal; the covering
+  inequality ``253 >= lookback`` is asserted against :data:`PRODUCTION_SPEC` rather than
+  against 200, so a task revision moves it instead of silently passing. The converse is
+  asserted too -- a truncated dilation list must both fall short *and* make ``TCN(...)``
+  raise -- because a one-sided assertion passes against a constructor that never checks.
 
 Units: samples for lookback, horizons and strides; degrees for roll and pitch, metres for
 heave.
@@ -37,7 +41,7 @@ import pytest
 import torch
 
 from conftest import CORPUS_CONFIG_PATH, DATA_CONFIG_PATH, SMALL_N_SAMPLES
-from dmf.config import DataConfig, load_data, load_sim
+from dmf.config import DataConfig, load_data, load_model, load_sim
 from dmf.data.dataset import DeckMotionDataset, make_dataloader, resolve_columns
 from dmf.data.splits import Regime, build_split
 from dmf.data.windows import (
@@ -48,6 +52,7 @@ from dmf.data.windows import (
     window_start_indices,
 )
 from dmf.eval.controls import persistence_pipeline_sanity
+from dmf.models.tcn import TCN, receptive_field
 
 #: The current task definition, read from ``configs/data/default.yaml`` rather than restated
 #: here. A test that means "the shipped task" must load the shipped task.
@@ -55,6 +60,13 @@ PRODUCTION_CFG = load_data(DATA_CONFIG_PATH)
 
 #: The production window geometry, derived from :data:`PRODUCTION_CFG`.
 PRODUCTION_SPEC = window_spec_from_config(PRODUCTION_CFG)
+
+#: Channel counts of the current task, derived, never restated.
+N_IN = len(PRODUCTION_CFG.input_channels)
+N_OUT = len(PRODUCTION_CFG.target_dofs)
+
+#: Where the shipped model configs live, for the receptive-field check below.
+MODEL_CONFIG_ROOT = DATA_CONFIG_PATH.parents[1] / "model"
 
 #: Realization length of the production corpus, samples, derived from
 #: ``configs/sim/corpus.yaml`` the same way the generator derives it (``duration_s * fs_hz``;
@@ -153,6 +165,65 @@ def test_window_spec_from_config_matches_the_config(small_data_cfg: DataConfig) 
     assert spec.lookback == small_data_cfg.lookback
     assert spec.horizons == small_data_cfg.horizons
     assert spec.stride == small_data_cfg.stride
+
+
+# ---------------------------------------------------------------------------
+# TCN receptive field vs lookback
+# ---------------------------------------------------------------------------
+
+#: The shipped TCN stack, read from ``configs/model/tcn.yaml`` so that the covering check
+#: below tests the configuration that actually trains rather than a copy of it.
+TCN_CFG = load_model(MODEL_CONFIG_ROOT / "tcn.yaml")
+
+
+def test_tcn_receptive_field_arithmetic_is_the_hand_computed_value() -> None:
+    """1 + 2*(3-1)*(1+2+4+8+16+32) = 1 + 4*63 = 253. Asserted, not commented."""
+    dilations = (1, 2, 4, 8, 16, 32)
+    assert sum(dilations) == 63
+    assert receptive_field(3, dilations) == 253
+    assert receptive_field(3, list(dilations)) == 253, "YAML delivers a list, not a tuple"
+
+
+def test_tcn_receptive_field_covers_the_production_lookback() -> None:
+    """The covering inequality, against the shipped config and the shipped task geometry.
+
+    Both sides are read rather than restated: the dilations come from
+    ``configs/model/tcn.yaml`` and the lookback from ``configs/data/default.yaml``. A
+    receptive field shorter than the lookback means the stack never sees the oldest part of
+    its own window, and that shows up nowhere in the loss curve.
+    """
+    rf = receptive_field(int(TCN_CFG.params["kernel_size"]), list(TCN_CFG.params["dilations"]))
+    assert rf >= PRODUCTION_SPEC.lookback
+    model = TCN(
+        PRODUCTION_SPEC.lookback, PRODUCTION_SPEC.max_horizon, N_IN, N_OUT, **TCN_CFG.params
+    )
+    assert model.receptive_field == rf
+
+
+def test_a_truncated_dilation_stack_falls_short_and_is_refused() -> None:
+    """The converse. Without it, a constructor that never checks passes the test above."""
+    truncated = [1, 2, 4, 8]
+    assert receptive_field(3, truncated) == 1 + 2 * 2 * 15
+    assert receptive_field(3, truncated) < PRODUCTION_SPEC.lookback
+    with pytest.raises(ValueError, match="receptive field"):
+        TCN(
+            PRODUCTION_SPEC.lookback,
+            PRODUCTION_SPEC.max_horizon,
+            N_IN,
+            N_OUT,
+            dilations=truncated,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kernel_size", "dilations"),
+    [(1, (1, 2)), (0, (1, 2)), (3, (1, 0, 4)), (3, (1, -2))],
+)
+def test_receptive_field_rejects_a_degenerate_stack(
+    kernel_size: int, dilations: tuple[int, ...]
+) -> None:
+    with pytest.raises(ValueError):
+        receptive_field(kernel_size, dilations)
 
 
 # ---------------------------------------------------------------------------

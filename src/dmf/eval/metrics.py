@@ -16,9 +16,27 @@ This is the convention already fixed by
 ``docs/protocol.md``; ``tests/test_metrics.py`` pins it with
 ``test_horizon_metric_is_per_step_not_cumulative``.
 
-**Scale.** A production test partition is ~442 000 windows, so a ``(N, H, C)`` float64
-array is ~0.5 GB per model per regime. The table is therefore built from *sums* --
-:func:`metrics_table_from_sums` -- which is what :mod:`dmf.eval.runner` streams.
+**Skill is not comparable across horizons on this signal, so every table also carries a
+normalised RMSE.** Persistence error tracks the target's autocorrelation, so the skill
+denominator oscillates with the signal's own period rather than growing with lead time: on
+``id``/test the persistence RMSE for roll *falls* from 7.088 deg at 50 samples to 3.794 deg
+at 100, because 10 s is close to one roll period (``docs/protocol.md`` P3-D5/P3-D6, pinned
+in ``tests/test_models.py::PERSISTENCE_RMSE_ID_TEST``). A skill-vs-horizon curve therefore
+shows dips that belong to the reference and not to the model. :func:`nrmse` divides instead
+by :func:`signal_std`, the standard deviation of the target over the partition being scored,
+which is a property of the signal at that lead time alone: 1.0 means "no better than the
+partition mean", lower is better, and it is monotone in difficulty in the way skill is not.
+
+**That is not the "normalised space" this subpackage forbids.** :mod:`dmf.eval` scores in
+corpus units and never in units of the *training* normalisation scale. ``signal_std`` is
+measured on the held-out targets themselves, in corpus units, and enters only as the
+denominator of a dimensionless ratio; no metric here is computed on normalised windows.
+
+**Scale.** A production test partition holds hundreds of thousands of windows, so a
+``(N, H, C)`` float64 array runs to several gigabytes per model per regime. The table is
+therefore built from *sums* -- :func:`metrics_table_from_sums` -- which is what
+:mod:`dmf.eval.runner` streams. The window count is deliberately not quoted here: it is a
+function of the corpus and the horizon list and it has already moved once (P3-D6).
 :func:`per_dof_horizon_metrics` keeps the array-shaped signature for small cases and tests
 and reduces to the same code path.
 """
@@ -31,8 +49,10 @@ from dmf.typedefs import FloatArray, IntArray
 __all__ = [
     "mae",
     "metrics_table_from_sums",
+    "nrmse",
     "per_dof_horizon_metrics",
     "rmse",
+    "signal_std",
     "skill_score",
 ]
 
@@ -47,6 +67,8 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "mae",
     "rmse_persistence",
     "skill",
+    "signal_std",
+    "nrmse",
 )
 
 
@@ -134,6 +156,92 @@ def skill_score(mse_model: FloatArray, mse_persistence: FloatArray) -> FloatArra
     return np.asarray(1.0 - model / reference, dtype=np.float64)
 
 
+def signal_std(sy: FloatArray, syy: FloatArray, n: int | IntArray | FloatArray) -> FloatArray:
+    """Compute the population standard deviation of the target signal.
+
+    ``sqrt(syy/n - (sy/n)**2)`` -- the spread of the target at lead time exactly ``h``, per
+    channel, over the whole partition being scored. It is a property of the *targets*, so it
+    is identical for every model scored over the same windows and is accumulated once per
+    batch rather than once per model (:func:`dmf.eval.runner.evaluate_models`).
+
+    Args:
+        sy: Summed target, shape ``(H, C)`` or any broadcastable shape, in **corpus units**
+            (degrees for roll and pitch, metres for heave, deg/s and m/s for the rates).
+        syy: Summed squared target over the same windows, same shape, in squared corpus
+            units.
+        n: Number of windows the sums were accumulated over; a scalar, or an array
+            broadcastable against ``sy`` when the rows differ in window count. Note that
+            windows overlap, so this is a window count and not an independent-sample count;
+            the value is the spread of the window population, which is what the reported
+            RMSE is averaged over.
+
+    Returns:
+        Standard deviation, shape of ``sy``, in **corpus units** -- the same units as
+        :func:`rmse`, which is what makes their ratio dimensionless.
+
+    Raises:
+        ValueError: If ``sy`` and ``syy`` differ in shape, if ``n`` is not positive, or if
+            any variance is zero or non-finite. Refused rather than returned as ``inf`` or
+            ``nan``, following :func:`skill_score`: a constant channel is a corpus bug, not
+            a perfectly easy forecast.
+    """
+    sums = np.asarray(sy, dtype=np.float64)
+    squares = np.asarray(syy, dtype=np.float64)
+    if sums.shape != squares.shape:
+        raise ValueError(f"sy has shape {sums.shape} but syy has shape {squares.shape}")
+    count = np.asarray(n, dtype=np.float64)
+    if np.any(count < 1.0):
+        raise ValueError(f"n must be positive, got {n!r}")
+    mean = sums / count
+    variance = squares / count - mean * mean
+    if not np.all(np.isfinite(variance)) or np.any(variance <= 0.0):
+        raise ValueError(
+            "the target signal has zero or non-finite variance at some reported cell, so a "
+            "normalised RMSE is undefined there. This happens on a constant channel, which "
+            "is a corpus bug, not a perfectly easy forecast."
+        )
+    return np.asarray(np.sqrt(variance), dtype=np.float64)
+
+
+def nrmse(rmse_value: FloatArray, std_value: FloatArray) -> FloatArray:
+    """Normalise an RMSE by the standard deviation of the signal it forecasts.
+
+    ``rmse / signal_std``. 1.0 means "no better than predicting the partition mean of that
+    channel at that lead time"; lower is better; there is no upper bound. Reported alongside
+    skill because skill's denominator is persistence, whose error tracks the autocorrelation
+    and is *not* monotone in lead time on this signal -- see the module docstring.
+
+    Args:
+        rmse_value: Root mean squared error, in corpus units, over the same windows as
+            ``std_value``.
+        std_value: Target standard deviation from :func:`signal_std`, in the same corpus
+            units and over the same windows.
+
+    Returns:
+        Normalised RMSE, **dimensionless**, shape of the broadcast inputs.
+
+    Raises:
+        ValueError: If the shapes do not agree, or if any standard deviation is zero or
+            non-finite -- the same refusal :func:`signal_std` makes, repeated here because
+            this function can be called with a denominator computed elsewhere.
+    """
+    numerator = np.asarray(rmse_value, dtype=np.float64)
+    denominator = np.asarray(std_value, dtype=np.float64)
+    if numerator.shape != denominator.shape:
+        raise ValueError(
+            f"rmse_value has shape {numerator.shape} but std_value has shape "
+            f"{denominator.shape}; a normalised RMSE must divide by the spread of the same "
+            f"targets the error was measured against"
+        )
+    if not np.all(np.isfinite(denominator)) or np.any(denominator <= 0.0):
+        raise ValueError(
+            "signal_std contains a zero or non-finite value: nrmse is undefined where the "
+            "target does not vary. This happens on a constant channel, which is a corpus "
+            "bug, not a perfectly easy forecast."
+        )
+    return np.asarray(numerator / denominator, dtype=np.float64)
+
+
 def _horizon_index(horizons: tuple[int, ...], max_horizon: int) -> IntArray:
     """Validate the requested horizons and return their zero-based indices.
 
@@ -163,6 +271,8 @@ def metrics_table_from_sums(
     sse: FloatArray,
     sae: FloatArray,
     sse_persistence: FloatArray,
+    sy: FloatArray,
+    syy: FloatArray,
     n: int,
     dof_names: tuple[str, ...],
     horizons: tuple[int, ...],
@@ -171,8 +281,8 @@ def metrics_table_from_sums(
     """Build the core results table from streamed error sums.
 
     The production form of :func:`per_dof_horizon_metrics`. Nothing here is ever
-    ``(N, H, C)``-shaped, so a 442 000-window test partition costs 1200 float64 values per
-    model instead of half a gigabyte.
+    ``(N, H, C)``-shaped, so a production test partition costs ``H * C`` float64 values per
+    model rather than one entry per window, independently of how many windows it holds.
 
     ``n`` cancels out of the skill score (``1 - sse_model/sse_persistence``), which is why
     the reference model's own skill is *bitwise* zero rather than zero to rounding.
@@ -182,6 +292,11 @@ def metrics_table_from_sums(
         sae: Model summed absolute error, shape ``(H, C)``, corpus units.
         sse_persistence: Persistence summed squared error over the **same windows**, shape
             ``(H, C)``, squared corpus units.
+        sy: Summed target over the same windows, shape ``(H, C)``, corpus units. Model
+            independent, which is why :func:`dmf.eval.runner.evaluate_models` accumulates it
+            once per batch and shares it between every model's accumulator.
+        syy: Summed squared target over the same windows, shape ``(H, C)``, squared corpus
+            units.
         n: Number of windows the sums were accumulated over. Note that consecutive windows
             overlap at ``stride < lookback``, so ``n`` is a window count and **not** an
             independent-sample count; see :func:`dmf.eval.runner.evaluate_models`.
@@ -192,22 +307,33 @@ def metrics_table_from_sums(
 
     Returns:
         One row per (DOF, horizon), columns :data:`METRIC_COLUMNS`. Units are degrees for
-        roll and pitch and metres for heave; ``skill`` is dimensionless.
+        roll and pitch and metres for heave; ``signal_std`` is in those same corpus units
+        and ``skill`` and ``nrmse`` are dimensionless.
 
     Raises:
-        ValueError: If the three arrays differ in shape, if ``dof_names`` does not match
-            the channel axis, if ``n`` is not positive, if ``fs_hz`` is not positive, or if
-            a requested horizon is outside ``[1, H]``.
+        ValueError: If the five sum arrays differ in shape, if ``dof_names`` does not match
+            the channel axis, if ``n`` is not positive, if ``fs_hz`` is not positive, if a
+            requested horizon is outside ``[1, H]``, or if the target has zero variance at a
+            reported cell.
     """
     model_sse = np.asarray(sse, dtype=np.float64)
     model_sae = np.asarray(sae, dtype=np.float64)
     reference_sse = np.asarray(sse_persistence, dtype=np.float64)
+    target_sy = np.asarray(sy, dtype=np.float64)
+    target_syy = np.asarray(syy, dtype=np.float64)
     if model_sse.ndim != 2:
         raise ValueError(f"sse must have shape (H, C), got {model_sse.shape}")
-    if not (model_sse.shape == model_sae.shape == reference_sse.shape):
+    if not (
+        model_sse.shape
+        == model_sae.shape
+        == reference_sse.shape
+        == target_sy.shape
+        == target_syy.shape
+    ):
         raise ValueError(
-            f"sse {model_sse.shape}, sae {model_sae.shape} and sse_persistence "
-            f"{reference_sse.shape} must agree"
+            f"sse {model_sse.shape}, sae {model_sae.shape}, sse_persistence "
+            f"{reference_sse.shape}, sy {target_sy.shape} and syy {target_syy.shape} must "
+            f"agree"
         )
     if model_sse.shape[1] != len(dof_names):
         raise ValueError(
@@ -222,11 +348,15 @@ def metrics_table_from_sums(
     # Validated and computed once, over the reported cells only: a zero persistence SSE at
     # some horizon nobody asked for must not fail a table that never reports it.
     skill_grid = skill_score(model_sse[index, :], reference_sse[index, :])
+    # Same argument for the normalised RMSE: a constant channel at an unreported horizon
+    # must not fail a table that never quotes it. Both grids are (n_horizons, C).
+    std_grid = signal_std(target_sy[index, :], target_syy[index, :], n)
+    rmse_grid = np.sqrt(model_sse[index, :] / n)
+    nrmse_grid = nrmse(rmse_grid, std_grid)
 
     rows: list[dict[str, object]] = []
     for channel, name in enumerate(dof_names):
         for position, (horizon, step) in enumerate(zip(horizons, index.tolist(), strict=True)):
-            cell_sse = float(model_sse[step, channel])
             cell_reference = float(reference_sse[step, channel])
             rows.append(
                 {
@@ -234,10 +364,12 @@ def metrics_table_from_sums(
                     "horizon_samples": int(horizon),
                     "horizon_s": float(horizon) / fs_hz,
                     "n_windows": int(n),
-                    "rmse": float(np.sqrt(cell_sse / n)),
+                    "rmse": float(rmse_grid[position, channel]),
                     "mae": float(model_sae[step, channel] / n),
                     "rmse_persistence": float(np.sqrt(cell_reference / n)),
                     "skill": float(skill_grid[position, channel]),
+                    "signal_std": float(std_grid[position, channel]),
+                    "nrmse": float(nrmse_grid[position, channel]),
                 }
             )
     return pd.DataFrame(rows, columns=list(METRIC_COLUMNS))
@@ -270,9 +402,8 @@ def per_dof_horizon_metrics(
             samples.
 
     Returns:
-        One row per (DOF, horizon), with columns ``dof``, ``horizon_samples``,
-        ``horizon_s``, ``rmse``, ``mae``, ``rmse_persistence``, ``skill``. Units are
-        degrees for roll and pitch, metres for heave.
+        One row per (DOF, horizon), columns :data:`METRIC_COLUMNS`. Units are degrees for
+        roll and pitch and metres for heave; ``skill`` and ``nrmse`` are dimensionless.
 
     Raises:
         ValueError: If the three arrays differ in shape, or if a requested horizon exceeds
@@ -297,6 +428,8 @@ def per_dof_horizon_metrics(
         sse=np.square(error).sum(axis=0),
         sae=np.abs(error).sum(axis=0),
         sse_persistence=np.square(reference_error).sum(axis=0),
+        sy=truth.sum(axis=0),
+        syy=np.square(truth).sum(axis=0),
         n=int(forecast.shape[0]),
         dof_names=dof_names,
         horizons=horizons,
