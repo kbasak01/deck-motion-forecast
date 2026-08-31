@@ -1,0 +1,106 @@
+# Gate 4 -- the deep-model table.
+#
+# TWELVE models in ONE run: the nine Phase 3 baselines re-scored alongside the three deep
+# architectures. Splitting them across runs is how one data pipeline, one normalisation,
+# one horizon definition and one early-stopping rule silently drift apart, which is the
+# failure mode Gate 4's fairness requirement exists to prevent. It is also not optional
+# here for two measured reasons:
+#
+#   1. The Phase 3 `dlinear` row hit its 60-epoch cap in 22 of 24 runs (docs/protocol.md
+#      P3-D19, P3-D23), i.e. it stopped with validation loss still falling. Comparing a
+#      deep model against that row would credit the deep model with an optimisation gap.
+#      Re-fitting it here under the identical budget makes the comparison like-for-like.
+#   2. The committed Phase 3 artifacts predate the `nrmse`/`signal_std` columns, so they
+#      cannot supply a normalised RMSE for a joined table. Re-scoring produces one table
+#      in which every row carries every column.
+#
+# Model order is table order. `persistence` is first because it is the skill-score
+# denominator and `dmf.eval.runner.evaluate_models` requires it. The three deep models come
+# AFTER `dlinear`/`dlinear_ols` deliberately: `_run_controls` selects the untrained-control
+# subject as the first SGD config in this list, and moving it off DLinear would break
+# continuity with the P3-D9 record without saying so.
+#
+# `imu` is not run in this phase. The observation-mode ablation is Phase 6.3, and P1-D6
+# forbids mixing an imu input with an ideal target, so the two modes are separate task
+# definitions rather than two columns of one table.
+name: deep
+data: ../data/default.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p10.yaml
+  - ../model/ar_p20.yaml
+  - ../model/ar_p40.yaml
+  - ../model/ar_attitude_only.yaml
+  - ../model/dlinear.yaml
+  - ../model/dlinear_ols.yaml
+  - ../model/tcn.yaml
+  - ../model/transformer.yaml
+  - ../model/lstm.yaml
+
+# Applies to the four SGD models -- dlinear, tcn, transformer, lstm. TrainConfig is one
+# flat block per experiment; there is no per-model override, and that is the Gate 4
+# fairness property rather than a limitation to work around. One budget, one schedule, one
+# stopping rule, for the linear baseline and the deep models alike.
+#
+# --- The budget was re-derived, not inherited (docs/IMPLEMENTATION_PLAN.md Phase 4
+#     carry-forward item 3 requires this; P3-D17's figures do not transfer). ---
+#
+# Step cost, measured on the production geometry (A4000, bf16 autocast, H2D + forward +
+# backward + clip + step, cuda-synchronised on both sides):
+#
+#   model         b=512    b=1024   b=2048   n_params
+#   dlinear        2.29     2.44     2.87      60 300
+#   tcn           20.34    38.60    75.24     196 804
+#   transformer   12.27    18.07    34.17   2 712 708
+#   lstm          10.16    17.93    35.26     317 828     (ms/step)
+#
+# P3-D17 found step cost nearly FLAT in batch size and concluded 4x the batch buys 3.6x
+# less wall time. That is a property of a 60 300-parameter linear map, not of this
+# pipeline: all three deep models are compute-bound, ms/step scales almost exactly
+# linearly with batch, and s/epoch barely moves (tcn 58.2 -> 53.8 s/epoch from 512 to
+# 2048). Batch size is therefore close to free for wall time here and is chosen for
+# continuity with the Phase 3 sweep instead: batch 1024, lr 2e-3 (square-root scaling of
+# the plan's 1e-3 at batch 256, the conservative choice over linear scaling's 4e-3).
+#
+# --- epochs 60, and early stopping is expected NOT to fire. Stated, not discovered. ---
+#
+# An 18-epoch pilot on `id` at this batch and lr, seed 0, one run per architecture,
+# measured per-epoch wall time including validation and read the validation curve:
+#
+#   model         s/epoch   best_epoch   best val MSE   curve
+#   tcn             78.8      17 / 18       0.132155    falling monotonically
+#   transformer     46.2      16 / 18       0.130390    near plateau, val bouncing
+#   lstm            57.6      17 / 18       0.094530    falling monotonically
+#
+# Two of the three have their best epoch at the LAST epoch and are still improving. To
+# trigger `patience: 15` a run must fail to improve for 16 consecutive epochs, and nothing
+# here is plateauing, so the cap will bind. `epochs_run` is recorded per run on
+# `baselines_by_seed.csv` (P3-D23) and the outcome is reported rather than presented as
+# convergence.
+#
+# The cap is nonetheless a real hyperparameter, not merely a stopping point: `_lr_at` sizes
+# the warmup+cosine schedule by `epochs * steps_per_epoch`, so a run at cap 60 anneals to
+# ~0 by epoch 60, whereas the same 60 epochs drawn from a cap-120 schedule would stop
+# mid-decay. 60 matches the Phase 3 nominal cap, which keeps the re-fitted `dlinear` row
+# directly comparable to the P3-D19 measurement of the same model at the same cap.
+#
+# Direction of the residual bias, since it cannot be removed: the deep models are still
+# improving when the cap bites, so their reported numbers UNDERSTATE them. For the question
+# Gate 4 asks -- do the deep models beat the trivial and linear baselines -- that is the
+# conservative direction. `dlinear_ols` is closed-form and therefore budget-independent, so
+# the strongest linear baseline in the table cannot be handicapped by this choice at all.
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [id, unseen_seastate, unseen_heading, unseen_vessel]

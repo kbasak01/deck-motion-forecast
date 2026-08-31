@@ -15,6 +15,9 @@ Per regime, exactly once:
 4. One :func:`dmf.train.loop.fit` per (SGD model, seed).
 5. One :func:`dmf.eval.runner.evaluate_models` pass scoring **every** model on identical
    windows, so the skill denominator is structurally the same for all of them.
+6. One :func:`dmf.eval.runner.paired_skill_difference_ci` per configured contrast, reusing
+   step 5's accumulators and its bootstrap resample weights, into
+   ``paired_contrasts.csv``. No second scoring pass and no second bootstrap draw.
 
 Models are dispatched on :attr:`dmf.models.base.BaseForecaster.FIT_KIND`, not on their
 class, so a Phase 4 architecture joins the run by declaring ``FIT_KIND = "sgd"`` and adding
@@ -24,7 +27,7 @@ Units: horizons and lookbacks in samples, ``fs_hz`` in hertz, wall-clock times i
 errors in corpus units (degrees for roll and pitch, metres for heave).
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +46,13 @@ from dmf.eval.controls import (
     untrained_control,
 )
 from dmf.eval.report import build_baselines_markdown, build_baselines_table, write_table
-from dmf.eval.runner import evaluate_models, marginalize_cells, per_cell_metrics
+from dmf.eval.runner import (
+    EvalAccumulator,
+    evaluate_models,
+    marginalize_cells,
+    paired_skill_difference_ci,
+    per_cell_metrics,
+)
 from dmf.models.base import BaseForecaster
 from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.persistence import TAU_WINDOW_MEAN, DampedPersistence
@@ -57,7 +66,18 @@ from dmf.train.closed_form import (
 from dmf.train.loop import fit, set_seed
 from dmf.train.registry import MODEL_REGISTRY, build_model
 
-__all__ = ["PERSISTENCE_LABEL", "RunRecord", "run_experiment"]
+__all__ = [
+    "BOOTSTRAP_CI_LEVEL",
+    "BOOTSTRAP_N_BOOT",
+    "BOOTSTRAP_SEED",
+    "CONTRAST_BASELINES",
+    "CONTRAST_DEEP_MODELS",
+    "PAIRED_CONTRASTS",
+    "PAIRED_CONTRAST_COLUMNS",
+    "PERSISTENCE_LABEL",
+    "RunRecord",
+    "run_experiment",
+]
 
 #: Label of the reference model. Every skill score's denominator comes from this model's
 #: accumulator, so the experiment refuses to run without it in the config.
@@ -79,6 +99,87 @@ GATE_HORIZON_SAMPLES = 100
 #: than one overwriting the others. Labels come from the config and never contain it, so
 #: :func:`_split_run_keys` can invert the join for the committed tables.
 RUN_KEY_SEP = "@"
+
+
+#: Bootstrap settings for **both** the marginal skill intervals computed inside
+#: :func:`dmf.eval.runner.evaluate_models` and the paired contrasts computed from the
+#: accumulators it returns. Passed explicitly to both rather than left to two default
+#: arguments that happen to agree: :func:`dmf.eval.runner.paired_skill_difference_ci` is
+#: exact only when it draws the *same* multinomial resample weights the marginals drew,
+#: and "the same" must be a property of this module, not a coincidence between two
+#: signatures. Values are the runner's current defaults, so no committed number moves.
+BOOTSTRAP_N_BOOT = 1000
+BOOTSTRAP_CI_LEVEL = 0.95
+BOOTSTRAP_SEED = 0
+
+#: Baselines that every deep model is contrasted against in ``paired_contrasts.csv``. Each
+#: one supports a different claim, and each is the reason that baseline is in the sweep:
+#:
+#: - ``ar20`` -- the Gate 3 subject and the strongest fitted baseline (``docs/protocol.md``
+#:   P3-D12). "This architecture was worth training" is the claim that it beats AR(20) by
+#:   more than the paired interval, and nothing weaker.
+#: - ``dlinear_ols`` -- the *converged* linear map, at the exact optimum of its own
+#:   objective. Contrasting a deep model against the SGD ``dlinear`` row instead would
+#:   credit it with an optimisation gap measured at up to +0.0758 skill (P3-D19).
+#: - ``damped_persistence`` -- the reference Gate 4 names.
+#: - ``window_mean`` -- the zero-parameter trivial forecast, which beats persistence (the
+#:   denominator of every skill score here) in 107 of 144 cells (P3-D20). A deep model that
+#:   does not clear it has learned nothing that the window mean does not already carry.
+CONTRAST_BASELINES: tuple[str, ...] = (
+    "ar20",
+    "dlinear_ols",
+    "damped_persistence",
+    "window_mean",
+)
+
+#: Phase 4 architectures. Listed here rather than derived from ``FIT_KIND == "sgd"``,
+#: which would also sweep in ``dlinear`` and make the optimisation-gap pair below
+#: ambiguous.
+CONTRAST_DEEP_MODELS: tuple[str, ...] = ("tcn", "transformer", "lstm")
+
+#: Ordered ``(model_a, model_b)`` label pairs written to ``paired_contrasts.csv``. The
+#: reported quantity is ``skill(a) - skill(b)``, so **positive means model_a is better**.
+#:
+#: Every deep model against every entry of :data:`CONTRAST_BASELINES` -- the deep-vs-
+#: baseline claims Phase 4 exists to make -- plus ``dlinear`` against ``dlinear_ols``, the
+#: DLinear optimisation gap at whatever epoch budget the config carries. That last pair is
+#: not a Phase 4 claim: it is the instrument P3-D19 used to show that the gap is not small
+#: in skill, and it has to be re-read at the new budget before any deep-vs-``dlinear``
+#: number is quoted.
+#:
+#: Pairs whose two labels are not both in the experiment being run are skipped silently, so
+#: this list does not force every config to carry every model; see :func:`_contrast_frame`.
+PAIRED_CONTRASTS: tuple[tuple[str, str], ...] = tuple(
+    (deep, baseline) for deep in CONTRAST_DEEP_MODELS for baseline in CONTRAST_BASELINES
+) + (("dlinear", "dlinear_ols"),)
+
+#: Exact column order of ``results/paired_contrasts.csv``.
+#:
+#: ``skill_diff`` is ``skill(model_a) - skill(model_b)`` on the full sample: **positive
+#: means model_a is the better model**, and it is stated here because a sign convention
+#: that has to be inferred is a sign convention that gets misread. ``ci_lo``/``ci_hi`` are
+#: the paired bootstrap percentile interval of that same difference over resampled
+#: realizations; an interval excluding zero is the claim "``model_a`` beats ``model_b`` on
+#: these realizations". ``skill_diff`` is *not* the centre of that interval and is not
+#: derived from it. All three are dimensionless. One row per (regime, pair, seed, DOF,
+#: horizon); ``seed`` is the training seed of the stochastic side (0 when both sides are
+#: deterministic), never an average over seeds.
+PAIRED_CONTRAST_COLUMNS: tuple[str, ...] = (
+    "regime",
+    "model_a",
+    "model_b",
+    "seed",
+    "dof",
+    "horizon_samples",
+    "horizon_s",
+    "skill_diff",
+    "ci_lo",
+    "ci_hi",
+    "n_realizations",
+    "n_boot",
+    "ci_level",
+    "bootstrap_seed",
+)
 
 
 @dataclass(frozen=True)
@@ -382,6 +483,199 @@ def _split_run_keys(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _runs_by_label(
+    accumulators: Mapping[str, EvalAccumulator],
+) -> dict[str, dict[int, EvalAccumulator]]:
+    """Group a scoring pass's accumulators by bare label, keyed by training seed.
+
+    Args:
+        accumulators: Per-realization error sums keyed ``"<label>@<seed>"``, as
+            :func:`dmf.eval.runner.evaluate_models` returns them.
+
+    Returns:
+        ``{label: {seed: accumulator}}``. A stochastic model contributes one entry per
+        seed; a deterministic one contributes the single entry ``{0: ...}``.
+
+    Raises:
+        ValueError: If a key carries no :data:`RUN_KEY_SEP`, which would mean the mapping
+            did not come from a per-run scoring pass and the seed would be invented.
+    """
+    grouped: dict[str, dict[int, EvalAccumulator]] = {}
+    for key, accumulator in accumulators.items():
+        label, separator, seed = key.rpartition(RUN_KEY_SEP)
+        if not separator:
+            raise ValueError(
+                f"accumulator key {key!r} carries no {RUN_KEY_SEP!r} run-key separator; "
+                f"this mapping did not come from a per-run scoring pass"
+            )
+        grouped.setdefault(label, {})[int(seed)] = accumulator
+    return grouped
+
+
+def _pair_seeds(
+    label_a: str, seeds_a: Sequence[int], label_b: str, seeds_b: Sequence[int]
+) -> list[tuple[int, int, int]]:
+    """Decide which run of ``a`` is contrasted against which run of ``b``.
+
+    A contrast is only paired if the two sides are the same *thing* being resampled, and
+    across seeds there are exactly two cases worth supporting:
+
+    - **Both stochastic, same seed set.** Pair seed by seed. Contrasting seed 0 of one
+      model against seed 2 of another adds a seed difference to the architecture
+      difference the row claims to measure.
+    - **One side deterministic.** A closed-form fit has a single accumulator and the seed
+      cannot enter it, so every seed of the stochastic side is contrasted against that one
+      accumulator. Each such row is still a genuine paired interval: it is the interval for
+      *that run* against the deterministic model.
+
+    Intervals are never averaged across seeds here. The mean of three intervals is not an
+    interval for anything -- it excludes seed variance and is invariant to seed
+    disagreement, which is the defect ``docs/protocol.md`` P3-D22 records and corrects for
+    the marginal CIs. The per-seed rows are what get written; any envelope over them is the
+    reader's, and must be labelled as an envelope.
+
+    Args:
+        label_a: Label of the first model, for the error message.
+        seeds_a: Seeds the first model was fitted at.
+        label_b: Label of the second model.
+        seeds_b: Seeds the second model was fitted at.
+
+    Returns:
+        Triples ``(row_seed, seed_a, seed_b)``. ``row_seed`` is the seed written to the
+        table: the stochastic side's seed when one side is deterministic, the shared seed
+        when both sides carry the same set.
+
+    Raises:
+        ValueError: If the two seed sets differ and neither side is a single deterministic
+            run, so no pairing is defined and any choice would be arbitrary.
+    """
+    left = sorted(seeds_a)
+    right = sorted(seeds_b)
+    if left == right:
+        return [(seed, seed, seed) for seed in left]
+    if len(right) == 1:
+        return [(seed, seed, right[0]) for seed in left]
+    if len(left) == 1:
+        return [(seed, left[0], seed) for seed in right]
+    raise ValueError(
+        f"cannot pair {label_a!r} (seeds {left}) with {label_b!r} (seeds {right}): the seed "
+        f"sets differ and neither side is a single deterministic run, so seed-by-seed "
+        f"pairing is undefined"
+    )
+
+
+def _contrast_frame(
+    accumulators: Mapping[str, EvalAccumulator],
+    *,
+    regime: str,
+    dof_names: Sequence[str],
+    horizons: tuple[int, ...],
+    fs_hz: float,
+    persistence_key: str,
+    contrasts: Sequence[tuple[str, str]] = PAIRED_CONTRASTS,
+    n_boot: int = BOOTSTRAP_N_BOOT,
+    ci_level: float = BOOTSTRAP_CI_LEVEL,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
+) -> pd.DataFrame:
+    """Compute the paired skill-difference intervals for one regime.
+
+    Reuses the accumulators of the regime's single :func:`dmf.eval.runner.evaluate_models`
+    pass, so this costs one small matrix product per (pair, seed) and no second pass over
+    the partition. ``n_boot`` and ``bootstrap_seed`` are the ones the marginal intervals in
+    that same pass used, which is what makes the pairing exact rather than approximate:
+    :func:`dmf.eval.runner._bootstrap_counts` is a pure function of
+    ``(n_realizations, n_boot, seed)``, so both models and the reference are reweighted by
+    the identical multinomial counts and the realization-to-realization variation that
+    dominates both marginals cancels in the difference.
+
+    Pairs naming a label the experiment did not run are skipped **silently**:
+    :data:`PAIRED_CONTRASTS` is the full Phase 4 list, and requiring every config to carry
+    every model would make it impossible to run a baselines-only or single-architecture
+    sweep. The one thing that is not silent is a list that matches nothing while deep
+    models are present -- see ``Raises``.
+
+    Args:
+        accumulators: Per-realization error sums keyed ``"<label>@<seed>"``.
+        regime: Regime name, written to every row.
+        dof_names: Target channel names in accumulator channel order (roll, pitch and heave
+            in degrees and metres, their rates in degrees per second and metres per second).
+        horizons: Horizons to report, samples. "Horizon ``h``" is the error at lead time
+            exactly ``h`` samples.
+        fs_hz: Sampling rate, hertz, used to report each horizon in seconds.
+        persistence_key: Key naming the reference accumulator, whose SSE is the skill
+            denominator on both sides of every difference.
+        contrasts: Ordered ``(model_a, model_b)`` label pairs. Defaults to
+            :data:`PAIRED_CONTRASTS`.
+        n_boot: Bootstrap resamples; must equal the value the marginal CIs used.
+        ci_level: Central confidence level of the paired interval.
+        bootstrap_seed: Bootstrap seed; must equal the value the marginal CIs used.
+
+    Returns:
+        A frame with columns :data:`PAIRED_CONTRAST_COLUMNS`, one row per (pair, seed, DOF,
+        horizon), rows channel-major and horizon-minor like every other table here. Empty
+        (with those columns) when no configured pair is present.
+
+    Raises:
+        ValueError: If the reference accumulator is missing, if a deep model from
+            :data:`CONTRAST_DEEP_MODELS` was scored but not one configured pair could be
+            formed -- a mistyped label in :data:`PAIRED_CONTRASTS` would otherwise write a
+            silently empty file -- or if a pair's two seed sets cannot be paired.
+    """
+    if persistence_key not in accumulators:
+        raise ValueError(
+            f"persistence_key {persistence_key!r} is not among the scored runs "
+            f"{sorted(accumulators)}; the skill difference has no denominator"
+        )
+    reference = accumulators[persistence_key]
+    by_label = _runs_by_label(accumulators)
+    rows: list[dict[str, object]] = []
+    for label_a, label_b in contrasts:
+        if label_a not in by_label or label_b not in by_label:
+            continue
+        runs_a = by_label[label_a]
+        runs_b = by_label[label_b]
+        pairing = _pair_seeds(label_a, list(runs_a), label_b, list(runs_b))
+        for row_seed, seed_a, seed_b in pairing:
+            difference, lo, hi = paired_skill_difference_ci(
+                runs_a[seed_a].sse,
+                runs_b[seed_b].sse,
+                reference.sse,
+                horizons=horizons,
+                n_boot=n_boot,
+                ci_level=ci_level,
+                seed=bootstrap_seed,
+            )
+            for channel, dof in enumerate(dof_names):
+                for index, horizon in enumerate(horizons):
+                    rows.append(
+                        {
+                            "regime": regime,
+                            "model_a": label_a,
+                            "model_b": label_b,
+                            "seed": row_seed,
+                            "dof": dof,
+                            "horizon_samples": horizon,
+                            "horizon_s": horizon / fs_hz,
+                            # skill(a) - skill(b): positive means model_a is better.
+                            "skill_diff": float(difference[index, channel]),
+                            "ci_lo": float(lo[index, channel]),
+                            "ci_hi": float(hi[index, channel]),
+                            "n_realizations": runs_a[seed_a].n_keys,
+                            "n_boot": n_boot,
+                            "ci_level": ci_level,
+                            "bootstrap_seed": bootstrap_seed,
+                        }
+                    )
+    scored_deep = sorted(set(by_label) & set(CONTRAST_DEEP_MODELS))
+    if scored_deep and not rows:
+        raise ValueError(
+            f"deep models {scored_deep} were scored but no pair of PAIRED_CONTRASTS "
+            f"matched the run labels {sorted(by_label)}; a mistyped label there writes an "
+            f"empty contrast file rather than failing"
+        )
+    return pd.DataFrame(rows, columns=list(PAIRED_CONTRAST_COLUMNS))
+
+
 def run_experiment(
     cfg: ExperimentConfig,
     corpus_root: Path,
@@ -399,8 +693,8 @@ def run_experiment(
         cfg: The experiment configuration.
         corpus_root: Path to the Parquet corpus.
         results_dir: Directory the CSV and Markdown artifacts are written to. The
-            per-seed and per-cell tables are rewritten after every regime, so a failure
-            late in a four-regime run leaves the completed regimes on disk.
+            per-seed, per-cell and paired-contrast tables are rewritten after every regime,
+            so a failure late in a four-regime run leaves the completed regimes on disk.
         seeds: Override for ``cfg.seeds``. Fewer than three still raises downstream when
             the stochastic rows are aggregated; the override exists for smoke tests, which
             do not aggregate.
@@ -414,6 +708,14 @@ def run_experiment(
         The per-run table (``baselines_by_seed.csv``), one row per
         (model, regime, DOF, horizon, run). It is the source of truth; the aggregated
         table is derived from it.
+
+        ``paired_contrasts.csv`` is written alongside it whenever at least one pair of
+        :data:`PAIRED_CONTRASTS` is present in the config, with columns
+        :data:`PAIRED_CONTRAST_COLUMNS` and one row per (regime, pair, seed, DOF, horizon).
+        It is not returned: it is a second view of the same accumulators, and the caller
+        that wants it should read the file it is committed as. No file is written when no
+        configured pair is present, so its presence is never a promise of contrasts that
+        were not computed.
 
     Raises:
         ValueError: If the reference model is absent from the config, or if a requested
@@ -436,6 +738,7 @@ def run_experiment(
     by_cell: list[pd.DataFrame] = []
     control_results: list[ControlResult] = []
     heading_marginals: list[pd.DataFrame] = []
+    contrasts: list[pd.DataFrame] = []
 
     for regime in chosen:
         split = build_split(manifest, _as_regime(regime))
@@ -479,6 +782,9 @@ def run_experiment(
             fs_hz=experiment.data.fs_hz,
             num_workers=experiment.train.num_workers,
             device=device,
+            n_boot=BOOTSTRAP_N_BOOT,
+            ci_level=BOOTSTRAP_CI_LEVEL,
+            bootstrap_seed=BOOTSTRAP_SEED,
         )
         meta = pd.DataFrame(
             [
@@ -533,6 +839,30 @@ def run_experiment(
         write_table(pd.concat(by_seed, ignore_index=True), results_dir / "baselines_by_seed.csv")
         write_table(pd.concat(by_cell, ignore_index=True), results_dir / "baselines_by_cell.csv")
 
+        # Model-vs-model, from the accumulators the scoring pass above already returned:
+        # same realizations, same resample weights, no second evaluation and no second
+        # bootstrap draw. Two *unpaired* marginal intervals overlapping says nothing about a
+        # difference between models scored over identical realizations with strongly
+        # correlated errors, and reading them as if it did has already produced a wrong
+        # published conclusion here (``docs/protocol.md`` P3-D13, P3-D22).
+        #
+        # After the two writes above for the same reason the controls are: this can raise on
+        # a mistyped contrast label, and that legitimate stop must not also destroy the
+        # regime's own scored rows.
+        contrast = _contrast_frame(
+            accumulators,
+            regime=regime,
+            dof_names=test.target_columns,
+            horizons=experiment.data.horizons,
+            fs_hz=experiment.data.fs_hz,
+            persistence_key=f"{PERSISTENCE_LABEL}@0",
+        )
+        if not contrast.empty:
+            contrasts.append(contrast)
+            write_table(
+                pd.concat(contrasts, ignore_index=True), results_dir / "paired_contrasts.csv"
+            )
+
         if run_controls:
             control_results.extend(
                 _run_controls(
@@ -552,6 +882,8 @@ def run_experiment(
     per_run = pd.concat(by_seed, ignore_index=True)
     write_table(per_run, results_dir / "baselines_by_seed.csv")
     write_table(pd.concat(by_cell, ignore_index=True), results_dir / "baselines_by_cell.csv")
+    if contrasts:
+        write_table(pd.concat(contrasts, ignore_index=True), results_dir / "paired_contrasts.csv")
     aggregated = build_baselines_table(per_run)
     write_table(aggregated, results_dir / "baselines.csv")
     controls = controls_table(control_results) if control_results else None
@@ -561,6 +893,10 @@ def run_experiment(
         aggregated,
         controls=controls,
         by_heading=heading_marginals[0] if heading_marginals else None,
+        # Exactly the condition the `paired_contrasts.csv` write above is guarded by, so
+        # the provenance line names that file when and only when it exists: a
+        # baselines-only run configures no contrast pair and writes none.
+        with_contrasts=bool(contrasts),
         # Explicit, so the document cites the run's own artifacts. Defaulting it would
         # render provenance as bare filenames -- vaguer, but never wrong, which is why the
         # `imu` document previously pointing at the `ideal` CSVs was the failure worth

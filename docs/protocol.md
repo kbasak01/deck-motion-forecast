@@ -1153,3 +1153,633 @@ reference is weak in three quarters of the table.
 3. **The training budget is not adequate and must be re-derived.** All twelve `ideal` DLinear runs hit
    the 60-epoch cap. A TCN or Transformer on a `cond`-1e19 design will not be fixed-overhead-bound the
    way a 60 300-parameter linear map is (P3-D17), and `epochs_run` must be checked rather than assumed.
+
+---
+
+## Phase 4 — deep models
+
+Entries P4-D1 .. P4-D7 were written **before** the Gate 4 sweep completed, so that the gate
+restatement and the training budget are on record as decisions rather than as
+rationalisations of a result. The Gate 4 evidence section is added when the sweep lands.
+
+### P4-D1 — Gate 4 restated: threshold unchanged, cell moved. RECORDED 2026-08-28
+
+`docs/IMPLEMENTATION_PLAN.md` §Phase 4 states:
+
+> **Gate 4:** all deep models beat damped persistence at 3 s horizon on the `id` regime by a
+> margin exceeding the seed-to-seed standard deviation.
+
+**The cell is saturated and the reference is weak**, which are two independent problems and
+both were measured in Phase 3:
+
+- *Saturated.* AR(20) scores 0.9987 skill at 3 s on roll in `id` (Gate 3 outcome), and across
+  the whole `id` regime exceeds 0.8 skill in 28 of 36 cells. P3-D1 records why: the response
+  is narrowband with no process noise, and 3 s is a quarter of the 12 s roll period. A model
+  can pass this cell having learned nothing that discriminates it from a linear filter.
+- *Weak reference.* `damped_persistence` is beaten by the **zero-parameter** `window_mean` in
+  54 of 144 cells (P3-D20). "Beats damped persistence" is therefore not a floor that means
+  what it sounds like — in 37% of cells it is a lower bar than beating a constant.
+
+**Gate 4, as of this entry:**
+
+> All deep models beat the **strongest trivial baseline in the cell** — the better of
+> `damped_persistence` and `window_mean`, resolved per cell rather than assumed — at the
+> **decision horizon (10 s / 100 samples) on the binding DOF (pitch)** in the `id` regime, by
+> a margin exceeding the seed-to-seed standard deviation.
+
+The margin criterion is unchanged. What moves is the cell, by the same two arguments P3-D12
+used for Gate 3 and for the same reasons: 10 s is where four of six channels fall below 0.8
+skill and is the lead time a full-scale rotorcraft's commit-to-land decision needs; pitch is
+stiffer and more damped than the lightly-damped roll resonance, hence broader-band, hence the
+argmin at that horizon. 15 s was rejected as the gate cell in P3-D12 because pitch is
+saturated there (normalised RMSE 0.985), and that rejection stands.
+
+**The original cell is measured and reported anyway**, per the user instruction that a model
+failing to beat damped persistence by more than the seed std is itself the result. Both
+readings ship. This entry does not retroactively make the original criterion pass or fail;
+it records which one the gate is read at.
+
+**What `skill_std` actually measures. THIS ENTRY ORIGINALLY GOT THIS WRONG; see P4-D13.**
+`skill_std` is a ddof=1 standard deviation over exactly three seeds, and it includes both weight
+initialisation and data-order variance. An earlier version of this entry asserted that batch
+order was identical across seeds and that the spread was initialisation variance alone. That was
+false, and the correction is recorded in P4-D13 rather than silently edited away, because the
+claim was also rendered into `results/e02/gate4.md` and read by a reviewer.
+
+### P4-D2 — The training budget was re-derived; P3-D17's conclusion does not transfer
+
+Required by the Phase 4 carry-forward: "do not inherit the budget". P3-D17 measured DLinear at
+6.85 / 7.55 / 8.03 ms/step for batch 256 / 1024 / 4096 and concluded step cost is nearly flat in
+batch size, so 4x the batch buys ~3.6x less wall time. **That is a property of a 60 300-parameter
+linear map that is fixed-overhead-bound, and it is false for all three deep models.**
+
+Measured on the production geometry (A4000, bf16 autocast, H2D + forward + backward + clip +
+step, `torch.cuda.synchronize()` on both sides of the timed region):
+
+| model | n_params | 512 | 1024 | 2048 | s/epoch @1024 (step only) |
+|---|---:|---:|---:|---:|---:|
+| `dlinear` | 60 300 | 2.29 | 2.44 | 2.87 | 3.5 |
+| `tcn` | 196 804 | 20.34 | 38.60 | 75.24 | 55.2 |
+| `transformer` | 2 712 708 | 12.27 | 18.07 | 34.17 | 25.9 |
+| `lstm` | 317 828 | 10.16 | 17.93 | 35.26 | 25.7 |
+
+(ms/step.) For the deep models ms/step scales almost exactly **linearly** with batch, so
+s/epoch barely moves — `tcn` goes 58.2 -> 55.2 -> 53.8 s/epoch across a 4x batch range. Batch
+size is close to free for wall time here, so it is chosen for continuity with the Phase 3 sweep
+rather than for throughput: **batch 1024, lr 2e-3**, unchanged from `e01_baselines`.
+
+**Step timing understates epoch cost by ~40%.** An 18-epoch pilot on `id` (seed 0, one run per
+architecture, batch 1024, lr 2e-3) measured wall time including validation and the loader:
+
+| model | s/epoch measured | vs step-only | best_epoch | best val MSE | curve |
+|---|---:|---:|---:|---:|---|
+| `tcn` | 78.8 | +43% | **17 / 18** | 0.132155 | falling monotonically |
+| `transformer` | 46.2 | +78% | 16 / 18 | 0.130390 | near plateau, val bouncing |
+| `lstm` | 57.6 | +124% | **17 / 18** | **0.094530** | falling monotonically |
+
+**Epoch cap 60, and early stopping is expected not to fire.** Two of three models have their
+best epoch at the *last* epoch of the pilot and are still improving; `patience: 15` requires 16
+consecutive non-improving epochs and nothing is plateauing. `epochs_run` is recorded per run
+(P3-D23) and the outcome is reported rather than presented as convergence.
+
+The cap is nonetheless a real hyperparameter and not merely a stopping point: `dmf.train.loop._lr_at`
+sizes the warmup+cosine schedule by `epochs * steps_per_epoch`, so a run at cap 60 anneals to ~0
+by epoch 60, whereas the same 60 epochs drawn from a cap-120 schedule would stop mid-decay.
+Raising the cap therefore changes the trajectory of runs that stop early, not only of runs that
+hit it. 60 matches the Phase 3 nominal cap, which keeps the re-fitted `dlinear` row directly
+comparable to the P3-D19 measurement of the same model at the same cap.
+
+**Direction of the residual bias, since it cannot be removed within the budget.** The deep
+models are still improving when the cap bites, so their reported numbers **understate** them.
+For the question Gate 4 asks — do the deep models beat the trivial and linear baselines — that
+is the conservative direction. `dlinear_ols` is closed-form and therefore budget-independent, so
+the strongest linear baseline in the table cannot be handicapped by this choice at all.
+
+**Weight decay is applied to LayerNorm and bias parameters**, because `fit` gives AdamW one flat
+parameter group with no exclusions. This is conventionally suboptimal for the Transformer.
+It is left alone deliberately: excluding them for the Transformer and not for the others is
+per-model tuning, which the Gate 4 fairness requirement forbids and which the task explicitly
+ruled out.
+
+### P4-D3 — `nrmse` and `signal_std` implemented; P3-D5 closed in the source, not in the artifacts
+
+P3-D5 mandated normalised RMSE twice and recorded its own status as "recorded, not implemented".
+It is now implemented.
+
+`signal_std[h, c] = sqrt(syy/n - (sy/n)**2)` — the **population** standard deviation of the
+target at lead time exactly `h`, per channel, over the same `n` windows the row's RMSE is
+averaged over, in corpus units (deg, m, deg/s, m/s). `nrmse = rmse / signal_std`, dimensionless,
+so `nrmse == 1.0` is "no better than the partition mean" and lower is better. A zero or
+non-finite `signal_std` raises, following `skill_score`'s zero-denominator precedent, and the
+check runs only over the *reported* cells so a constant channel at an unrequested horizon does
+not fail a table that never quotes it.
+
+Three implementation facts worth recording:
+
+- **Accumulated once per batch, not once per model, and it is checked by identity.**
+  `evaluate_models` builds one `(n_keys, H, C_out)` float64 pair before the model loop and hands
+  the same two tensor objects to every model's accumulator, then raises if any accumulator does
+  not hold those objects by identity afterwards. Twelve models never sum the same float64 values
+  in twelve reduction orders and disagree in the last bits.
+- **The by-cell table stores raw `sy`/`syy`, not just derived columns.** `marginalize_cells`
+  re-derives `signal_std` from summed moments, because the standard deviation of a union of grid
+  cells is not the mean of their standard deviations — on a grid spanning four sea states it is
+  much larger.
+- **The streaming form loses accuracy in proportion to `(mean/std)**2`.** It agrees with a
+  two-pass NumPy `std` to 1e-12 relative on a zero-mean channel and to ~4e-9 on a channel offset
+  to 2000 standard deviations; both tolerances are pinned separately rather than hidden under one
+  loose bound. Harmless for this corpus — all six channels oscillate about zero — but a future
+  target with a large DC offset (an absolute position, a heading in degrees) needs a two-pass or
+  Welford form.
+
+**What is NOT fixed, and the wording of P3-D5 needs this correction.** P3-D5 says "this is a
+column, not a re-run". That is true prospectively only. Every committed Phase 3 artifact
+(`results/*.csv`, `results/imu/*.csv`) predates the column and still carries the pre-nrmse
+19-column header. `run_experiment` must re-fit every model to produce a scored table, so
+populating those columns for the completed nine-model sweep **is** a re-run of that sweep. The
+consequence: the normalised-RMSE figures quoted in P3-D3, P3-D4 and P3-D13 — and the 15 s
+rejection in P3-D12 that rests on one of them — remain unreproducible from `results/`. The
+Phase 4 sweep re-scores all nine baselines beside the three deep models and therefore carries
+`nrmse` for all twelve rows; the Phase 3 directories are left as the Gate 3 record and are not
+regenerated.
+
+**Which signal std, since P3-D5 does not say.** The denominator is the standard deviation of the
+partition actually being scored, per (lead time, channel) — not a training-split scale and not a
+corpus-wide constant. Within a regime this makes `nrmse` comparable across horizons and models,
+which is what P3-D5 asked for. Across regimes it compares two different denominators. That is
+the *desirable* reading for the P3-D7 `unseen_vessel` case — each hull's error as a fraction of
+that hull's own variability is exactly what removes the collapsing-persistence artefact — but it
+is not a like-for-like "same signal" comparison, and it is the same class of caveat as `ideal`
+vs `imu`.
+
+### P4-D4 — `paired_skill_difference_ci` wired; P3-D22's open item closed
+
+P3-D22 recorded the function as "implemented but not wired", and P3-D13 records a conclusion
+published wrong **twice**, the second time from reading two unpaired marginal medians as a
+paired contrast. `run_experiment` now computes 13 ordered contrasts per regime and writes
+`paired_contrasts.csv`:
+
+| pairs | claim supported |
+|---|---|
+| {`tcn`,`transformer`,`lstm`} x `ar20` | against the strongest fitted baseline / the Gate 3 subject |
+| {`tcn`,`transformer`,`lstm`} x `dlinear_ols` | against the *converged* linear map, so no deep model is credited with the P3-D19 optimisation gap |
+| {`tcn`,`transformer`,`lstm`} x `damped_persistence` | the reference Gate 4 names |
+| {`tcn`,`transformer`,`lstm`} x `window_mean` | against the zero-parameter forecast that beats persistence in 107/144 cells (P3-D20) |
+| `dlinear` vs `dlinear_ols` | the DLinear optimisation gap re-read at this epoch budget |
+
+`skill_diff = skill(a) - skill(b)`, positive meaning `model_a` is better, stated in the schema
+rather than left to be inferred. Pairing is seed-by-seed; where one side is deterministic, every
+seed of the stochastic side is paired against its single `@0` accumulator. **No aggregated view
+is emitted at all**, so there is no mean-of-intervals to misread — the defect P3-D22 corrected
+in `build_baselines_table` is not reintroduced here.
+
+The exactness is structural: `BOOTSTRAP_N_BOOT`, `BOOTSTRAP_CI_LEVEL` and `BOOTSTRAP_SEED` are
+passed explicitly to *both* `evaluate_models` and `paired_skill_difference_ci`, and a test
+asserts they still equal the runner's defaults, because `_bootstrap_counts` is a pure function
+of `(n_realizations, n_boot, seed)` and the pairing holds only while both sides draw identical
+multinomial counts. No second scoring pass and no re-drawn bootstrap — one matrix product per
+(pair, seed).
+
+Measured on the test fixture, the property the wiring exists for: paired interval width is a
+median 0.375 of the unpaired `width(a) + width(b)`, the marginals overlap in 15 of 18 cells
+while every paired interval excludes zero.
+
+**One correction to P3-D22.** It states that a calibrated seed-mean interval "needs the
+per-realization SSE tensors at scoring time — a re-run, not an aggregation, so it cannot be
+recovered in `report.py`". True of `report.py`; **not** true of `run_experiment`, where at
+contrast time those tensors are in hand and a seed-pooled interval is one more matrix product
+away. Not built — it is a different quantity from the paired contrast and was not in scope — but
+the "needs a re-run" framing holds only for the reporting layer.
+
+### P4-D5 — The Phase 4 table is not budget-matched, and the Transformer head is why
+
+Parameter counts at the production geometry (L=200, H=150, C_in=C_out=6), from
+`n_fitted_parameters`:
+
+| model | n_params | of which head | head share |
+|---|---:|---:|---:|
+| `dlinear` | 60 300 | — | — |
+| `ar20` | 108 900 | — | — |
+| `tcn` | 196 804 | 58 500 | 30% |
+| `lstm` | 317 828 | 116 100 | 37% |
+| `transformer` | **2 712 708** | **2 304 900** | **85%** |
+
+The Transformer is 14x the TCN and 45x DLinear, and essentially all of that is the
+flatten-and-project head the plan specifies (§Phase 4): `Linear(20*128 -> 150*6)`. It ships as
+specified. A pooled or last-token head would cut it to ~0.4 M and make the column look tidy,
+but it would change the architecture being compared, and shrinking the one model most likely to
+lose is indistinguishable from tuning it. The spread is reported beside the table instead.
+
+This project has now confounded capacity with its intended variable twice — the removed
+`dlinear_mc` at 36x, and `ar_attitude_only`'s first parametrisation at 2x (P3-D13) — so the
+spread is stated explicitly rather than left for a reader to compute.
+
+**The TCN head reads the last encoded timestep only**, giving 58 500 head parameters instead of
+the 11.5 M a flatten of `64 x 200` would cost. That is not a saving trick: because the receptive
+field (253) already covers the lookback (200), the final step is a function of every input
+sample, so flattening all 200 steps multiplies the head by 200 without adding information. The
+receptive-field precondition is what makes the cheap head the correct one.
+
+### P4-D6 — Two of the three deep models are not bitwise reproducible, and it is not a defect
+
+`set_seed` calls `torch.use_deterministic_algorithms(True, warn_only=False)` nowhere; it uses
+`warn_only=True`. Two consequences observed during the pilot:
+
+- the **cuDNN LSTM backward** is nondeterministic and warns rather than raises;
+- the **Flash Attention backward** is nondeterministic and warns rather than raises
+  (`aten/src/ATen/native/transformers/cuda/attention_backward.cu`), which affects the Transformer.
+
+So `lstm` and `transformer` carry a little run-to-run variance that `tcn` and `dlinear` do not.
+This is not a correctness problem — three seeds are reported, and CLAUDE.md non-negotiable 5 is
+satisfied — but the three-seed spreads are not measuring quite the same quantity across rows.
+Every SGD row's `skill_std` covers initialisation and data-order variance (P4-D13); those two
+models add kernel nondeterminism on top. Since the criterion compares each model's margin against
+*its own* spread, the noisier model faces the harder bar.
+Forcing `warn_only=False` would make the LSTM raise rather than run, so it is not an option
+without changing the architecture set.
+
+### P4-D7 — Stale window-count literals, and a guard that could not see them
+
+Three live sentences in `src/dmf/eval/` asserted a window count that P3-D6 superseded — the
+pre-revision 441 984, rounded to "~442 000" — together with a "half a gigabyte" array size that
+is wrong by 6x at `max_horizon = 150` (the array is ~3.1 GB). Found in `dmf/eval/__init__.py`
+and two passages of `dmf/eval/metrics.py`. All three are now structural statements with no
+literal.
+
+The interesting part is why they survived. `test_no_hardcoded_window_count_survives_in_the_reporting_modules`
+exists precisely to catch this — it was added by P3-D21 — but it iterated a **hardcoded
+two-module list**, `(report.py, runner.py)`, and so never looked at `__init__.py` or at
+`metrics.py`'s docstrings. The guard reproduced in miniature the duplication defect it exists to
+catch, which is the same failure P2-D5 and P3-D15 record in other places. It now globs
+`src/dmf/eval/*.py`, asserts the glob found the subpackage, and forbids **today's** count
+(434 304) as firmly as yesterday's, because the next horizon change moves it too. Lines citing
+a decision record stay exempt: naming a superseded number *as history* is the opposite of the
+defect.
+
+### P4-D8 — The Gate 4 read-out is repo code, and it reports two questions rather than one
+
+`src/dmf/eval/gate.py` + `scripts/gate4.py` (`make gate4`) compute the gate from the committed
+artifacts, so the gate number is reproducible rather than the output of an analysis script that
+was never committed. It writes `gate4.csv` and `gate4.md` beside the sweep's other tables. Both
+readings of P4-D1 are always computed and written; the process exit status is taken from
+Reading B, which is the reading the gate is read at.
+
+**`verdict` and `paired_verdict` are separate columns and are never merged.** The margin test
+("does the model beat the reference by more than its own seed spread?") and the paired bootstrap
+("does the realization-resampled skill difference exclude zero?") are different questions with
+different failure modes, and a margin can exceed the seed std while the paired interval still
+spans zero. Collapsing them into one verdict would hide exactly the disagreement that is worth
+seeing. `reference_pool` renders every candidate's skill in the cell, so P4-D1's
+"stronger of `damped_persistence` and `window_mean`" resolution is auditable from the row rather
+than trusted.
+
+**A NaN `skill_std` is `UNVERIFIED`, never `PASS`.** Deterministic rows carry `skill_std = NaN`
+by design (P3-D10); filling that with 0.0 would make every positive margin "exceed" it and turn
+the criterion into "is the margin positive". A deep model arriving with a NaN std, or with fewer
+than three seeds, is an error condition surfaced as `UNVERIFIED`: the row stays in the table body
+(non-negotiable 6), the reading does not pass, and the CLI exits non-zero. `margin == std` is
+`FAIL` — the criterion says *exceeding*, which is strict.
+
+**Four caveats the read-out prints in its own Notes section**, because three are properties of
+the artifacts rather than of the gate code and would otherwise be invisible at the point of use:
+
+1. `skill_std` covers initialisation **and** data-order variance (P4-D13), so the margin test
+   is against the full three-seed spread rather than a narrower one.
+2. `skill_std` is not the same quantity in every row (P4-D6): `lstm` and `transformer` carry
+   kernel nondeterminism that `tcn` and `dlinear` do not. Since the criterion compares each
+   model's margin against *its own* spread, the noisier model faces the harder bar.
+3. **The three per-seed paired intervals against a deterministic reference are correlated, not
+   independent.** `_pair_seeds` pairs every stochastic seed against the single `@0` deterministic
+   accumulator and `BOOTSTRAP_SEED` is fixed, so all three seeds draw identical multinomial
+   weights against an identical reference. "Every seed excludes zero" is three correlated
+   statements. The envelope reduction (min `ci_lo`, max `ci_hi`, mean `skill_diff`) is the
+   conservative choice and follows P3-D22's precedent, but it is not three-fold evidence and must
+   not be read as one.
+4. `nrmse_mean` is absent from any artifact written before P4-D3. The read-out degrades to a NaN
+   column and says so, rather than printing an empty column or failing.
+
+### P4-D9 — P4-D2's prediction was wrong: early stopping fired, and the larger cap made two models worse
+
+P4-D2 stated, from the 18-epoch pilot, that "early stopping is expected not to fire" because two
+of three models had their best epoch at the last pilot epoch and were still improving. **On the
+sweep it fired for two of the three deep models.** Recorded as a correction rather than edited
+into P4-D2, because the reasoning that produced the wrong prediction is the useful part.
+
+Measured on `id`, cap 60, batch 1024, lr 2e-3, patience 15:
+
+| model | `epochs_run` | `best_epoch` | outcome |
+|---|---|---|---|
+| `dlinear` | 60 / 60 / 60 | 59 / 59 / 58 | cap bound |
+| `tcn` | 60 / 60 / 60 | 59 / 59 / 58 | cap bound, still improving |
+| `transformer` | **33 / 29 / 41** | 16 / 12 / 24 | early stopped |
+| `lstm` | **33 / 32 / 34** | 16 / 15 / 17 | early stopped |
+
+**Why the pilot mispredicted it, and it is the cap-as-hyperparameter mechanism P4-D2 itself
+described.** `_lr_at` sizes the warmup+cosine schedule by `epochs * steps_per_epoch`. At the
+pilot's cap of 18 the learning rate annealed to ~0 by epoch 18, so validation loss fell
+monotonically to the last epoch and nothing plateaued — which is exactly what "still improving,
+so a larger cap will not early-stop" was read off. At cap 60 the same epochs are drawn from a
+schedule three times longer, so at epoch 16 the learning rate is still near its peak, validation
+loss plateaus and bounces, and patience 15 fires. **The pilot could not have predicted this,
+because the quantity it measured is not invariant to the cap it was measured at.** A budget pilot
+must be run at the cap it is being used to justify, or it measures a different optimisation
+problem.
+
+**The consequence is that the larger cap made two of the three models worse.** Best validation
+loss on `id`, seed 0 against seed 0, so the comparison is exact:
+
+| model | pilot, cap 18 | sweep, cap 60 | change |
+|---|---:|---:|---|
+| `tcn` | 0.132155 | **0.120901** | 8.5% better — it used all 60 epochs |
+| `transformer` | 0.130390 | 0.134548 | **3.2% worse** |
+| `lstm` | **0.094530** | 0.101515 | **7.4% worse** |
+
+The two models that early-stopped did so mid-anneal, checkpointing a best epoch reached while the
+learning rate was still high, and never got the low-lr refinement the cap-18 pilot gave them. So
+the shipped configuration is demonstrably *not* the best available for `transformer` and `lstm`,
+and this project knows it.
+
+**The cap was not changed, and that is deliberate.** Lowering it now — after measuring that a
+lower cap helps two specific architectures and hurts a third — would be selecting a
+hyperparameter on the results it produces, which is the failure the Gate 4 fairness requirement
+and CLAUDE.md non-negotiable 6 both exist to prevent. It would also be per-architecture tuning in
+all but name, since one cap cannot be simultaneously raised for `tcn` and lowered for the other
+two. The rule as written — one cap, one schedule policy, one stopping rule, chosen in advance and
+recorded before the run — is honoured, and its cost is reported here.
+
+**Direction of the resulting bias, which is not uniform across the table.** P4-D2 stated that the
+budget understates every deep model equally. That is now known to be wrong: `tcn` is understated
+(cap bound, still improving), while `transformer` and `lstm` are understated *differently* — not
+by a truncated budget but by an unfavourable interaction between a long cosine schedule and an
+early stop. Any statement of the form "architecture X beats architecture Y" in this phase carries
+that asymmetry. It does not threaten the Gate 4 verdict, which all three models clear by two
+orders of magnitude more than their seed spread, but it does bound how finely the three deep
+models can be ranked against *each other*.
+
+**What a Phase 5 that wanted a fair architecture ranking would have to do** — stated because
+Phase 5 selects "the best point model from Phase 4": decouple the schedule length from the
+stopping criterion, either by sizing the cosine over a fixed horizon independent of the cap, or
+by disabling early stopping and reporting the whole curve. That is a change to `dmf.train.loop`
+and to every committed comparison, so it is not made mid-phase.
+
+### P4-D10 — The re-scored Phase 3 rows reproduce Phase 3 exactly
+
+The twelve-model design (P4-D2, `e02_deep.yaml`) re-fits and re-scores the nine baselines rather
+than joining to the committed Gate 3 tables. That makes the Phase 3 numbers a **positive control
+on the whole pipeline**, and they land:
+
+| quantity | Phase 3 record | Phase 4 re-run (`id`) |
+|---|---|---|
+| `dlinear` best val loss, 3 seeds | 0.432852 +/- 0.000007 (P3-D19) | 0.432844 / 0.432857 / 0.432855, mean **0.432852** |
+| `ar20` skill, pitch @ 100 samples | 0.5446 (P3-D12, the Gate 3 cell) | **0.5446** |
+| `dlinear_ols` skill, same cell | 0.5683 (P3 carry-forward 1) | **0.5683** |
+
+Nothing about the corpus, the splits, the normalisation or the closed-form solvers moved under
+the `nrmse` and paired-contrast changes. `dlinear` also reproduces P3-D19's finding that the cap
+binds: `epochs_run = 60` in all three seeds, `best_epoch` 58-59.
+
+**`nrmse` passes its definitional check on real data.** At `id`, pitch, 100 samples:
+`window_mean` scores `nrmse = 1.0005` and `damped_persistence` 1.0005 — both are essentially the
+partition-mean forecast at that lead, and `nrmse == 1.0` is defined as "no better than the
+partition mean", so this is the column validating itself against a known answer rather than
+against a fixture. `persistence` scores **1.2562**: at a 10 s lead on this signal the skill-score
+denominator is *worse than predicting the mean*, which is P3-D5's and P3-D20's argument made
+directly visible in a column for the first time.
+
+### Gate 4 evidence
+
+Sweep: `configs/experiment/e02_deep.yaml`, `ideal`, 2026-08-28 20:38 -> 2026-08-30 04:15
+(31 h 37 m, exit 0). Artifacts in `results/e02/`: eight files (six from the sweep, plus `gate4.csv` and `gate4.md`). `results/` and `results/imu/` are
+the Gate 3 record and are untouched.
+
+**Gate 4 PASSES on both readings**, read by `scripts/gate4.py` from the committed CSVs
+(`results/e02/gate4.{csv,md}`):
+
+| Reading | Cell | Result |
+|---|---|---|
+| A — original criterion, verbatim | `id`, 3 s, vs `damped_persistence` | **18 of 18 PASS** (3 models x 6 DOFs) |
+| B — restated (P4-D1), the gate | `id`, 10 s, pitch, vs stronger trivial | **3 of 3 PASS** |
+
+Every row's paired bootstrap interval also excludes zero in the model's favour, so the margin
+test and the resampling test agree here. Reading B margins: `lstm` +0.5023, `tcn` +0.4690,
+`transformer` +0.4423, against seed spreads of 0.0016, 0.0006 and 0.0032 — the margins exceed
+the spread by two to three orders of magnitude, which is why the P4-D1 caveat about `skill_std` being
+initialisation-only variance — since **retracted as false, see P4-D13** — does not change the
+verdict either way.
+
+| Criterion | Evidence |
+|---|---|
+| Table covers every model / horizon / DOF / regime | **1728 rows** = 12 models x 4 regimes x 6 DOFs x 6 horizons; schema equals `BASELINES_COLUMNS` |
+| Reference is exact | `persistence` skill **bitwise 0.0** in all 144 rows; `rmse_persistence` identical across all twelve models in every cell |
+| Not attributable to leakage | Shuffle control **0 failing rows of 144**; worst excess +0.0095 against a 2% tolerance |
+| Three seeds on every stochastic row | All four SGD models carry `n_seeds = 3`; deterministic rows `n/a` per P3-D10 |
+| Per-cell table decomposes the headline | Joins with **0 unmatched of 1728** |
+| No run diverged | `best_val_loss` finite in all 36 deep runs |
+| Optimisation state traceable | `epochs_run` per run: `tcn` 60/60/60 (cap bound), `transformer` 29-60, `lstm` 30-44, `dlinear` 60 in 12 of 12 |
+| Phase 3 reproduced as a positive control | P4-D10: `dlinear` val loss, `ar20` and `dlinear_ols` gate skill all reproduce to four decimals |
+
+### P4-D11 — What Gate 4 does *not* say: the deep models lose to a linear model on half the corpus
+
+**The counts in this entry are exact; the framing in its heading does not survive. See P4-D14**,
+which shows the result reverses for `tcn` and ties for `lstm` once `unseen_heading` — which this
+very entry argues is a corpus artifact — is excluded.
+
+Gate 4 is read on `id`, and P3's carry-forward said in advance that `id` cannot separate
+architectures. It cannot. The gate passes and the honest headline is close to its opposite.
+
+**Skill at the gate cell (pitch, 10 s) across all four regimes:**
+
+| model | n_params | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` |
+|---|---:|---:|---:|---:|---:|
+| `damped_persistence` | 6 | 0.3657 | 0.3082 | 0.2247 | 0.1724 |
+| `ar20` | 108 900 | 0.5446 | 0.1584 | **-49.43** | 0.4786 |
+| `dlinear` | 60 300 | 0.5147 | **0.4775** | 0.5191 | 0.5019 |
+| `dlinear_ols` | 60 300 | 0.5683 | 0.4499 | **0.5775** | 0.5344 |
+| `tcn` | 196 804 | 0.8346 | 0.2772 | **-81.09** | **0.8298** |
+| `transformer` | 2 712 708 | 0.8080 | 0.1953 | **-79.22** | 0.7250 |
+| `lstm` | 317 828 | **0.8680** | 0.3437 | **-279.44** | 0.8007 |
+
+**Paired contrasts against `dlinear_ols`** (envelope over seeds; 36 cells per regime, counted as
+the paired interval excluding zero in favour of the deep model / of `dlinear_ols` / spanning zero):
+
+| regime | `tcn` | `transformer` | `lstm` |
+|---|---|---|---|
+| `id` | 27 / 7 / 2 | 25 / 10 / 1 | 27 / 9 / 0 |
+| `unseen_seastate` | 17 / 15 / 4 | 9 / 21 / 6 | 10 / 20 / 6 |
+| `unseen_heading` | **0 / 32 / 4** | **0 / 36 / 0** | **0 / 35 / 1** |
+| `unseen_vessel` | 16 / 20 / 0 | 10 / 24 / 2 | 12 / 20 / 4 |
+| **all 144** | **60 / 74** | **44 / 91** | **49 / 84** |
+
+**All three deep models lose more cells to `dlinear_ols` than they win, across the full table.**
+A 60 300-parameter closed-form linear map beats a 2.7 M-parameter transformer in 91 of 144 cells.
+This is `docs/IMPLEMENTATION_PLAN.md` §0.3 — "include a linear model you might lose to" — landing,
+and it is reported in the README body per CLAUDE.md non-negotiable 6.
+
+**Robustness, counting cells where `nrmse > 1.0`, i.e. the model is worse than simply predicting
+the scored partition's mean** (of 144):
+
+| `dlinear_ols` | `dlinear` | `ar40` | `ar20` | `ar10` | `tcn` | `transformer` | `lstm` |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| **8** | 10 | 16 | 17 | 18 | 25 | 26 | **27** |
+
+By this measure the closed-form linear model is the **most robust model in the table** and the
+three deep models are the **least robust of the fitted ones**. The column that makes this legible
+did not exist before P4-D3.
+
+**Where the deep models do win, they win large**: `id` (all three, decisively) and
+`unseen_vessel` at the gate cell (`tcn` +0.2955 over `dlinear_ols`, interval [+0.2647, +0.3256]).
+The `unseen_vessel` result is the interesting one — a held-out hull, and the TCN transfers better
+than the linear model at the decision horizon on pitch — but it does **not** hold across that
+regime's other cells, where `tcn` still loses 20 of 36. The gate cell is not representative of its
+own regime, which is the same lesson P3-D12 recorded for Gate 3.
+
+**`unseen_heading` is a rout, and the mechanism is P1-D2, not a training failure.** That regime's
+test set *is* beam seas, where the pitch heading factor is clamped at `eps = 0.05` (~26 dB down),
+so test-set pitch is a residual floor rather than pitch physics. A model fitted where pitch is a
+real signal imposes a fitted amplitude on a channel that has none, and the damage scales with how
+much cross-channel structure the model learned: the two channel-independent DLinear rows — which
+forecast pitch from pitch history alone and structurally cannot import amplitude from roll — are
+the only fitted models that survive, and they are the *best* models in the cell. AR(20) at -49
+was already recorded in P3-D7; the deep models reach -79, -81 and -279. This is a property of the
+corpus construction, and P1-D2 already flagged those floors as an engineering stand-in belonging
+in the README limitations section. It is not evidence that attention or recurrence is unsound.
+
+### P4-D12 — The DLinear optimisation gap did not close at cap 60
+
+`dlinear` hit `epochs_run = 60` in **12 of 12** runs, exactly as P3-D19/P3-D23 recorded at the
+same cap. The paired contrast against its own closed-form optimum: `dlinear_ols` is better in
+**108 of 144 cells**, `dlinear` in 27, 9 span zero. So the shortfall P3-D19 measured at 0.30% of
+the validation loss is still present and still moves per-cell skill, and the two rows must keep
+shipping together — a `deep-vs-dlinear` statement made against the SGD row alone would still be
+absorbing an optimisation gap into an architecture claim.
+
+### P4-D13 — Correction: `skill_std` is not initialisation variance only
+
+P4-D1 and P4-D8 originally asserted that `dmf.train.experiment._fit_one` shares one seeded
+loader across all three seeds, so "batch order is identical across seeds and only weight
+initialisation varies", making `skill_std` a narrower spread than the Gate 4 wording intends.
+**That is false**, and it was rendered into `results/e02/gate4.md` as well as into this file. It
+was caught by the Gate 4 adversarial review, not by the person who wrote it three times.
+
+`dmf.data.dataset.make_dataloader` constructs one `torch.Generator` seeded at `seed`, which the
+`RandomSampler` consumes. **The generator's state advances every epoch and is never reset**, and
+`set_seed` does not touch it — it is a private object on the loader, not a global RNG. Verified
+directly: four successive epochs drawn from one seeded loader give four different permutations.
+Since `_fit_one` builds the loader *before* the seed loop, seed 1 begins from the state seed 0's
+run left behind. Batch order therefore differs across seeds and `skill_std` includes data-order
+variance as the criterion intends.
+
+The error was in the conservative direction — the margin test is against the full spread, not a
+narrower one — so no verdict changes. Gate 4's Reading B margins (0.4423 to 0.5023) exceed the
+three-seed spreads (0.0006 to 0.0032) by two to three orders of magnitude either way.
+
+**What is true, and is the more interesting property:** the three seeds are *consecutive segments
+of one generator stream*, not independent draws. Seed k's batch order depends on how many epochs
+seeds 0..k-1 ran. Because `transformer` and `lstm` early-stop at different epochs per seed
+(P4-D9), the data order seed 2 receives is a function of seed 0's and seed 1's stopping points. A
+run is still exactly reproducible from its config, but the seeds are not exchangeable, and
+changing the epoch cap changes the data order of every seed after the first. Recorded because it
+bounds what a three-seed spread means here, and because no test asserts it.
+
+### P4-D14 — What P4-D11's headline does not survive, found by the Gate 4 audit
+
+P4-D11 states that all three deep models lose more cells to `dlinear_ols` than they win across
+144 cells. The counts are exact. **The interpretation does not survive two restrictions this
+protocol itself endorses**, and the audit was right to call the framing overstated.
+
+**Restriction 1 — drop `unseen_heading`,** the regime P4-D11 argues is a corpus artifact:
+
+| | all 144 | excluding `unseen_heading` (108) |
+|---|---|---|
+| `tcn` | 60 - 74 | **60 - 42** (reverses) |
+| `lstm` | 49 - 84 | **49 - 49** (ties) |
+| `transformer` | 44 - 91 | 44 - 55 (still loses) |
+
+32 of `tcn`'s 74 losses, 35 of `lstm`'s 84 and 36 of `transformer`'s 91 are in that one regime.
+Asserting the aggregate and then arguing three paragraphs later that the regime is an artifact
+is having it both ways. **Corrected reading: `tcn` wins outside `unseen_heading`, `lstm` ties,
+`transformer` loses.**
+
+**Restriction 2 — the gate is read in the horizon band that most favours the deep models.**
+Deep vs `dlinear_ols`, excluding `unseen_heading`, split by lead time:
+
+| band | `tcn` | `transformer` | `lstm` |
+|---|---|---|---|
+| **1-5 s** (72 cells) — the operational band CLAUDE.md §1 names | 34 - 34 | 19 - 47 | 23 - 42 |
+| **10-15 s** (36 cells) — where Gate 4 Reading B is read | **26 - 8** | **25 - 8** | **26 - 7** |
+
+The deep models' advantage is concentrated at long lead times. In the 1-5 s band that the
+project exists to serve, `tcn` ties the linear model and the other two lose to it. Reading B's
+10 s cell was pre-registered in P4-D1 before the sweep landed and on Gate-3-era reasoning, so
+this is not post-hoc cell selection — but the consequence was unstated and is stated now: **the
+gate is read where the deep models look best.**
+
+**Restriction 3 — the robustness gap is also carried by `unseen_heading`.** P4-D11's
+`nrmse > 1.0` row (8 for `dlinear_ols`, 27 for `lstm`) becomes, over the other three regimes and
+listing **every** fitted model rather than a subset: `ar40` 6, `ar_attitude_only` 6,
+`dlinear_ols` 7, `ar20` 7, `ar10` 8, `dlinear` 9, `lstm` 9, `tcn` 10, `transformer` 12.
+
+Two corrections to how this was first written, both caught by the Gate 4 re-review. The worst-case
+ratio falls from 3.4x (`lstm` 27 / `dlinear_ols` 8) to **1.7x** (`transformer` 12 / 7), not the
+1.3x first stated — that paired a worst case before with a non-worst case after. And
+**`dlinear_ols` is not the most robust model once `unseen_heading` is dropped**: `ar40` and
+`ar_attitude_only` are marginally better at 6. The first version of this entry asserted the
+superlative while omitting the three `ar*` rows that falsify it, which is the omission
+CLAUDE.md non-negotiable 6 forbids, committed inside the entry written to correct an
+overstatement. The all-144 claim in P4-D11 — `dlinear_ols` lowest of all twelve at 8 — is true
+as stated; the excluding-`unseen_heading` version is not.
+
+**Restriction 4 — the two models carrying most of the loss column are shipped in a configuration
+this project measured as worse than one it already ran.** P4-D9 records `transformer` and `lstm`
+at cap 60 as 3.2% and 7.4% worse than the cap-18 pilot, and scoped its bias caveat to deep-vs-deep
+ranking. That scope was too narrow: "`dlinear_ols` beats `transformer` in 91 of 144 cells" is a
+statement of exactly that form and runs in the direction of the known handicap. The caveat applies
+to every deep-vs-baseline count in P4-D11, not only to the ranking among the three deep models.
+
+### P4-D15 — Two omissions from the Gate 4 evidence table
+
+**The untrained control's outcome was omitted.** The evidence table cited the shuffle control
+(0 failing of 144) and not the untrained control, which **fails 76 of 144 rows** (worst excess
++0.787). The failure is expected and was predicted: P3-D9 records that a small-init random linear
+map emits approximately the window mean, which beats persistence past ~2 s, so the plan's literal
+criterion ("a random-init model must score worse than persistence") is wrong for this task, and
+the criterion is kept with its failures reported rather than the tolerance tuned. Quoting only the
+control that passed is the defect, not the failing control.
+
+**There is no untrained control for any deep model.** `_run_controls` takes the subject as
+`sgd_cfgs[0]`, which `e02_deep.yaml` deliberately keeps as `dlinear` (for continuity with the
+P3-D9 record). So the untrained control in this phase is run on the linear baseline, and none of
+the three models Gate 4 is about has one. Recorded rather than fixed mid-phase.
+
+### P4-D16 — The corpus makes a linear forecaster optimal by construction
+
+The most important limitation on every model-vs-model claim in this phase, and it is structural.
+
+`dmf.sim.response` applies a linear second-order RAO to a 299-component random-phase sinusoid
+superposition. Every realization is exactly `sum_i A_i cos(w_e,i t + psi_i)` with **no process
+noise anywhere in the generator** (P3-D1). A finite sum of sinusoids satisfies an exact linear
+recursion, so the Bayes-optimal forecaster for this corpus **is linear**, and enough lags of a
+linear model can identify the system rather than approximate it — which is exactly what P3-D1
+measured when AR(20) reached 0.9987 skill.
+
+The README's existing caveat says the achievable-skill ceiling is inflated and that "only
+relative comparisons and out-of-distribution degradation should be read as findings". For a
+*linear-versus-nonlinear* comparison that is backwards: the relative comparison is the one the
+generator prejudges. "A closed-form linear model is competitive with, or beats, three deep
+architectures" is a substantially weaker claim on a noiseless linear system than it would be on a
+stochastic process, and it is not evidence about how these architectures would rank on real deck
+motion, which has process noise, nonlinear roll damping and short-crested excitation.
+
+Anti-periodicity is handled and is not the explanation (`jitter_frequencies: true`,
+`n_components: 299`, asserted in `tests/test_spectra.py`), and the 1 s skills of 0.999 are the
+signature of the deterministic-superposition structure rather than of leakage — the shuffle
+control passes 144 of 144.
+
+### P4-D17 — 144 cells are not 144 independent tests
+
+The win/loss counts throughout P4-D11 and P4-D14 are 6 DOFs x 6 horizons x 4 regimes over the
+same realizations, with the rate channels being exact frequency-domain derivatives of the
+position channels (P1-D5), all bootstrapped at 95% with no multiplicity control. They are a
+**description of the table**, not 144 hypothesis tests, and a count of "cells where the interval
+excludes zero" should not be read as a family-wise error-controlled result. P4-D8 caveat 3
+records the smaller version of this for the three-seed envelope; this is the larger one.

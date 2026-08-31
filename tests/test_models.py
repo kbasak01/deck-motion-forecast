@@ -56,6 +56,7 @@ degrees per second for their rates, metres for heave and metres per second for h
 hertz for ``fs_hz``. Model inputs and outputs are dimensionless.
 """
 
+import inspect
 from dataclasses import replace
 from pathlib import Path
 
@@ -73,6 +74,7 @@ from dmf.models.ar import ARForecaster, lag_features
 from dmf.models.base import BaseForecaster
 from dmf.models.dlinear import DLinear, moving_average, series_decompose
 from dmf.models.dlinear_ols import DLinearOLS
+from dmf.models.lstm import LSTMForecaster
 from dmf.models.persistence import (
     TAU_WINDOW_MEAN,
     DampedPersistence,
@@ -82,6 +84,8 @@ from dmf.models.persistence import (
     fit_decay_constant,
     solve_decay_tau,
 )
+from dmf.models.tcn import TCN, TemporalBlock
+from dmf.models.transformer import PatchEmbedding, TransformerForecaster
 from dmf.models.window_mean import WindowMean
 from dmf.train.closed_form import (
     DecompMoments,
@@ -137,6 +141,27 @@ BASELINE_KEYS: tuple[str, ...] = (
     "dlinear_ols",
 )
 
+#: The Phase 4 registry keys. Kept separate from :data:`BASELINE_KEYS` because the two sets
+#: answer different questions -- the baselines decide whether the deep models are worth
+#: training at all, and the Gate 3 sweep that pins the nine baseline labels must not start
+#: tracking whatever Phase 4 adds.
+DEEP_KEYS: tuple[str, ...] = ("tcn", "transformer", "lstm")
+
+#: A second geometry for the deep-model shape tests, pinned locally. ``SYNTH_C_OUT <
+#: SYNTH_C_IN`` makes the target set a *proper* prefix of the inputs, which the shipped task
+#: no longer supplies; ``SYNTH_LOOKBACK`` is a multiple of the transformer's default
+#: ``patch_len`` and is covered by the TCN's default receptive field, so the same pair of
+#: numbers exercises all three architectures.
+SYNTH_LOOKBACK = 60
+SYNTH_HORIZON = 20
+
+#: ``(lookback, max_horizon, C_in, C_out)`` pairs the deep shape tests run over: the shipped
+#: task as configured, and the synthetic proper-prefix geometry above.
+DEEP_GEOMETRIES: tuple[tuple[int, int, int, int], ...] = (
+    (PRODUCTION_SPEC.lookback, PRODUCTION_SPEC.max_horizon, N_IN, N_OUT),
+    (SYNTH_LOOKBACK, SYNTH_HORIZON, SYNTH_C_IN, SYNTH_C_OUT),
+)
+
 
 def _small_dataset(
     corpus: Path, cfg: DataConfig, regime: Regime, partition: str
@@ -177,9 +202,14 @@ def _stack(dataset: DeckMotionDataset) -> tuple[torch.Tensor, torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", BASELINE_KEYS)
+@pytest.mark.parametrize("key", BASELINE_KEYS + DEEP_KEYS)
 def test_importing_dmf_models_populates_the_registry(key: str) -> None:
-    """An empty registry from import order is a classic bug; it presents as a config typo."""
+    """An empty registry from import order is a classic bug; it presents as a config typo.
+
+    A model file that is never imported by ``dmf/models/__init__.py`` registers nothing and
+    fails four regimes into a sweep as ``KeyError: unknown model``, which reads like a typo
+    in the experiment config and sends the reader to the wrong file.
+    """
     import dmf.models  # noqa: F401
 
     assert key in MODEL_REGISTRY
@@ -217,6 +247,9 @@ def test_build_model_raises_on_an_unknown_constructor_argument() -> None:
         "ar_attitude_only",
         "dlinear",
         "dlinear_ols",
+        "tcn",
+        "transformer",
+        "lstm",
     ],
 )
 def test_every_shipped_model_config_builds(stem: str) -> None:
@@ -251,6 +284,52 @@ def test_the_baselines_experiment_configs_load_with_nine_models_and_three_seeds(
     ]
     assert len(cfg.seeds) >= 3
     assert set(cfg.regimes) == set(REGIMES)
+
+
+def test_the_deep_experiment_config_carries_the_baselines_and_the_deep_models() -> None:
+    """Gate 4's table must be ONE run, not a join of two.
+
+    The nine Phase 3 baselines are re-scored beside the three deep architectures so that
+    every row shares one pipeline, one normalisation, one horizon list and one
+    early-stopping rule. Two of those nine are load-bearing rather than decorative:
+    `dlinear` because the Phase 3 row hit its epoch cap in 22 of 24 runs (P3-D19, P3-D23)
+    and comparing against it would credit a deep model with an optimisation gap, and
+    `dlinear_ols` because it is closed-form and therefore the one linear baseline no epoch
+    budget can handicap.
+
+    Deep models come after `dlinear`/`dlinear_ols`: `_run_controls` takes the untrained
+    control's subject to be the first SGD config, and reordering would silently move the
+    control off DLinear (P3-D9).
+    """
+    from dmf.eval.report import MIN_SEEDS
+
+    cfg = load_experiment(CONFIG_ROOT / "experiment" / "e02_deep.yaml")
+    labels = [m.label for m in cfg.models]
+    assert labels == [
+        "persistence",
+        "window_mean",
+        "damped_persistence",
+        "ar10",
+        "ar20",
+        "ar40",
+        "ar_attitude_only",
+        "dlinear",
+        "dlinear_ols",
+        "tcn",
+        "transformer",
+        "lstm",
+    ]
+    assert labels[0] == "persistence", "the skill denominator must be scored first"
+    sgd = [m.label for m in cfg.models if MODEL_REGISTRY[m.name].FIT_KIND == "sgd"]
+    assert sgd[0] == "dlinear", "the untrained control's subject must stay DLinear (P3-D9)"
+    assert set(sgd) == {"dlinear", "tcn", "transformer", "lstm"}
+    assert len(cfg.seeds) >= MIN_SEEDS
+    assert set(cfg.regimes) == set(REGIMES)
+    # One budget for every SGD row is the Gate 4 fairness property, and TrainConfig has no
+    # per-model override, so this is asserted structurally rather than described in a comment.
+    assert cfg.train.epochs == 60
+    assert cfg.train.batch_size == 1024
+    assert cfg.train.patience == 15
 
 
 @pytest.mark.parametrize("stem", ["e01_baselines", "e01_baselines_imu"])
@@ -1307,6 +1386,233 @@ def test_window_mean_fits_nothing_and_says_so() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 deep models: TCN, transformer, LSTM
+# ---------------------------------------------------------------------------
+
+
+def _deep_model(key: str, geometry: tuple[int, int, int, int], n_quantiles: int) -> BaseForecaster:
+    """Build one deep model at a given geometry, at its shipped architecture defaults.
+
+    Args:
+        key: Registry key, one of :data:`DEEP_KEYS`.
+        geometry: ``(lookback, max_horizon, C_in, C_out)``, samples and channels.
+        n_quantiles: Quantile count ``Q``, or 0 for a point head.
+
+    Returns:
+        The model, in eval mode so that dropout is off and two forward passes on the same
+        input are bitwise equal -- which every perturbation test below relies on.
+    """
+    lookback, horizon, n_in, n_out = geometry
+    model: BaseForecaster = MODEL_REGISTRY[key](
+        lookback=lookback,
+        max_horizon=horizon,
+        n_input_channels=n_in,
+        n_target_channels=n_out,
+        n_quantiles=n_quantiles,
+    )
+    return model.eval()
+
+
+@pytest.mark.parametrize("n_quantiles", [0, 9])
+@pytest.mark.parametrize("geometry", DEEP_GEOMETRIES, ids=["task", "synthetic"])
+def test_tcn_shapes(geometry: tuple[int, int, int, int], n_quantiles: int) -> None:
+    lookback, horizon, n_in, n_out = geometry
+    model = TCN(lookback, horizon, n_in, n_out, n_quantiles=n_quantiles).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(3, lookback, n_in))
+    expected = (3, horizon, n_out, n_quantiles) if n_quantiles else (3, horizon, n_out)
+    assert tuple(out.shape) == expected == model.output_shape(3)
+    assert model.receptive_field >= lookback
+
+
+@pytest.mark.parametrize("n_quantiles", [0, 9])
+@pytest.mark.parametrize("geometry", DEEP_GEOMETRIES, ids=["task", "synthetic"])
+def test_transformer_shapes(geometry: tuple[int, int, int, int], n_quantiles: int) -> None:
+    lookback, horizon, n_in, n_out = geometry
+    model = TransformerForecaster(lookback, horizon, n_in, n_out, n_quantiles=n_quantiles).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(3, lookback, n_in))
+    expected = (3, horizon, n_out, n_quantiles) if n_quantiles else (3, horizon, n_out)
+    assert tuple(out.shape) == expected == model.output_shape(3)
+    assert model.n_tokens == lookback // model.patch_len
+
+
+@pytest.mark.parametrize("n_quantiles", [0, 9])
+@pytest.mark.parametrize("geometry", DEEP_GEOMETRIES, ids=["task", "synthetic"])
+def test_lstm_shapes(geometry: tuple[int, int, int, int], n_quantiles: int) -> None:
+    lookback, horizon, n_in, n_out = geometry
+    model = LSTMForecaster(lookback, horizon, n_in, n_out, n_quantiles=n_quantiles).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(3, lookback, n_in))
+    expected = (3, horizon, n_out, n_quantiles) if n_quantiles else (3, horizon, n_out)
+    assert tuple(out.shape) == expected == model.output_shape(3)
+
+
+def test_patch_embedding_tokenises_the_window(rng: np.random.Generator) -> None:
+    """20 tokens of 10 samples x C_in for the shipped 200-sample lookback."""
+    embed = PatchEmbedding(patch_len=10, n_input_channels=SYNTH_C_IN, d_model=16)
+    x = torch.from_numpy(rng.normal(size=(2, SYNTH_LOOKBACK, SYNTH_C_IN)).astype(np.float32))
+    with torch.no_grad():
+        tokens = embed(x)
+    assert tuple(tokens.shape) == (2, SYNTH_LOOKBACK // 10, 16)
+
+
+def test_patch_embedding_rejects_a_ragged_window() -> None:
+    embed = PatchEmbedding(patch_len=10, n_input_channels=SYNTH_C_IN, d_model=16)
+    with pytest.raises(ValueError, match="multiple of patch_len"):
+        embed(torch.zeros(2, 55, SYNTH_C_IN))
+
+
+def test_transformer_rejects_a_lookback_that_does_not_tile() -> None:
+    with pytest.raises(ValueError, match="multiple of patch_len"):
+        TransformerForecaster(55, SYNTH_HORIZON, SYNTH_C_IN, SYNTH_C_OUT, patch_len=10)
+
+
+def test_transformer_rejects_a_head_count_that_does_not_divide_d_model() -> None:
+    with pytest.raises(ValueError, match="divisible by n_heads"):
+        TransformerForecaster(
+            SYNTH_LOOKBACK, SYNTH_HORIZON, SYNTH_C_IN, SYNTH_C_OUT, d_model=128, n_heads=5
+        )
+
+
+def test_temporal_block_output_is_causal(rng: np.random.Generator) -> None:
+    """Perturbing samples after ``cut`` must leave the first ``cut`` outputs bitwise equal.
+
+    This is the assertion that catches symmetric padding, and it cannot be made at the model
+    level: :class:`~dmf.models.tcn.TCN` reads only the **last** encoded step, which legitimately
+    depends on every input sample, so any whole-model perturbation test is vacuous in one
+    direction or the other. It is therefore asserted on the block's ``(B, C, L)`` feature map,
+    where output step ``t`` must be a function of inputs ``<= t`` alone. The second half is the
+    non-vacuity control: a block that ignored its input entirely would pass the first
+    assertion.
+    """
+    block = TemporalBlock(SYNTH_C_IN, 8, kernel_size=3, dilation=4, dropout=0.0).eval()
+    x = torch.from_numpy(rng.normal(size=(2, SYNTH_C_IN, 40)).astype(np.float32))
+    cut = 25
+    perturbed = x.clone()
+    perturbed[:, :, cut:] += 100.0
+    with torch.no_grad():
+        base_out, perturbed_out = block(x), block(perturbed)
+    assert torch.equal(base_out[:, :, :cut], perturbed_out[:, :, :cut])
+    assert not torch.equal(base_out[:, :, cut:], perturbed_out[:, :, cut:])
+
+
+def test_the_whole_tcn_stack_is_causal(rng: np.random.Generator) -> None:
+    """The same control over all six residual blocks, so one mis-padded block cannot hide.
+
+    ``TCN.blocks`` is the stack before the horizon head; running it directly is what makes
+    the assertion non-vacuous, for the reason given in
+    :func:`test_temporal_block_output_is_causal`.
+    """
+    model = TCN(
+        SYNTH_LOOKBACK, SYNTH_HORIZON, SYNTH_C_IN, SYNTH_C_OUT, n_filters=8, dropout=0.0
+    ).eval()
+    x = torch.from_numpy(rng.normal(size=(2, SYNTH_LOOKBACK, SYNTH_C_IN)).astype(np.float32))
+    cut = SYNTH_LOOKBACK // 2
+    perturbed = x.clone()
+    perturbed[:, cut:, :] += 100.0
+    with torch.no_grad():
+        base_feat = model.blocks(x.transpose(1, 2))
+        perturbed_feat = model.blocks(perturbed.transpose(1, 2))
+        changed = not torch.equal(model(x), model(perturbed))
+    assert torch.equal(base_feat[:, :, :cut], perturbed_feat[:, :, :cut])
+    assert not torch.equal(base_feat[:, :, cut:], perturbed_feat[:, :, cut:])
+    assert changed, "the forecast must react to the recent past it is conditioned on"
+
+
+@pytest.mark.parametrize("key", DEEP_KEYS)
+@pytest.mark.parametrize("geometry", DEEP_GEOMETRIES, ids=["task", "synthetic"])
+def test_the_effective_context_reaches_the_first_lookback_sample(
+    key: str, geometry: tuple[int, int, int, int], rng: np.random.Generator
+) -> None:
+    """Perturbing sample 0 must change the forecast, for every deep model.
+
+    The TCN has a closed-form receptive field and is checked against it in
+    ``tests/test_windows.py``; the transformer and the LSTM do not, so coverage of the full
+    lookback has to be measured. A model whose effective context stops short of the window
+    start is silently solving a shorter-lookback problem, which no shape test can see.
+
+    The assertion is bitwise, not thresholded, and deliberately so. At the task geometry with
+    a random init, the same +10 perturbation applied to the **first** rather than the last
+    lookback sample moves the output by 4.0e-4 for the TCN, 6.7e-1 for the transformer and
+    1.5e-8 for the LSTM, against 9.4, 4.7e-1 and 5.0e-2 respectively for the last sample.
+    The LSTM's sensitivity to the window start is therefore some six orders of magnitude
+    below its sensitivity to the window end -- non-zero, so nothing is architecturally
+    truncated, but small. Any threshold large enough to look reassuring would simply fail on
+    the LSTM, so the decay is recorded here and reported rather than tuned around.
+    """
+    lookback, _, n_in, _ = geometry
+    model = _deep_model(key, geometry, n_quantiles=0)
+    x = torch.from_numpy(rng.normal(size=(2, lookback, n_in)).astype(np.float32))
+    first, last = x.clone(), x.clone()
+    first[:, 0, :] += 10.0
+    last[:, -1, :] += 10.0
+    with torch.no_grad():
+        base_out = model(x)
+        first_out, last_out = model(first), model(last)
+    assert not torch.equal(first_out, base_out), "sample 0 is outside the effective context"
+    assert float((first_out - base_out).abs().max()) > 0.0
+    assert float((last_out - base_out).abs().max()) > 0.0, "no reaction to the newest sample"
+
+
+@pytest.mark.parametrize("key", DEEP_KEYS)
+def test_the_deep_models_are_fitted_by_sgd(key: str) -> None:
+    """The experiment driver dispatches on ``FIT_KIND``, not on the class."""
+    assert MODEL_REGISTRY[key].FIT_KIND == "sgd"
+
+
+@pytest.mark.parametrize("stem", DEEP_KEYS)
+def test_the_deep_configs_carry_every_hyperparameter_explicitly(stem: str) -> None:
+    """A hyperparameter absent from the YAML takes the Python default with no warning.
+
+    ``build_model`` raises ``TypeError`` on an *extra* key but is silent on a missing one, so
+    the config would document an architecture that is not the one that trained. Asserted
+    against the constructor signature rather than against a copy of the key list.
+    """
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    accepted = set(inspect.signature(MODEL_REGISTRY[cfg.name].__init__).parameters)
+    supplied_elsewhere = {
+        "self",
+        "lookback",
+        "max_horizon",
+        "n_input_channels",
+        "n_target_channels",
+        "n_quantiles",
+    }
+    assert set(cfg.params) == accepted - supplied_elsewhere
+
+
+@pytest.mark.parametrize("stem", DEEP_KEYS)
+def test_no_deep_config_carries_a_param_named_order(stem: str) -> None:
+    """``dmf.train.experiment._max_order`` scans every model config for ``order``.
+
+    It sizes the shared AR moment accumulation from the maximum it finds, so a deep model
+    carrying an unrelated ``order`` would silently change which normal equations every AR row
+    is solved from -- in a sweep where the AR rows look untouched.
+    """
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    assert "order" not in cfg.params
+
+
+def test_the_deep_models_report_their_parameter_counts(rng: np.random.Generator) -> None:
+    """The parameter column of the Phase 4 table, pinned at the shipped geometry.
+
+    Not budget-matched, and pinned here so that the spread is a number in the table rather
+    than a surprise: the transformer's flatten-and-project head alone is 2 304 900 of its
+    2 712 708 parameters (docs/IMPLEMENTATION_PLAN.md §Phase 4 specifies that head).
+    """
+    counts = {
+        key: _deep_model(key, DEEP_GEOMETRIES[0], n_quantiles=0).n_fitted_parameters
+        for key in DEEP_KEYS
+    }
+    assert counts == {"tcn": 196_804, "transformer": 2_712_708, "lstm": 317_828}
+    dlinear = DLinear(
+        PRODUCTION_SPEC.lookback, PRODUCTION_SPEC.max_horizon, N_IN, N_OUT
+    ).n_fitted_parameters
+    assert dlinear < counts["tcn"] < counts["lstm"] < counts["transformer"]
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -1693,6 +1999,415 @@ def test_the_ablation_adds_no_pass_over_the_training_split(
     # it is that value plus whatever a 2x parameter budget is worth (measured at a median
     # +0.0064 skill from `ar10` -> `ar20`).
     assert counts["ar20"] == counts["ar_attitude_only"]
+
+
+# ---------------------------------------------------------------------------
+# Paired model-vs-model contrasts
+# ---------------------------------------------------------------------------
+
+
+class _OffsetForecaster(BaseForecaster):
+    """A wrapped forecaster shifted by a constant, i.e. a deliberately worse model.
+
+    The offset is added in **normalised (dimensionless)** space, so after
+    :func:`dmf.data.normalize.invert_norm` it is a constant bias of ``offset * scale`` in
+    corpus units on every channel and every lead time. Large enough, the ``offset**2``
+    term dominates the cross term in every realization's squared error, so the wrapped
+    model is worse than the model it wraps *everywhere* rather than on average -- which is
+    what makes it a usable subject for a sign-convention test.
+    """
+
+    FIT_KIND = "none"
+
+    def __init__(self, inner: BaseForecaster, offset: float) -> None:
+        """Wrap ``inner`` and shift its output.
+
+        Args:
+            inner: The model to degrade. Its shape contract is adopted unchanged.
+            offset: Constant added to every forecast, dimensionless (normalised space).
+        """
+        super().__init__(
+            inner.lookback, inner.max_horizon, inner.n_input_channels, inner.n_target_channels
+        )
+        self.inner = inner
+        self.offset = float(offset)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forecast, then shift.
+
+        Args:
+            x: Input windows, ``(B, L, C_in)``, dimensionless.
+
+        Returns:
+            ``(B, H, C_out)``, dimensionless, biased by ``offset``.
+        """
+        return self.inner.forward(x) + self.offset
+
+
+def _score_for_contrasts(corpus: Path, cfg: DataConfig):  # type: ignore[no-untyped-def]
+    """Score persistence, AR(10), AR(20) and a degraded AR(20) in one pass over `id`/test.
+
+    Two AR orders fitted from one moments pass are the cheapest *genuinely correlated*
+    pair available on the fixture corpus: same windows, same moments, same solver, differing
+    only in lag depth, so a realization that is hard for one is hard for the other. That
+    correlation is precisely what a paired interval exploits and what an unpaired pair of
+    marginals throws away, so it is the setting the narrowness test needs.
+
+    Keys are the ``"<label>@<seed>"`` run keys the experiment driver uses, because that is
+    the key space :func:`dmf.train.experiment._contrast_frame` inverts.
+
+    Args:
+        corpus: Small-corpus root.
+        cfg: The small-corpus task configuration.
+
+    Returns:
+        Tuple ``(table, accumulators, dof_names)`` from a single
+        :func:`dmf.eval.runner.evaluate_models` pass. ``table`` carries the *unpaired*
+        marginal ``skill_ci_lo``/``skill_ci_hi`` drawn at the same bootstrap seed the
+        contrasts use, so the two are comparable by construction.
+    """
+    from dmf.eval.runner import evaluate_models
+    from dmf.train.experiment import BOOTSTRAP_CI_LEVEL, BOOTSTRAP_N_BOOT, BOOTSTRAP_SEED
+
+    spec = window_spec_from_config(cfg)
+    train = _small_dataset(corpus, cfg, "id", "train")
+    test = _small_dataset(corpus, cfg, "id", "test")
+    n_in = len(train.input_columns)
+    n_out = len(train.target_columns)
+    moments = accumulate_training_moments(train, max_order=20, num_workers=0)
+    shapes = {"lookback": spec.lookback, "n_input_channels": n_in, "n_target_channels": n_out}
+    ar10, _ = fit_ar(moments, order=10, ridge=1e-6, **shapes)
+    ar20, _ = fit_ar(moments, order=20, ridge=1e-6, **shapes)
+    models = {
+        "persistence@0": Persistence(spec.lookback, spec.max_horizon, n_in, n_out).eval(),
+        "ar10@0": ar10,
+        "ar20@0": ar20,
+        # 100 dimensionless units of bias on a de-meaned, unit-scaled target: worse than
+        # `ar20` on every realization, not merely on the pooled sum.
+        "ar20_biased@0": _OffsetForecaster(ar20, 100.0).eval(),
+    }
+    table, accumulators = evaluate_models(
+        models,
+        test,
+        persistence_key="persistence@0",
+        horizons=cfg.horizons,
+        fs_hz=cfg.fs_hz,
+        num_workers=0,
+        n_boot=BOOTSTRAP_N_BOOT,
+        ci_level=BOOTSTRAP_CI_LEVEL,
+        bootstrap_seed=BOOTSTRAP_SEED,
+    )
+    return table, accumulators, tuple(test.target_columns)
+
+
+def _contrasts_for(  # type: ignore[no-untyped-def]
+    accumulators, dof_names, cfg: DataConfig, pairs: tuple[tuple[str, str], ...]
+):
+    """Run `_contrast_frame` over one regime's accumulators for the given label pairs.
+
+    Args:
+        accumulators: Per-run accumulators from :func:`_score_for_contrasts`.
+        dof_names: Target channel names, accumulator channel order.
+        cfg: The task configuration, for horizons and sampling rate.
+        pairs: Ordered ``(model_a, model_b)`` label pairs.
+
+    Returns:
+        The emitted contrast frame.
+    """
+    from dmf.train.experiment import _contrast_frame
+
+    return _contrast_frame(
+        accumulators,
+        regime="id",
+        dof_names=dof_names,
+        horizons=cfg.horizons,
+        fs_hz=cfg.fs_hz,
+        persistence_key="persistence@0",
+        contrasts=pairs,
+    )
+
+
+def test_the_contrast_bootstrap_settings_are_the_ones_the_marginals_used() -> None:
+    """The pairing is exact only if both sides draw the *same* multinomial counts.
+
+    `dmf.eval.runner._bootstrap_counts` is a pure function of
+    ``(n_realizations, n_boot, seed)``, so a paired difference computed at a different
+    ``n_boot`` or ``bootstrap_seed`` from the marginals it is read beside is not paired
+    with anything -- it is a second, independent resampling that happens to be printed in
+    the same table. `run_experiment` passes one set of constants to both, and this asserts
+    those constants are still the runner's own defaults, so the committed marginal CIs of
+    earlier sweeps and the new contrasts describe one set of resamples.
+    """
+    from dmf.eval.runner import evaluate_models
+    from dmf.train.experiment import BOOTSTRAP_CI_LEVEL, BOOTSTRAP_N_BOOT, BOOTSTRAP_SEED
+
+    defaults = inspect.signature(evaluate_models).parameters
+    assert defaults["n_boot"].default == BOOTSTRAP_N_BOOT
+    assert defaults["ci_level"].default == BOOTSTRAP_CI_LEVEL
+    assert defaults["bootstrap_seed"].default == BOOTSTRAP_SEED
+
+
+def test_a_model_contrasted_with_itself_is_exactly_zero(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """The degenerate case, and the cheapest check that the pairing is real.
+
+    ``skill(a) - skill(a)`` is ``(sse_a - sse_a) / sse_persistence`` under *every* resample,
+    so both the point estimate and both interval bounds are exactly 0.0 -- not 1e-17, and
+    not a narrow interval around zero. An implementation that resampled the two sides
+    separately, or that reused a stale count matrix for one of them, would produce a small
+    non-zero interval here and nothing else in the suite would notice.
+    """
+    _, accumulators, dofs = _score_for_contrasts(small_corpus, small_data_cfg)
+    frame = _contrasts_for(accumulators, dofs, small_data_cfg, (("ar20", "ar20"),))
+
+    assert len(frame) == len(dofs) * len(small_data_cfg.horizons)
+    assert (frame["skill_diff"] == 0.0).all(), frame["skill_diff"].abs().max()
+    assert (frame["ci_lo"] == 0.0).all(), frame["ci_lo"].abs().max()
+    assert (frame["ci_hi"] == 0.0).all(), frame["ci_hi"].abs().max()
+
+
+def test_the_sign_convention_is_a_minus_b_and_swapping_negates_it(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """`skill_diff` is ``skill(model_a) - skill(model_b)``: positive means model_a is better.
+
+    Asserted with a model that is worse by construction -- AR(20) plus a 100-unit
+    normalised bias -- rather than with two models whose ordering has to be looked up, so
+    the expected sign is known before the test runs. A driver that emitted ``b - a`` would
+    reverse every conclusion in the file while leaving every magnitude and every interval
+    width intact, which is the failure mode a sign convention documented only in prose
+    invites.
+
+    The point estimate negates **bitwise** on swapping, because it is
+    ``(sse_b - sse_a) / sse_persistence`` and IEEE subtraction is exactly antisymmetric.
+    The bounds are compared to a tight tolerance instead: they come out of a percentile of
+    the negated bootstrap draws, and the tail index arithmetic (``q`` against ``1 - q``) is
+    not required to interpolate identically in the last bits.
+    """
+    _, accumulators, dofs = _score_for_contrasts(small_corpus, small_data_cfg)
+    forward = _contrasts_for(accumulators, dofs, small_data_cfg, (("ar20_biased", "ar20"),))
+    reversed_pair = _contrasts_for(accumulators, dofs, small_data_cfg, (("ar20", "ar20_biased"),))
+
+    keys = ["dof", "horizon_samples"]
+    assert forward[keys].equals(reversed_pair[keys])
+    # The worse model on side `a` -> negative, in every cell, by a wide margin.
+    assert (forward["skill_diff"] < 0.0).all(), forward["skill_diff"].max()
+    assert (forward["ci_hi"] < 0.0).all(), forward["ci_hi"].max()
+    assert (reversed_pair["skill_diff"] > 0.0).all(), reversed_pair["skill_diff"].min()
+
+    assert (forward["skill_diff"].to_numpy() == -reversed_pair["skill_diff"].to_numpy()).all()
+    assert forward["ci_lo"].to_numpy() == pytest.approx(
+        -reversed_pair["ci_hi"].to_numpy(), rel=1e-12, abs=0.0
+    )
+    assert forward["ci_hi"].to_numpy() == pytest.approx(
+        -reversed_pair["ci_lo"].to_numpy(), rel=1e-12, abs=0.0
+    )
+
+
+def test_the_paired_interval_is_narrower_than_the_two_unpaired_marginals(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """The property the whole wiring exists for (`docs/protocol.md` P3-D13, P3-D22).
+
+    Every model in a pass is scored on the same realizations, so the realization-to-
+    realization variation dominates both marginal skill intervals and *cancels* in the
+    difference. Judging a model-vs-model effect by eye from two overlapping marginals is
+    therefore not conservative, it is uninformative -- and it has already produced a wrong
+    published conclusion in this project.
+
+    Three things make this non-vacuous rather than a tautology about interval arithmetic:
+
+    1. Both marginals are asserted to have positive width, and the paired interval too, so
+       "narrower" is not being satisfied by a degenerate interval.
+    2. The comparison is against ``width(a) + width(b)``, which is exactly the width of
+       ``[lo_a - hi_b, hi_a - lo_b]`` -- the interval for the difference you would get by
+       treating the two marginals as independent, i.e. the naive unpaired procedure this
+       replaces. Nothing forces the paired width below that sum; it is below it only
+       because the errors are genuinely correlated.
+    3. The two marginals are asserted to actually *overlap* in a majority of cells, so the
+       unpaired read really is inconclusive there, while the paired interval excludes zero
+       in every cell. If AR(10) and AR(20) were ever separated by their marginals on this
+       fixture, this test would be asserting something that no longer needs asserting, and
+       it says so by failing.
+    """
+    table, accumulators, dofs = _score_for_contrasts(small_corpus, small_data_cfg)
+    frame = _contrasts_for(accumulators, dofs, small_data_cfg, (("ar20", "ar10"),))
+
+    keys = ["dof", "horizon_samples"]
+    marginal_cols = [*keys, "skill_ci_lo", "skill_ci_hi"]
+    cells = frame.merge(
+        table.loc[table["model"] == "ar20@0", marginal_cols], on=keys, validate="one_to_one"
+    ).merge(
+        table.loc[table["model"] == "ar10@0", marginal_cols],
+        on=keys,
+        suffixes=("_a", "_b"),
+        validate="one_to_one",
+    )
+    assert len(cells) == len(dofs) * len(small_data_cfg.horizons)
+
+    width_a = cells["skill_ci_hi_a"] - cells["skill_ci_lo_a"]
+    width_b = cells["skill_ci_hi_b"] - cells["skill_ci_lo_b"]
+    paired = cells["ci_hi"] - cells["ci_lo"]
+    unpaired = width_a + width_b
+    assert (width_a > 0.0).all() and (width_b > 0.0).all(), "degenerate marginals prove nothing"
+    assert (paired > 0.0).all(), "a degenerate paired interval would pass this test vacuously"
+    assert (paired < unpaired).all(), (paired / unpaired).max()
+
+    overlapping = (cells["skill_ci_lo_a"] <= cells["skill_ci_hi_b"]) & (
+        cells["skill_ci_lo_b"] <= cells["skill_ci_hi_a"]
+    )
+    assert int(overlapping.sum()) > len(cells) // 2, (
+        f"the unpaired marginals separate AR(20) from AR(10) in "
+        f"{len(cells) - int(overlapping.sum())} of {len(cells)} cells on this fixture; the "
+        f"narrowness claim needs a case where the naive read is inconclusive"
+    )
+    assert (cells["ci_lo"] > 0.0).all(), cells.loc[cells["ci_lo"] <= 0.0, [*keys, "ci_lo"]]
+    assert (cells["skill_diff"] > 0.0).all()
+
+
+def test_an_absent_pair_is_skipped_but_a_mistyped_one_is_not(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """Silence for a model the config did not run; a raise for a list that matches nothing.
+
+    The first half is what lets one contrast list serve every config: a baselines-only
+    sweep names no ``tcn``, and skipping that pair is correct, not an error. The second
+    half is what stops the same silence from covering a typo -- a deep model scored and
+    *no* pair formed can only mean the labels in :data:`dmf.train.experiment.PAIRED_CONTRASTS`
+    no longer match the labels the configs ship, and the alternative to raising is a
+    committed contrast file that is empty for a reason nobody notices.
+    """
+    from dmf.train.experiment import PAIRED_CONTRAST_COLUMNS
+
+    _, accumulators, dofs = _score_for_contrasts(small_corpus, small_data_cfg)
+
+    absent = _contrasts_for(accumulators, dofs, small_data_cfg, (("tcn", "ar20"),))
+    assert absent.empty
+    assert tuple(absent.columns) == PAIRED_CONTRAST_COLUMNS
+
+    # The same run relabelled as a deep model, with the *other* side of the pair mistyped.
+    renamed = {("tcn@0" if key == "ar20@0" else key): a for key, a in accumulators.items()}
+    with pytest.raises(ValueError, match="no pair of PAIRED_CONTRASTS matched"):
+        _contrasts_for(renamed, dofs, small_data_cfg, (("tcn", "ar20_typo"),))
+
+
+def test_run_experiment_writes_paired_contrasts_and_skips_absent_pairs(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """The artifact: documented schema, one row per seed, no row for a model not in the run.
+
+    The smoke config carries no deep model, so twelve of the thirteen configured contrasts
+    name a label that was never fitted and must be skipped **silently** -- a constant that
+    forced every experiment to carry every model would make a baselines-only sweep
+    impossible to run. What survives is ``dlinear`` against ``dlinear_ols``, the DLinear
+    optimisation gap, which is the one pair this config can support.
+
+    The multi-seed assertion is the P3-D22 point restated for contrasts: ``dlinear`` is
+    stochastic and ``dlinear_ols`` is a closed-form solve with a single accumulator, so the
+    file must carry **three** rows per cell -- one interval per seed, each a genuine paired
+    interval against that one deterministic run -- and not one row holding the mean of
+    three intervals, which is an interval for nothing.
+    """
+    import pandas as pd
+
+    from dmf.train.experiment import (
+        BOOTSTRAP_CI_LEVEL,
+        BOOTSTRAP_N_BOOT,
+        BOOTSTRAP_SEED,
+        CONTRAST_DEEP_MODELS,
+        PAIRED_CONTRAST_COLUMNS,
+        run_experiment,
+    )
+
+    results = tmp_path / "results"
+    seeds = (0, 1, 2)
+    run_experiment(
+        _smoke_experiment(small_data_cfg),
+        small_corpus,
+        results_dir=results,
+        seeds=seeds,
+        regimes=("id",),
+        device="cpu",
+        run_controls=False,
+        checkpoint_root=tmp_path / "checkpoints",
+    )
+
+    written = results / "paired_contrasts.csv"
+    assert written.exists()
+    frame = pd.read_csv(written)
+    assert tuple(frame.columns) == PAIRED_CONTRAST_COLUMNS
+
+    pairs = set(map(tuple, frame[["model_a", "model_b"]].drop_duplicates().to_numpy()))
+    assert pairs == {("dlinear", "dlinear_ols")}
+    named = set(frame["model_a"]) | set(frame["model_b"])
+    assert not named & set(CONTRAST_DEEP_MODELS), named
+
+    n_cells = len(small_data_cfg.target_dofs) * len(small_data_cfg.horizons)
+    assert len(frame) == len(seeds) * n_cells
+    assert set(frame["seed"]) == set(seeds)
+    per_cell = frame.groupby(["regime", "model_a", "model_b", "dof", "horizon_samples"]).size()
+    assert (per_cell == len(seeds)).all(), per_cell[per_cell != len(seeds)].to_dict()
+
+    assert set(frame["regime"]) == {"id"}
+    assert (frame["ci_lo"] <= frame["ci_hi"]).all()
+    assert (frame["horizon_s"] == frame["horizon_samples"] / small_data_cfg.fs_hz).all()
+    assert (frame["n_boot"] == BOOTSTRAP_N_BOOT).all()
+    assert (frame["ci_level"] == BOOTSTRAP_CI_LEVEL).all()
+    assert (frame["bootstrap_seed"] == BOOTSTRAP_SEED).all()
+    assert (frame["n_realizations"] > 0).all()
+
+    # Provenance, end to end. The conditional itself is unit-tested in
+    # `tests/test_metrics.py`; what is only observable from here is that `run_experiment`
+    # passes the flag, i.e. that the document names the fifth file this same run wrote.
+    document = (results / "baselines.md").read_text(encoding="utf-8")
+    assert f"`{written.as_posix()}`" in document
+
+
+def test_a_run_with_no_contrast_pair_writes_no_file_and_its_report_names_none(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """The other half of the conditional, on a run that genuinely writes no contrasts.
+
+    ``PAIRED_CONTRASTS`` names no pair that this model set supports, so no
+    ``paired_contrasts.csv`` is written -- and a provenance line naming it anyway would be
+    a document asserting a file that is not beside it, which is the ``docs/protocol.md``
+    P3-D21 defect. All four models are deterministic, so one seed is a legal run here and
+    the test costs a single fixture-corpus pass.
+    """
+    from dmf.config import ExperimentConfig
+    from dmf.train.experiment import run_experiment
+
+    smoke = _smoke_experiment(small_data_cfg)
+    wanted = ("persistence", "window_mean", "damped_persistence", "ar10")
+    models = tuple(m for m in smoke.models if m.label in wanted)
+    assert len(models) == len(wanted), [m.label for m in smoke.models]
+
+    results = tmp_path / "results"
+    run_experiment(
+        ExperimentConfig(
+            name="no_contrast_pair",
+            data=small_data_cfg,
+            models=models,
+            train=smoke.train,
+            seeds=smoke.seeds,
+            regimes=("id",),
+        ),
+        small_corpus,
+        results_dir=results,
+        seeds=(0,),
+        regimes=("id",),
+        device="cpu",
+        run_controls=False,
+        checkpoint_root=tmp_path / "checkpoints",
+    )
+
+    assert not (results / "paired_contrasts.csv").exists()
+    document = (results / "baselines.md").read_text(encoding="utf-8")
+    assert "paired_contrasts.csv" not in document
+    # The unconditional artifacts are still named: the assertion above must be failing
+    # because the file is absent, not because provenance stopped being rendered.
+    assert f"`{(results / 'baselines_by_seed.csv').as_posix()}`" in document
 
 
 # ---------------------------------------------------------------------------
