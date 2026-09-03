@@ -151,8 +151,9 @@ class ModelConfig:
         name: Registry key, e.g. ``"tcn"``. Resolved by
             :func:`dmf.train.registry.build_model`.
         head: Output head type, one of ``"point"``, ``"quantile"``, ``"gaussian"``.
-        quantiles: Quantile levels for a quantile head, each in (0, 1), ascending.
-            Ignored for other head types.
+        quantiles: Quantile levels for a quantile head, each in (0, 1), ascending. Must be
+            **empty** for a ``point`` or ``gaussian`` head: :func:`load_model` refuses
+            levels beside a head that does not emit them, rather than ignoring them.
         params: Architecture keyword arguments passed to the model constructor. Units are
             model-specific and documented on each model class.
         label: Results-table identifier, unique within an experiment. Defaults to ``name``
@@ -434,9 +435,12 @@ def load_model(path: Path) -> ModelConfig:
     Raises:
         FileNotFoundError: If ``path`` does not exist.
         ValueError: If a required key is missing, if ``head`` is not one of ``point``,
-            ``quantile`` or ``gaussian``, if ``params`` is not a mapping, or if a
-            ``quantile`` head carries quantile levels that are not strictly ascending
-            inside ``(0, 1)``.
+            ``quantile`` or ``gaussian``, if ``params`` is not a mapping, if a ``quantile``
+            head carries quantile levels that are not strictly ascending inside ``(0, 1)``,
+            or if a ``point`` or ``gaussian`` head carries any levels at all. The last one
+            is not pedantry: a Gaussian head emits ``(mean, log_var)``, and a config that
+            lists nine levels beside it documents a fan the model never produces and that
+            nothing would ever read.
     """
     raw = load_yaml(path)
     missing = {"name", "head", "quantiles", "params"} - set(raw)
@@ -454,6 +458,11 @@ def load_model(path: Path) -> ModelConfig:
             raise ValueError(f"{path}: quantile levels must lie in (0, 1), got {list(quantiles)}")
         if any(b <= a for a, b in zip(quantiles, quantiles[1:], strict=False)):
             raise ValueError(f"{path}: quantile levels must be ascending, got {list(quantiles)}")
+    elif quantiles:
+        raise ValueError(
+            f"{path}: a {head} head carries no quantile levels, got {list(quantiles)}; "
+            f"leave 'quantiles' empty"
+        )
 
     params_raw = raw["params"] or {}
     if not isinstance(params_raw, dict):

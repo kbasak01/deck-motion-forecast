@@ -47,6 +47,7 @@ from torch import nn
 
 from dmf.models.base import FitKind
 from dmf.models.dlinear import DLinear
+from dmf.models.heads import HeadKind
 from dmf.train.registry import register_model
 from dmf.typedefs import FloatArray
 
@@ -77,6 +78,12 @@ class DLinearOLS(DLinear):
     # Silenced here rather than fixed by annotating DLinear, which CLAUDE.md forbids
     # editing to accommodate a new model.
     FIT_KIND: ClassVar[FitKind] = "closed_form"  # type: ignore[assignment]
+
+    #: Point only, narrowed from the parent's three: this row is a least-squares solve, and
+    #: neither pinball loss nor a Gaussian NLL has normal equations to accumulate. Stated on
+    #: the class so that a config asking this model for a head fails at construction rather
+    #: than inheriting a capability the fitting path does not have.
+    SUPPORTED_HEADS: ClassVar[tuple[HeadKind, ...]] = ("point",)
 
     def __init__(
         self,
@@ -111,6 +118,8 @@ class DLinearOLS(DLinear):
             n_target_channels,
             kernel_size=kernel_size,
             individual=False,
+            # Hardcoded, and matched by `SUPPORTED_HEADS` above: a closed-form solve has no
+            # probabilistic head.
             n_quantiles=0,
         )
         if ridge < 0.0:

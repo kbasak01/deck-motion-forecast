@@ -45,7 +45,13 @@ from dmf.eval.controls import (
     shuffle_control,
     untrained_control,
 )
-from dmf.eval.report import build_baselines_markdown, build_baselines_table, write_table
+from dmf.eval.prob_runner import evaluate_probabilistic_models
+from dmf.eval.report import (
+    build_baselines_markdown,
+    build_baselines_table,
+    build_probabilistic_table,
+    write_table,
+)
 from dmf.eval.runner import (
     EvalAccumulator,
     evaluate_models,
@@ -55,6 +61,7 @@ from dmf.eval.runner import (
 )
 from dmf.models.base import BaseForecaster
 from dmf.models.dlinear_ols import DLinearOLS
+from dmf.models.heads import point_view
 from dmf.models.persistence import TAU_WINDOW_MEAN, DampedPersistence
 from dmf.train.closed_form import (
     TrainingMoments,
@@ -64,6 +71,7 @@ from dmf.train.closed_form import (
     fit_dlinear_ols,
 )
 from dmf.train.loop import fit, set_seed
+from dmf.train.losses import resolve_loss
 from dmf.train.registry import MODEL_REGISTRY, build_model
 
 __all__ = [
@@ -76,6 +84,7 @@ __all__ = [
     "PAIRED_CONTRAST_COLUMNS",
     "PERSISTENCE_LABEL",
     "RunRecord",
+    "VAL_LOSS_NAMES",
     "run_experiment",
 ]
 
@@ -93,6 +102,28 @@ PERSISTENCE_LABEL = "persistence"
 #: committed artifact declared the superseded cell while the README claimed the gate passed.
 GATE_DOF = "pitch"
 GATE_HORIZON_SAMPLES = 100
+
+#: Which objective ``best_val_loss`` reports, by head kind. Written to the per-seed table
+#: beside the number, because since Phase 5 the early-stopping criterion is head-specific
+#: (``docs/protocol.md`` P5-D4) and the column is otherwise three different quantities
+#: sharing one name.
+VAL_LOSS_NAMES: dict[str, str] = {
+    "point": "mse",
+    "quantile": "pinball",
+    "gaussian": "gaussian_nll",
+}
+
+#: Nominal miscoverage the Phase 5 intervals are scored at. ``0.1`` is the 90 percent
+#: interval Gate 5 is read on (``docs/protocol.md`` P5-D2), and it is the level the
+#: outermost pair of ``dmf.models.heads.QUANTILE_FAN_9`` was chosen to sit exactly on, so no
+#: quantile has to be interpolated to form it.
+GATE5_ALPHA = 0.1
+
+#: The band Gate 5 requires PICP@90 to fall inside on the ``id`` regime, verbatim from
+#: ``docs/IMPLEMENTATION_PLAN.md`` Phase 5. Unchanged in Phase 5; only the cell it is read
+#: at was registered (P5-D2), and it is the same cell Gates 3 and 4 are read at.
+GATE5_PICP_BAND = (0.85, 0.95)
+
 
 #: Separator in the per-run key ``"<label>@<seed>"`` that every model of a regime is scored
 #: under, so that three seeds of one model stay three entries in the scoring pass rather
@@ -206,7 +237,13 @@ class RunRecord:
         epochs_run: Epochs completed before early stopping or exhaustion, or None. Equal to
             ``cfg.train.epochs`` means the run hit the cap rather than converging.
         best_val_loss: Lowest validation loss reached, dimensionless, or None. Directly
-            comparable to a closed-form model's residual only in units, not in partition.
+            comparable to a closed-form model's residual only in units, not in partition --
+            and, since Phase 5, not comparable across heads either: see ``val_loss_name``.
+        val_loss_name: Which objective ``best_val_loss`` is, one of ``mse``, ``pinball``,
+            ``gaussian_nll``, or None for a model with no epochs. Each model is stopped on
+            its own training objective (``docs/protocol.md`` P5-D4), so a pinball loss and
+            an MSE sit in the same column and their ratio means nothing. The column ships
+            beside the number so that the comparison cannot be made by accident.
     """
 
     label: str
@@ -218,6 +255,7 @@ class RunRecord:
     best_epoch: int | None = None
     epochs_run: int | None = None
     best_val_loss: float | None = None
+    val_loss_name: str | None = None
 
 
 def _instantiate(
@@ -354,9 +392,25 @@ def _fit_one(
         num_workers=experiment.train.num_workers,
         seed=0,
     )
+    # Resolved once per config, from the config rather than from the built model, so that a
+    # config asking for a head its model cannot carry fails in `build_model` and never
+    # reaches a mismatched objective here.
+    loss_fn = resolve_loss(cfg.head, cfg.quantiles)
     for seed in experiment.seeds:
         model = _instantiate(cfg, spec, n_in, n_out, seed).to(device)
-        result = fit(model, train_loader, val_loader, experiment.train, seed, checkpoint_dir)
+        result = fit(
+            model,
+            train_loader,
+            val_loader,
+            experiment.train,
+            seed,
+            checkpoint_dir,
+            loss_fn=loss_fn,
+            # The label, not the class name: in `e03` the point, quantile and Gaussian
+            # variants of one class share a class name and would write one checkpoint file
+            # three times, leaving two runs' weights on disk under a third run's name.
+            label=cfg.label,
+        )
         model.eval()
         records.append(
             RunRecord(
@@ -369,6 +423,7 @@ def _fit_one(
                 best_epoch=result.best_epoch,
                 epochs_run=result.epochs_run,
                 best_val_loss=result.best_val_loss,
+                val_loss_name=VAL_LOSS_NAMES[cfg.head],
             )
         )
     return records
@@ -735,6 +790,7 @@ def run_experiment(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     by_seed: list[pd.DataFrame] = []
+    by_seed_prob: list[pd.DataFrame] = []
     by_cell: list[pd.DataFrame] = []
     control_results: list[ControlResult] = []
     heading_marginals: list[pd.DataFrame] = []
@@ -774,8 +830,18 @@ def run_experiment(
         # key is split back into `model` and `seed` columns before anything is written, so
         # that every committed table shares one key space.
         keyed = {f"{r.label}@{r.seed}": r for r in records}
+        # A probabilistic model is scored for point accuracy through its point projection --
+        # the 0.5 quantile, or the Gaussian mean (P5-D5). `point_view` exists so that goes
+        # through the SAME `evaluate_models` call as every other row: one pass, one window
+        # set, one persistence denominator, one realization bootstrap. Widening
+        # `evaluate_models` to accept rank-4 output instead would have put its bitwise-zero
+        # reference guarantee and its identity-shared target sums one refactor away from
+        # being silently untrue.
         table, accumulators = evaluate_models(
-            {k: r.model for k, r in keyed.items()},
+            {
+                k: (r.model if r.model.head_kind == "point" else point_view(r.model))
+                for k, r in keyed.items()
+            },
             test,
             persistence_key=f"{PERSISTENCE_LABEL}@0",
             horizons=experiment.data.horizons,
@@ -800,6 +866,7 @@ def run_experiment(
                     "best_epoch": record.best_epoch,
                     "epochs_run": record.epochs_run,
                     "best_val_loss": record.best_val_loss,
+                    "val_loss_name": record.val_loss_name,
                 }
                 for key, record in keyed.items()
             ]
@@ -807,7 +874,44 @@ def run_experiment(
         table = table.merge(meta, on="model", validate="many_to_one")
         table["model"] = table["label"]
         table["regime"] = regime
-        by_seed.append(table.drop(columns=["label"]))
+        scored = table.drop(columns=["label"])
+        by_seed.append(scored)
+
+        # The distributional pass, over the same partition and the same realizations. It is
+        # a second pass rather than a branch inside `evaluate_models` for the reason given
+        # at the `point_view` call above; `expected_keys` is what asserts the two passes
+        # scored the same windows in the same order, so a row's `picp` and its `rmse` can
+        # never describe different data.
+        prob_models = {k: r.model for k, r in keyed.items() if r.model.head_kind != "point"}
+        if prob_models:
+            prob_table, _ = evaluate_probabilistic_models(
+                prob_models,
+                test,
+                horizons=experiment.data.horizons,
+                fs_hz=experiment.data.fs_hz,
+                alpha=GATE5_ALPHA,
+                num_workers=experiment.train.num_workers,
+                device=device,
+                n_boot=BOOTSTRAP_N_BOOT,
+                ci_level=BOOTSTRAP_CI_LEVEL,
+                bootstrap_seed=BOOTSTRAP_SEED,
+                expected_keys=list(test.realization_keys),
+            )
+            prob_table = prob_table.merge(meta, on="model", validate="many_to_one")
+            prob_table["model"] = prob_table["label"]
+            prob_table["regime"] = regime
+            # `signal_std` is carried over from the point pass rather than recomputed: it is
+            # a property of the targets alone, `evaluate_models` already accumulates it once
+            # per batch and shares it across every model by object identity (P4-D3), and a
+            # second float64 reduction of the same values in a different order would differ
+            # in the last bits. It is what makes `width_ratio` -- the sharpness reference
+            # that turns "2.3 degrees" into a readable number -- available downstream.
+            prob_table = prob_table.drop(columns=["label"]).merge(
+                scored[["model", "seed", "dof", "horizon_samples", "signal_std"]],
+                on=["model", "seed", "dof", "horizon_samples"],
+                validate="one_to_one",
+            )
+            by_seed_prob.append(prob_table)
 
         cells = per_cell_metrics(
             accumulators,
@@ -838,6 +942,17 @@ def run_experiment(
         # "optimise" these away as duplicated work -- recoverability is the point.
         write_table(pd.concat(by_seed, ignore_index=True), results_dir / "baselines_by_seed.csv")
         write_table(pd.concat(by_cell, ignore_index=True), results_dir / "baselines_by_cell.csv")
+        if by_seed_prob:
+            per_run_prob = pd.concat(by_seed_prob, ignore_index=True)
+            write_table(per_run_prob, results_dir / "probabilistic_by_seed.csv")
+            # The *aggregated* probabilistic table is checkpointed per regime as well, which
+            # `baselines.csv` is not. The reason is specific rather than a general tidiness
+            # preference: this sweep is ~2 days, `probabilistic.csv` is the only file
+            # `scripts/gate5.py` reads, and the regime list is ordered so that `id` and
+            # `unseen_seastate` -- the two Gate 5 actually turns on -- finish first. Writing
+            # it here means `make gate5` is answerable after the first regime instead of
+            # only after the last, on a run long enough that the difference is a day.
+            write_table(build_probabilistic_table(per_run_prob), results_dir / "probabilistic.csv")
 
         # Model-vs-model, from the accumulators the scoring pass above already returned:
         # same realizations, same resample weights, no second evaluation and no second
@@ -886,6 +1001,10 @@ def run_experiment(
         write_table(pd.concat(contrasts, ignore_index=True), results_dir / "paired_contrasts.csv")
     aggregated = build_baselines_table(per_run)
     write_table(aggregated, results_dir / "baselines.csv")
+    if by_seed_prob:
+        per_run_prob = pd.concat(by_seed_prob, ignore_index=True)
+        write_table(per_run_prob, results_dir / "probabilistic_by_seed.csv")
+        write_table(build_probabilistic_table(per_run_prob), results_dir / "probabilistic.csv")
     controls = controls_table(control_results) if control_results else None
     if controls is not None:
         write_table(controls, results_dir / "baselines_controls.csv")
@@ -1036,6 +1155,14 @@ def _run_controls(
     if sgd_cfgs:
         untrained = _instantiate(sgd_cfgs[0], spec, n_in, n_out, experiment.seeds[0])
         untrained.eval()
+        # Scored through its point projection when the subject carries a head, because the
+        # control's null and its published Phase 3/4 comparators are point forecasts. What
+        # this measures for a quantile head is its untrained MEDIAN, which is the quantity
+        # comparable to those rows -- it is not a control on the interval, and no control on
+        # an untrained interval exists in this sweep. P4-D15 records the more general
+        # version of that gap: `sgd_cfgs[0]` is one model, so no control here covers the
+        # architectures the gate is actually about.
+        untrained_subject = untrained if untrained.head_kind == "point" else point_view(untrained)
         # strict=False: the outcome is recorded in baselines_controls.csv rather than
         # raised. The protocol's null for this control ("a random-init model must score
         # worse than persistence") is wrong on this task in exactly the way the shuffle
@@ -1063,7 +1190,7 @@ def _run_controls(
         results.append(
             untrained_control(
                 test,
-                untrained_model=untrained,
+                untrained_model=untrained_subject,
                 persistence_model=persistence,
                 regime=regime,
                 horizons=experiment.data.horizons,

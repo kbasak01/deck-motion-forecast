@@ -61,19 +61,31 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from conftest import SMALL_LOOKBACK
 from dmf.config import DataConfig, ModelConfig, load_data, load_experiment, load_model
 from dmf.data.dataset import DeckMotionDataset, make_dataloader
-from dmf.data.normalize import invert_norm, normalize_target
+from dmf.data.normalize import build_norm_stats, invert_norm, normalize_target
 from dmf.data.splits import REGIMES, Regime, build_split
 from dmf.data.windows import window_spec_from_config
 from dmf.models.ar import ARForecaster, lag_features
 from dmf.models.base import BaseForecaster
 from dmf.models.dlinear import DLinear, moving_average, series_decompose
 from dmf.models.dlinear_ols import DLinearOLS
+from dmf.models.heads import (
+    LOG_VAR_MAX,
+    LOG_VAR_MIN,
+    QUANTILE_FAN_9,
+    IntervalPredictor,
+    PredictiveDistribution,
+    n_output_params,
+    point_view,
+    quantile_fan,
+    sort_quantiles,
+)
 from dmf.models.lstm import LSTMForecaster
 from dmf.models.persistence import (
     TAU_WINDOW_MEAN,
@@ -99,10 +111,36 @@ from dmf.train.closed_form import (
     subset_columns,
 )
 from dmf.train.loop import EarlyStopper, fit, set_seed, validate
-from dmf.train.losses import mse_loss
+from dmf.train.losses import (
+    gaussian_nll_loss,
+    mae_loss,
+    mse_loss,
+    pinball_loss,
+    resolve_loss,
+)
 from dmf.train.registry import MODEL_REGISTRY, build_model, register_model
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
+
+#: Committed results, read by the tests that tie a parameter count to a published table
+#: rather than to a second copy of the same literal.
+RESULTS_ROOT = Path(__file__).resolve().parents[1] / "results"
+
+#: Constructor arguments every model receives from the geometry or the head resolution
+#: rather than from its ``params:`` block, so a config that omitted one would not be
+#: taking a silent Python default. Shared by the Phase 4 and Phase 5 config tests: two
+#: copies is how one of them ends up not knowing about ``head``.
+_SUPPLIED_ELSEWHERE: frozenset[str] = frozenset(
+    {
+        "self",
+        "lookback",
+        "max_horizon",
+        "n_input_channels",
+        "n_target_channels",
+        "n_quantiles",
+        "head",
+    }
+)
 
 #: The current task definition, **loaded** from ``configs/data/default.yaml`` rather than
 #: mirrored into constants here. The mirror this replaces (``lookback=200,
@@ -1571,15 +1609,7 @@ def test_the_deep_configs_carry_every_hyperparameter_explicitly(stem: str) -> No
     """
     cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
     accepted = set(inspect.signature(MODEL_REGISTRY[cfg.name].__init__).parameters)
-    supplied_elsewhere = {
-        "self",
-        "lookback",
-        "max_horizon",
-        "n_input_channels",
-        "n_target_channels",
-        "n_quantiles",
-    }
-    assert set(cfg.params) == accepted - supplied_elsewhere
+    assert set(cfg.params) == accepted - _SUPPLIED_ELSEWHERE
 
 
 @pytest.mark.parametrize("stem", DEEP_KEYS)
@@ -1610,6 +1640,731 @@ def test_the_deep_models_report_their_parameter_counts(rng: np.random.Generator)
         PRODUCTION_SPEC.lookback, PRODUCTION_SPEC.max_horizon, N_IN, N_OUT
     ).n_fitted_parameters
     assert dlinear < counts["tcn"] < counts["lstm"] < counts["transformer"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 probabilistic heads
+# ---------------------------------------------------------------------------
+
+#: The six shipped probabilistic configs, as ``(stem, point_twin_stem)``. The second entry
+#: is what makes "same backbone, different head" checkable: a probabilistic row is only
+#: comparable to its Phase 4 point row if nothing but the head changed.
+PROBABILISTIC_STEMS: tuple[tuple[str, str], ...] = (
+    ("dlinear_quantile", "dlinear"),
+    ("dlinear_gaussian", "dlinear"),
+    ("tcn_quantile", "tcn"),
+    ("tcn_gaussian", "tcn"),
+    ("lstm_quantile", "lstm"),
+    ("lstm_gaussian", "lstm"),
+)
+
+#: Parameter count of every (registry key, head) pair at the shipped geometry, pinned.
+#:
+#: The point column is **not** a third copy of a number: it is asserted below against
+#: ``results/e02/baselines.csv``, the committed artifact Phase 4 published, so a backbone
+#: change breaks the tie to the shipped table rather than quietly re-pinning it. The other
+#: two columns are the P5-D5 table, which records in advance that a quantile row is
+#: **not** parameter-matched to its point row or to the Gaussian one -- the final
+#: projection widens by ``K`` and ``max_horizon`` is 150.
+HEAD_PARAM_COUNTS: dict[tuple[str, str], int] = {
+    ("dlinear", "point"): 60_300,
+    ("dlinear", "gaussian"): 120_600,
+    ("dlinear", "quantile"): 542_700,
+    ("tcn", "point"): 196_804,
+    ("tcn", "gaussian"): 255_304,
+    ("tcn", "quantile"): 664_804,
+    ("lstm", "point"): 317_828,
+    ("lstm", "gaussian"): 433_928,
+    ("lstm", "quantile"): 1_246_628,
+}
+
+
+def _headed_model(key: str, geometry: tuple[int, int, int, int], head: str) -> BaseForecaster:
+    """Build one model at a given geometry with a given head, at its shipped defaults.
+
+    Args:
+        key: Registry key.
+        geometry: ``(lookback, max_horizon, C_in, C_out)``, samples and channels.
+        head: Head kind. The fan width for ``quantile`` comes from
+            :data:`dmf.models.heads.QUANTILE_FAN_9` rather than from a literal 9 here, so
+            the tests below move with the fan if it is ever revised.
+
+    Returns:
+        The model, in eval mode.
+    """
+    lookback, horizon, n_in, n_out = geometry
+    model: BaseForecaster = MODEL_REGISTRY[key](
+        lookback=lookback,
+        max_horizon=horizon,
+        n_input_channels=n_in,
+        n_target_channels=n_out,
+        n_quantiles=len(QUANTILE_FAN_9) if head == "quantile" else 0,
+        head=head,
+    )
+    return model.eval()
+
+
+def _fan(batch: int, horizon: int, channels: int, levels: int, seed: int = 0) -> torch.Tensor:
+    """Return a deliberately **crossed** quantile fan, shape ``(B, H, C, Q)``.
+
+    Drawn i.i.d. rather than sorted, because every assertion about sorting is vacuous on a
+    fan that was already ascending.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randn(batch, horizon, channels, levels, generator=generator, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("head", ["point", "gaussian", "quantile"])
+@pytest.mark.parametrize("key", ["dlinear", *DEEP_KEYS])
+@pytest.mark.parametrize("geometry", DEEP_GEOMETRIES, ids=["task", "synthetic"])
+def test_every_head_emits_the_shape_its_output_shape_promises(
+    geometry: tuple[int, int, int, int], key: str, head: str
+) -> None:
+    """The Gaussian case beside the ``n_quantiles=[0, 9]`` ones the shape tests already run.
+
+    ``(B, H, C, 2)`` is the same rank as a two-level fan and is deliberately not one: the
+    trailing axis carries ``(mean, log_var)`` and is never sorted (P5-D1).
+    """
+    lookback, horizon, _, n_out = geometry
+    model = _headed_model(key, geometry, head)
+    with torch.no_grad():
+        out = model(torch.zeros(3, lookback, geometry[2]))
+    width = {"point": 0, "gaussian": 2, "quantile": len(QUANTILE_FAN_9)}[head]
+    expected = (3, horizon, n_out) if head == "point" else (3, horizon, n_out, width)
+    assert tuple(out.shape) == expected == model.output_shape(3)
+    assert model.head_kind == head
+    assert bool(model.quantile_levels) == (head == "quantile")
+
+
+def test_the_point_parameter_counts_are_the_ones_phase_4_published() -> None:
+    """Adding the heads must not have moved a single point-model parameter.
+
+    Tied to ``results/e02/baselines.csv`` rather than to a literal, so this fails if the
+    backbone changes under a committed table instead of silently re-pinning it.
+    """
+    published = pd.read_csv(RESULTS_ROOT / "e02" / "baselines.csv")
+    for key in ("dlinear", "tcn", "lstm"):
+        rows = published.loc[published["model"] == key, "n_params"].unique()
+        assert len(rows) == 1, f"{key} reports several parameter counts in the Phase 4 table"
+        measured = _headed_model(key, DEEP_GEOMETRIES[0], "point").n_fitted_parameters
+        assert measured == int(rows[0]) == HEAD_PARAM_COUNTS[(key, "point")]
+
+
+@pytest.mark.parametrize("head", ["point", "gaussian", "quantile"])
+@pytest.mark.parametrize("key", ["dlinear", "tcn", "lstm"])
+def test_the_head_parameter_counts_are_the_p5d5_table(key: str, head: str) -> None:
+    """Pinned because the comparison they make impossible has to be stated, not discovered.
+
+    A quantile row carries 4-9x its point row's parameters, so a quantile-vs-point or a
+    quantile-vs-Gaussian comparison is **not** parameter-matched (P5-D5). The count belongs
+    in every table these rows appear in.
+    """
+    model = _headed_model(key, DEEP_GEOMETRIES[0], head)
+    assert model.n_fitted_parameters == HEAD_PARAM_COUNTS[(key, head)]
+
+
+@pytest.mark.parametrize(("stem", "twin"), PROBABILISTIC_STEMS)
+def test_every_probabilistic_config_builds_and_keeps_its_twins_backbone(
+    stem: str, twin: str
+) -> None:
+    """Same architecture, different head -- otherwise the pair measures two things at once."""
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    point = load_model(CONFIG_ROOT / "model" / f"{twin}.yaml")
+    assert cfg.name == point.name
+    assert cfg.params == point.params, "the probabilistic row must not change the backbone"
+    assert cfg.label == stem, "the label keys the results row and the checkpoint file"
+    model = build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
+    width = len(cfg.quantiles) if cfg.head == "quantile" else 2
+    assert model.output_shape(4) == (4, PRODUCTION_SPEC.max_horizon, N_OUT, width)
+    assert model.head_kind == cfg.head
+
+
+@pytest.mark.parametrize(("stem", "twin"), PROBABILISTIC_STEMS)
+def test_the_probabilistic_configs_carry_every_hyperparameter_explicitly(
+    stem: str, twin: str
+) -> None:
+    """A hyperparameter absent from the YAML takes the Python default with no warning."""
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    accepted = set(inspect.signature(MODEL_REGISTRY[cfg.name].__init__).parameters)
+    assert set(cfg.params) == accepted - _SUPPLIED_ELSEWHERE
+    assert twin in stem
+
+
+@pytest.mark.parametrize(("stem", "twin"), PROBABILISTIC_STEMS)
+def test_a_quantile_config_ships_the_project_fan_and_a_gaussian_one_ships_none(
+    stem: str, twin: str
+) -> None:
+    """The fan is read off, never interpolated, so the config's levels must be *the* fan.
+
+    A model is constructed with a fan *width* and recovers its levels from
+    :func:`dmf.models.heads.quantile_fan`, while :func:`dmf.train.losses.resolve_loss` reads
+    the config's levels. A config declaring different levels would be trained on one fan and
+    scored on another.
+    """
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    assert twin
+    if cfg.head == "quantile":
+        assert cfg.quantiles == QUANTILE_FAN_9
+        assert 0.5 in cfg.quantiles and 0.05 in cfg.quantiles and 0.95 in cfg.quantiles
+    else:
+        assert cfg.head == "gaussian"
+        assert cfg.quantiles == ()
+
+
+def test_load_model_refuses_quantile_levels_beside_a_gaussian_head(tmp_path: Path) -> None:
+    source = (CONFIG_ROOT / "model" / "dlinear_gaussian.yaml").read_text(encoding="utf-8")
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(source.replace("quantiles: []", "quantiles: [0.05, 0.5, 0.95]"))
+    with pytest.raises(ValueError, match="carries no quantile levels"):
+        load_model(bad)
+
+
+@pytest.mark.parametrize("name", ["persistence", "window_mean", "damped_persistence", "ar"])
+def test_build_model_refuses_a_gaussian_head_on_a_model_that_has_none(name: str) -> None:
+    """The hole this closes: ``head: gaussian`` used to build a POINT model in silence.
+
+    ``build_model`` passed ``n_quantiles`` for a quantile config and nothing at all for a
+    Gaussian one, so a Gaussian config fell through and produced a point model under a
+    config file documenting a distribution. Passing ``head`` through is only half the fix:
+    ``Persistence`` defines no ``__init__``, so it *accepts* the keyword by inheritance and
+    would have recorded itself as Gaussian while emitting a rank-3 point forecast. The
+    other half is :attr:`dmf.models.base.BaseForecaster.SUPPORTED_HEADS`, which the model
+    declares and the constructor checks.
+    """
+    params = {"order": 4} if name == "ar" else {}
+    cfg = ModelConfig(name=name, head="gaussian", quantiles=(), params=params, label="x")
+    # Two mechanisms, both loud, and which one fires depends only on whether the class
+    # defines its own ``__init__``: a model that does refuses the unexpected keyword
+    # (TypeError), a model that inherits ``BaseForecaster.__init__`` accepts it and is
+    # refused by ``SUPPORTED_HEADS`` (ValueError). Neither silently builds a point model,
+    # which is the property under test.
+    with pytest.raises((TypeError, ValueError)) as excinfo:
+        build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
+    assert "head" in str(excinfo.value)
+
+
+def test_build_model_refuses_a_head_on_the_closed_form_dlinear() -> None:
+    """``dlinear_ols`` inherits DLinear's forward and narrows its heads back to point only.
+
+    A closed-form solve has no probabilistic head: neither pinball loss nor a Gaussian NLL
+    has normal equations to accumulate. The narrowing is on the class, so it holds however
+    the model is constructed.
+    """
+    assert DLinearOLS.SUPPORTED_HEADS == ("point",)
+    assert set(DLinear.SUPPORTED_HEADS) == {"point", "quantile", "gaussian"}
+    cfg = ModelConfig(
+        name="dlinear_ols",
+        head="gaussian",
+        quantiles=(),
+        params={"kernel_size": 25, "ridge": 1e-6},
+        label="x",
+    )
+    with pytest.raises(TypeError, match="does not accept"):
+        build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
+
+
+def test_build_model_refuses_a_fan_that_is_not_the_one_the_model_will_report() -> None:
+    cfg = ModelConfig(
+        name="dlinear",
+        head="quantile",
+        quantiles=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+        params={"kernel_size": 25, "individual": False},
+        label="wrong_fan",
+    )
+    with pytest.raises(ValueError, match="quantile_fan"):
+        build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT)
+
+
+def test_a_head_and_a_quantile_count_that_disagree_are_refused() -> None:
+    """``n_quantiles`` positive if and only if the head is ``quantile``, or the arity lies."""
+    with pytest.raises(ValueError, match="disagree"):
+        DLinear(50, 10, SYNTH_C_IN, SYNTH_C_OUT, n_quantiles=2, head="gaussian")
+    with pytest.raises(ValueError, match="disagree"):
+        DLinear(50, 10, SYNTH_C_IN, SYNTH_C_OUT, n_quantiles=0, head="quantile")
+
+
+def test_n_output_params_is_the_single_definition_of_the_fan_width() -> None:
+    assert n_output_params("point") == 1
+    assert n_output_params("gaussian") == 2
+    assert n_output_params("quantile", QUANTILE_FAN_9) == len(QUANTILE_FAN_9) == 9
+    with pytest.raises(ValueError, match="at least 2 levels"):
+        n_output_params("quantile", (0.5,))
+    with pytest.raises(ValueError, match="no quantile levels"):
+        n_output_params("gaussian", QUANTILE_FAN_9)
+    # The fan axis is sorted ascending and the levels are read off it positionally, so a
+    # descending list would report the 0.05 quantile as the 0.95.
+    with pytest.raises(ValueError, match="strictly ascending"):
+        n_output_params("quantile", tuple(reversed(QUANTILE_FAN_9)))
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        n_output_params("quantile", (0.0, 0.5, 1.0))
+
+
+def test_the_shipped_fan_is_evenly_spaced_with_the_median_and_the_90_percent_pair_exact() -> None:
+    """0.05, 0.5 and 0.95 are members, which is why nothing has to be interpolated."""
+    assert quantile_fan(len(QUANTILE_FAN_9)) is QUANTILE_FAN_9
+    assert QUANTILE_FAN_9[0] == 0.05
+    assert QUANTILE_FAN_9[len(QUANTILE_FAN_9) // 2] == 0.5
+    assert QUANTILE_FAN_9[-1] == 0.95
+    steps = {round(b - a, 12) for a, b in zip(QUANTILE_FAN_9, QUANTILE_FAN_9[1:], strict=False)}
+    assert steps == {0.1125}
+
+
+def test_sort_quantiles_is_idempotent_and_preserves_the_multiset_per_cell() -> None:
+    """Sorting must reorder the fan of each ``(h, c)`` and change nothing else.
+
+    A bug that sorted across horizons or channels -- flattening the wrong axes -- would
+    still return an ascending tensor of the right shape.
+    """
+    raw = _fan(2, 4, 3, len(QUANTILE_FAN_9))
+    once = sort_quantiles(raw)
+    assert torch.equal(once, sort_quantiles(once))
+    assert bool((once.diff(dim=-1) >= 0).all())
+    torch.testing.assert_close(raw.sum(dim=-1), once.sum(dim=-1))
+    for h in range(raw.shape[1]):
+        for c in range(raw.shape[2]):
+            for b in range(raw.shape[0]):
+                assert sorted(raw[b, h, c].tolist()) == pytest.approx(once[b, h, c].tolist())
+
+
+def test_a_gaussian_distribution_cannot_reach_sort_quantiles() -> None:
+    """The P5-D1 trap, asserted rather than described.
+
+    ``(mean, log_var)`` on a sorted axis is swapped on every element where
+    ``log_var < mean``: silent, shape-preserving, and it produces intervals that are wrong
+    without being malformed. The guard is structural -- the ``gaussian`` kind never calls
+    :func:`sort_quantiles` -- so the assertion is that a *crossed* Gaussian pair survives
+    construction untouched.
+    """
+    raw = torch.stack(
+        (torch.full((2, 3, 3), 5.0), torch.full((2, 3, 3), -2.0)),
+        dim=-1,
+    )
+    dist = PredictiveDistribution(raw, "gaussian")
+    assert torch.equal(dist.raw, raw), "a gaussian output must not be sorted"
+    mean, sigma = dist.gaussian_params()
+    assert bool((mean == 5.0).all())
+    torch.testing.assert_close(sigma, torch.full_like(sigma, float(torch.exp(torch.tensor(-1.0)))))
+    # And the same numbers read as a fan would have been silently swapped:
+    assert bool((sort_quantiles(raw)[..., 0] == -2.0).all())
+
+
+def test_a_constructed_quantile_distribution_is_never_crossed() -> None:
+    raw = _fan(3, 5, 2, len(QUANTILE_FAN_9))
+    dist = PredictiveDistribution(raw, "quantile", QUANTILE_FAN_9)
+    assert bool((dist.raw.diff(dim=-1) >= 0).all())
+    assert not torch.equal(dist.raw, raw), "the fixture fan must be crossed to be a test"
+
+
+def test_the_rank_of_the_raw_output_is_checked_against_the_head() -> None:
+    with pytest.raises(ValueError, match="must be rank 4"):
+        PredictiveDistribution(torch.zeros(2, 3, 4), "gaussian")
+    with pytest.raises(ValueError, match=r"must be \(B, H, C\)"):
+        PredictiveDistribution(torch.zeros(2, 3, 4, 2), "point")
+    with pytest.raises(ValueError, match="trailing axis"):
+        PredictiveDistribution(torch.zeros(2, 3, 4, 3), "gaussian")
+
+
+def test_the_point_forecast_of_each_head_is_the_one_p5d5_names() -> None:
+    """0.5 quantile for a fan, mean for a Gaussian -- read off, never interpolated."""
+    fan = PredictiveDistribution(_fan(2, 3, 4, len(QUANTILE_FAN_9)), "quantile", QUANTILE_FAN_9)
+    median_index = QUANTILE_FAN_9.index(0.5)
+    assert torch.equal(fan.point(), fan.raw[..., median_index])
+    gaussian_raw = _fan(2, 3, 4, 2)
+    gaussian = PredictiveDistribution(gaussian_raw, "gaussian")
+    assert torch.equal(gaussian.point(), gaussian_raw[..., 0])
+    point_raw = torch.zeros(2, 3, 4)
+    assert torch.equal(PredictiveDistribution(point_raw, "point").point(), point_raw)
+
+
+def test_interval_at_alpha_0p1_is_exactly_the_outermost_fan_pair() -> None:
+    """PICP@90 must read fan members, not an interpolation between them."""
+    dist = PredictiveDistribution(_fan(2, 3, 4, len(QUANTILE_FAN_9)), "quantile", QUANTILE_FAN_9)
+    lower, upper = dist.interval(0.1)
+    assert torch.equal(lower, dist.raw[..., 0])
+    assert torch.equal(upper, dist.raw[..., -1])
+    assert bool((upper >= lower).all())
+
+
+def test_quantiles_at_raises_on_a_level_that_is_not_in_the_fan() -> None:
+    dist = PredictiveDistribution(_fan(2, 3, 4, len(QUANTILE_FAN_9)), "quantile", QUANTILE_FAN_9)
+    with pytest.raises(ValueError, match="not in the fan"):
+        dist.quantiles_at((0.9,))
+    with pytest.raises(ValueError, match="not in the fan"):
+        dist.interval(0.2)
+    with pytest.raises(ValueError, match="has no quantiles"):
+        PredictiveDistribution(torch.zeros(2, 3, 4), "point").interval(0.1)
+
+
+def test_a_gaussian_interval_is_the_inverse_normal_cdf_of_its_own_sigma() -> None:
+    raw = torch.stack((torch.zeros(2, 3, 4), torch.zeros(2, 3, 4)), dim=-1)
+    dist = PredictiveDistribution(raw, "gaussian")
+    lower, upper = dist.interval(0.1)
+    # log_var = 0 so sigma = 1: the 90 percent interval is +- z(0.95) = +- 1.6448536...
+    torch.testing.assert_close(upper, torch.full_like(upper, 1.6448536269514722))
+    torch.testing.assert_close(lower, -upper)
+
+
+def test_affine_round_trips_a_fan_to_corpus_units_and_back() -> None:
+    """``affine`` is the single place unit conversion happens, and it must be invertible.
+
+    Also asserted against :func:`dmf.data.normalize.invert_norm` on the same tensors: the
+    distribution-valued conversion and the array-valued one are the same map, or a
+    probabilistic row's interval is in different units from the point row's RMSE.
+    """
+    channels = PRODUCTION_CFG.target_dofs
+    scale_values = np.linspace(0.5, 3.0, len(channels))
+    stats = build_norm_stats(scale_values, channels, "id/train", n_realizations=4)
+    raw = _fan(3, 6, len(channels), len(QUANTILE_FAN_9))
+    dist = PredictiveDistribution(raw, "quantile", QUANTILE_FAN_9)
+
+    generator = torch.Generator().manual_seed(11)
+    window_mean = torch.randn(3, 1, len(channels), generator=generator, dtype=torch.float64)
+    scale = torch.as_tensor(scale_values, dtype=torch.float64).reshape(1, 1, -1)
+
+    corpus = dist.affine(scale, window_mean)
+    torch.testing.assert_close(corpus.raw, invert_norm(dist.raw, stats, window_mean))
+    assert bool((corpus.raw.diff(dim=-1) >= 0).all()), "a positive scale preserves the order"
+
+    back = corpus.affine(1.0 / scale, -window_mean / scale)
+    torch.testing.assert_close(back.raw, dist.raw)
+
+    lower, upper = corpus.interval(0.1)
+    torch.testing.assert_close(upper - lower, (dist.raw[..., -1] - dist.raw[..., 0]) * scale)
+
+
+def test_affine_scales_a_gaussian_sigma_and_does_not_offset_it() -> None:
+    """A location shift does not change a spread; ``log_var`` takes ``2*log(scale)`` only."""
+    generator = torch.Generator().manual_seed(5)
+    raw = torch.randn(2, 4, 3, 2, generator=generator, dtype=torch.float64)
+    dist = PredictiveDistribution(raw, "gaussian")
+    mean, sigma = dist.gaussian_params()
+    scale = torch.tensor([0.5, 2.0, 10.0], dtype=torch.float64).reshape(1, 1, -1)
+    offset = torch.full((2, 1, 3), 7.0, dtype=torch.float64)
+
+    moved = dist.affine(scale, offset)
+    moved_mean, moved_sigma = moved.gaussian_params()
+    torch.testing.assert_close(moved_mean, mean * scale + offset)
+    torch.testing.assert_close(moved_sigma, sigma * scale)
+    lower, upper = moved.interval(0.1)
+    before_lo, before_hi = dist.interval(0.1)
+    torch.testing.assert_close(upper - lower, (before_hi - before_lo) * scale)
+
+
+def test_affine_refuses_a_negative_scale() -> None:
+    """A negative scale reverses a fan and swaps every interval endpoint, shape unchanged."""
+    dist = PredictiveDistribution(_fan(2, 3, 4, len(QUANTILE_FAN_9)), "quantile", QUANTILE_FAN_9)
+    with pytest.raises(ValueError, match="strictly positive"):
+        dist.affine(torch.full((1, 1, 4), -1.0, dtype=torch.float64), torch.zeros(2, 1, 4))
+
+
+def test_the_gaussian_head_clamps_its_log_variance() -> None:
+    """Unclamped, the NLL drives ``log_var`` down as a loss that keeps improving."""
+    model = _headed_model("dlinear", DEEP_GEOMETRIES[1], "gaussian")
+    with torch.no_grad():
+        for linear in (*model.trend, *model.remainder):
+            linear.bias.fill_(1e4)
+        out = model(torch.zeros(2, DEEP_GEOMETRIES[1][0], DEEP_GEOMETRIES[1][2]))
+    assert float(out[..., 1].max()) == LOG_VAR_MAX
+    assert float(out[..., 0].max()) > LOG_VAR_MAX, "the mean must not be clamped"
+    with torch.no_grad():
+        for linear in (*model.trend, *model.remainder):
+            linear.bias.fill_(-1e4)
+        out = model(torch.zeros(2, DEEP_GEOMETRIES[1][0], DEEP_GEOMETRIES[1][2]))
+    assert float(out[..., 1].min()) == LOG_VAR_MIN
+
+
+def test_point_view_scores_a_probabilistic_model_through_the_rank_three_path() -> None:
+    """``evaluate_models`` hard-rejects rank 4, and that guarantee is not being widened.
+
+    Every row of every committed table comes out of one scoring path with one skill
+    denominator; P5-D5 requires the probabilistic rows to be in it, so the view -- not the
+    runner -- is what changes.
+    """
+    geometry = DEEP_GEOMETRIES[1]
+    lookback, horizon, n_in, n_out = geometry
+    x = torch.zeros(3, lookback, n_in)
+    for head in ("point", "quantile", "gaussian"):
+        model = _headed_model("dlinear", geometry, head)
+        view = point_view(model)
+        view.eval()
+        with torch.no_grad():
+            scored = view(x)
+            expected = PredictiveDistribution(
+                model(x), model.head_kind, model.quantile_levels
+            ).point()
+        assert tuple(scored.shape) == (3, horizon, n_out)
+        assert torch.equal(scored, expected)
+    # The wrapped model is a submodule, so device moves and eval switches reach it.
+    subject = _headed_model("dlinear", geometry, "quantile")
+    wrapper = point_view(subject)
+    wrapper.train()
+    assert subject.training
+    wrapper.eval()
+    assert not subject.training
+
+
+def test_the_conformal_seam_moves_coverage_without_importing_a_model() -> None:
+    """P5-D1's ``IntervalPredictor`` seam, exercised by a test double.
+
+    A ``ConformalWrapper`` (Project 6) must be able to offset interval endpoints from
+    held-out residuals **without importing or subclassing any model**. The double below
+    holds a stub distribution, implements ``predict``, and must move PICP by the amount it
+    shifted. A seam that is only claimed in a docstring is not a seam.
+
+    Written here rather than in ``tests/test_probabilistic.py`` because that module already
+    exists and is owned by the eval side, which deliberately imports nothing from the model
+    layer.
+    """
+
+    class _ShiftCalibrator:
+        """Widens every interval by a fixed additive margin, model-agnostically."""
+
+        def __init__(self, fan: torch.Tensor, levels: tuple[float, ...], margin: float) -> None:
+            self._fan = fan
+            self._levels = levels
+            self._margin = margin
+
+        def predict(self, x: torch.Tensor) -> PredictiveDistribution:
+            """Return the stub fan, widened by the calibrated margin."""
+            assert x.ndim == 3, "an IntervalPredictor takes (B, L, C_in) like any model"
+            widened = self._fan.clone()
+            widened[..., 0] -= self._margin
+            widened[..., -1] += self._margin
+            return PredictiveDistribution(widened, "quantile", self._levels)
+
+    generator = torch.Generator().manual_seed(2)
+    truth = torch.randn(256, 4, 2, generator=generator, dtype=torch.float64)
+    # Centred 3.0 away from the truth with a spread of 0.1: sharp, confident and wrong,
+    # which is the state a calibrator has to repair.
+    fan = torch.stack(
+        [
+            truth + 3.0 + q
+            for q in torch.linspace(-0.05, 0.05, len(QUANTILE_FAN_9), dtype=torch.float64)
+        ],
+        dim=-1,
+    )
+    x = torch.zeros(256, 8, 2)
+
+    uncalibrated = _ShiftCalibrator(fan, QUANTILE_FAN_9, margin=0.0)
+    calibrated = _ShiftCalibrator(fan, QUANTILE_FAN_9, margin=5.0)
+    assert isinstance(uncalibrated, IntervalPredictor)
+
+    def _picp(predictor: _ShiftCalibrator) -> float:
+        lower, upper = predictor.predict(x).interval(0.1)
+        return float(((truth >= lower) & (truth <= upper)).to(torch.float64).mean())
+
+    assert _picp(uncalibrated) == 0.0, "the stub must start under-covering for this to be a test"
+    assert _picp(calibrated) == 1.0
+    # The seam holds a distribution, not a model: nothing in this test built one.
+    assert not hasattr(uncalibrated, "model")
+
+
+def test_mae_loss_matches_torch(rng: np.random.Generator) -> None:
+    a = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    b = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    torch.testing.assert_close(mae_loss(a, b), torch.nn.functional.l1_loss(a, b))
+
+
+def test_pinball_at_the_median_alone_is_half_the_mae(rng: np.random.Generator) -> None:
+    """``max(0.5e, -0.5e) = 0.5|e|`` -- the identity that says the sign convention is right."""
+    target = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    pred = torch.from_numpy(rng.normal(size=(4, 6, 3, 1)))
+    torch.testing.assert_close(
+        pinball_loss(pred, target, (0.5,)), 0.5 * mae_loss(pred[..., 0], target)
+    )
+
+
+def test_pinball_penalises_the_two_tails_asymmetrically() -> None:
+    """Under-predicting the 0.95 quantile must cost 19x what over-predicting it does."""
+    target = torch.zeros(1, 1, 1)
+    over = pinball_loss(torch.full((1, 1, 1, 1), 1.0), target, (0.95,))
+    under = pinball_loss(torch.full((1, 1, 1, 1), -1.0), target, (0.95,))
+    assert float(over) == pytest.approx(0.05)
+    assert float(under) == pytest.approx(0.95)
+
+
+def test_pinball_rejects_a_fan_that_does_not_match_its_levels() -> None:
+    with pytest.raises(ValueError, match="quantile levels"):
+        pinball_loss(torch.zeros(2, 3, 4, 5), torch.zeros(2, 3, 4), QUANTILE_FAN_9)
+    with pytest.raises(ValueError, match=r"\(B, H, C\)"):
+        pinball_loss(torch.zeros(2, 3, 4, 9), torch.zeros(2, 3, 5), QUANTILE_FAN_9)
+
+
+def test_gaussian_nll_matches_torch(rng: np.random.Generator) -> None:
+    """Up to the dropped ``0.5*log(2*pi)``, which ``full=False`` drops as well."""
+    mean = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    log_var = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    target = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    torch.testing.assert_close(
+        gaussian_nll_loss(mean, log_var, target),
+        torch.nn.functional.gaussian_nll_loss(
+            mean, target, torch.exp(log_var), full=False, reduction="mean"
+        ),
+    )
+
+
+def test_resolve_loss_dispatches_on_the_head(rng: np.random.Generator) -> None:
+    """One resolution per config; the loop never branches on a head (P5-D4)."""
+    target = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    point = torch.from_numpy(rng.normal(size=(4, 6, 3)))
+    fan = torch.from_numpy(rng.normal(size=(4, 6, 3, len(QUANTILE_FAN_9))))
+    gaussian = torch.from_numpy(rng.normal(size=(4, 6, 3, 2)))
+
+    assert resolve_loss("point") is mse_loss
+    torch.testing.assert_close(resolve_loss("point")(point, target), mse_loss(point, target))
+    torch.testing.assert_close(
+        resolve_loss("quantile", QUANTILE_FAN_9)(fan, target),
+        pinball_loss(fan, target, QUANTILE_FAN_9),
+    )
+    torch.testing.assert_close(
+        resolve_loss("gaussian")(gaussian, target),
+        gaussian_nll_loss(gaussian[..., 0], gaussian[..., 1], target),
+    )
+    with pytest.raises(ValueError, match="at least 2 levels"):
+        resolve_loss("quantile", (0.5,))
+    with pytest.raises(ValueError, match="no quantile levels"):
+        resolve_loss("point", QUANTILE_FAN_9)
+
+
+def test_checkpoint_paths_do_not_collide_across_the_heads_of_one_class(tmp_path: Path) -> None:
+    """Three variants of ``DLinear`` in one run wrote ``dlinear_seed0.pt`` three times.
+
+    The filename used to be built from the class name, so in ``e03`` the point, quantile and
+    Gaussian rows of one architecture would each overwrite the last -- leaving two runs'
+    weights on disk under a third run's name, with nothing in the table to say so.
+    """
+    lookback, horizon, n_in, n_out = 20, 5, SYNTH_C_IN, SYNTH_C_OUT
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(32, lookback, n_in, generator=generator)
+    y = torch.randn(32, horizon, n_out, generator=generator)
+    window_mean = torch.zeros(32, 1, n_out)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x, y, window_mean), batch_size=16
+    )
+    cfg = _train_cfg(epochs=1)
+
+    paths = []
+    for label, head, quantiles in (
+        ("dlinear", "point", ()),
+        ("dlinear_quantile", "quantile", QUANTILE_FAN_9),
+        ("dlinear_gaussian", "gaussian", ()),
+    ):
+        set_seed(0)
+        model = DLinear(
+            lookback,
+            horizon,
+            n_in,
+            n_out,
+            kernel_size=5,
+            n_quantiles=len(quantiles),
+            head=head,
+        )
+        result = fit(
+            model,
+            loader,
+            loader,
+            cfg,
+            seed=0,
+            checkpoint_dir=tmp_path,
+            loss_fn=resolve_loss(head, quantiles),
+            label=label,
+        )
+        assert result.checkpoint_path.name == f"{label}_seed0.pt"
+        assert result.checkpoint_path.exists()
+        paths.append(result.checkpoint_path)
+    assert len({p.name for p in paths}) == 3
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(p.name for p in paths)
+
+
+def test_the_probabilistic_experiment_config_is_one_run_at_the_phase_4_budget() -> None:
+    """Gate 5's table must be ONE run, and its budget must be Phase 4's, unchanged.
+
+    The five deterministic rows are the skill denominator (`persistence`), the two trivial
+    references, `ar20`, and the closed-form positive control: `dlinear_ols` is budget- and
+    seed-independent, so its `id` gate-cell skill must reproduce `results/e02/baselines.csv`
+    exactly, and if it does not, the pipeline moved between phases.
+
+    `ar20` earns its place structurally, which is why its presence is asserted below rather
+    than left to the config: ``dmf.train.experiment._run_controls`` runs the shuffle control
+    -- the only control in this project that answers "is this leakage?" -- **only** when the
+    experiment carries a config with an ``order`` parameter. Drop that row and the sweep
+    still runs, still writes a controls file, and ships a coverage table with no leakage
+    control at all. That silent-omission shape is the P4-D15 defect, so it is pinned here.
+
+    The train block is asserted **equal to** ``e02_deep.yaml``'s rather than pinned to
+    literals: P5-D3 keeps the budget unchanged so that every point row here stays comparable
+    to the committed Phase 4 table, and equality is that claim.
+    """
+    from dmf.eval.report import MIN_SEEDS
+
+    cfg = load_experiment(CONFIG_ROOT / "experiment" / "e03_probabilistic.yaml")
+    deep = load_experiment(CONFIG_ROOT / "experiment" / "e02_deep.yaml")
+    labels = [m.label for m in cfg.models]
+    assert labels == [
+        "persistence",
+        "window_mean",
+        "damped_persistence",
+        "ar20",
+        "dlinear_ols",
+        "dlinear_quantile",
+        "dlinear_gaussian",
+        "tcn_quantile",
+        "tcn_gaussian",
+        "lstm_quantile",
+        "lstm_gaussian",
+    ]
+    assert labels[0] == "persistence", "the skill denominator must be scored first"
+    assert cfg.name == "probabilistic"
+    assert cfg.data == deep.data, "one task definition, or the horizons are not comparable"
+    assert cfg.train == deep.train, "the Phase 5 budget is the Phase 4 budget (P5-D3)"
+    assert len(cfg.seeds) >= MIN_SEEDS
+    assert set(cfg.regimes) == set(REGIMES)
+
+    heads = {m.label: m.head for m in cfg.models}
+    assert sorted(label for label, head in heads.items() if head == "quantile") == [
+        "dlinear_quantile",
+        "lstm_quantile",
+        "tcn_quantile",
+    ]
+    assert sorted(label for label, head in heads.items() if head == "gaussian") == [
+        "dlinear_gaussian",
+        "lstm_gaussian",
+        "tcn_gaussian",
+    ]
+    sgd = [m.label for m in cfg.models if MODEL_REGISTRY[m.name].FIT_KIND == "sgd"]
+    assert sgd[0] == "dlinear_quantile", "_run_controls takes the first SGD config as subject"
+    assert "dlinear_ols" in labels, "the closed-form positive control ties this run to e02"
+    # Asserted on the mechanism `_run_controls` actually dispatches on, not on the label:
+    # renaming `ar20` would keep the shuffle control running, whereas dropping the `order`
+    # parameter would silently disable it.
+    assert [m.label for m in cfg.models if "order" in m.params], (
+        "no AR config: _run_controls would skip the shuffle control and this sweep would "
+        "publish coverage numbers with no leakage control (P4-D15)"
+    )
+
+
+def test_every_model_in_the_probabilistic_config_builds() -> None:
+    """A config that loads but cannot be instantiated fails four regimes into a sweep."""
+    cfg = load_experiment(CONFIG_ROOT / "experiment" / "e03_probabilistic.yaml")
+    spec = window_spec_from_config(cfg.data)
+    n_in = len(cfg.data.input_channels)
+    n_out = len(cfg.data.target_dofs)
+    for model_cfg in cfg.models:
+        model = build_model(model_cfg, spec, n_in, n_out)
+        rank_three = (4, spec.max_horizon, n_out)
+        if model_cfg.head == "point":
+            assert model.output_shape(4) == rank_three
+        else:
+            assert model.output_shape(4)[:3] == rank_three
+        if MODEL_REGISTRY[model_cfg.name].FIT_KIND != "sgd":
+            # The closed-form and fit-free rows raise until they are fitted; their shapes
+            # are asserted above and their forward pass is covered by the Phase 3 tests.
+            continue
+        with torch.no_grad():
+            scored = point_view(model.eval())(torch.zeros(2, spec.lookback, n_in))
+        assert tuple(scored.shape) == (2, *rank_three[1:]), (
+            f"{model_cfg.label} must reach dmf.eval.runner.evaluate_models as rank 3"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2601,3 +3356,238 @@ def test_unused_import_guard() -> None:
     cfg = ModelConfig(name="persistence", head="point", quantiles=(), params={}, label="p")
     assert replace(cfg, label="q").label == "q"
     assert SMALL_LOOKBACK > 0
+
+
+def _probabilistic_smoke_experiment(data_cfg: DataConfig):  # type: ignore[no-untyped-def]
+    """Return a cut-down ``e03_probabilistic`` covering both heads and the point pass.
+
+    One backbone per head rather than three: this test exists to exercise the *assembly* --
+    head-specific loss dispatch, the point projection reaching ``evaluate_models``, the
+    distributional pass, the ``signal_std`` join and the two aggregated writes -- and a
+    second backbone would exercise none of it twice. ``persistence`` and ``dlinear_ols`` are
+    kept because the first is the skill denominator the scorer requires and the second is
+    the closed-form row that proves a point model still routes untouched.
+
+    Args:
+        data_cfg: The small-corpus task configuration.
+
+    Returns:
+        A :class:`dmf.config.ExperimentConfig` sized for a few seconds on CPU.
+    """
+    from dmf.config import ExperimentConfig
+
+    base = load_experiment(CONFIG_ROOT / "experiment" / "e03_probabilistic.yaml")
+    wanted = ("persistence", "dlinear_ols", "dlinear_quantile", "dlinear_gaussian")
+    models = tuple(m for m in base.models if m.label in wanted)
+    assert len(models) == len(wanted), [m.label for m in base.models]
+    return ExperimentConfig(
+        name="probabilistic_smoke",
+        data=data_cfg,
+        models=models,
+        train=_train_cfg(epochs=2),
+        seeds=base.seeds,
+        regimes=("id", "unseen_seastate"),
+    )
+
+
+def test_run_experiment_writes_a_joinable_probabilistic_artifact(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """End-to-end cover for the Phase 5 assembly, on the two regimes Gate 5 is read across.
+
+    The Phase 5 sweep is roughly two days of GPU. This is the test that has to fail first if
+    a shape, a unit or a join is wrong, so it asserts the things that would otherwise only
+    show up in a published number:
+
+    - **Both heads train and score.** Head-specific loss dispatch (P5-D4) reaching ``fit``,
+      and a rank-4 head reaching the distributional scorer without going near the rank-3
+      guarantees of ``evaluate_models``.
+    - **Every probabilistic row also carries point accuracy** (P5-D5), against the same
+      persistence denominator as every other row -- the non-negotiable-4 requirement that a
+      result without its baseline is not a result.
+    - **The two passes describe the same windows.** ``picp`` and ``rmse`` on one row must
+      come from one window set; the ``expected_keys`` guard enforces it and this is the
+      test that the guard is actually wired.
+    - **Coverage is in [0, 1] and width is positive and in corpus units.** A sorted fan
+      cannot produce anything else, so a violation means sorting or the affine unit
+      conversion is broken.
+    - **Checkpoints do not collide.** Three variants of one class write three files; before
+      the P5-D4 rename they all wrote ``dlinear_seed0.pt`` and two silently overwrote the
+      third.
+    - **The controls run with a head-carrying subject.** ``_run_controls`` takes
+      ``sgd_cfgs[0]``, which in ``e03`` is a *quantile* model, and ``untrained_control``
+      scores through ``evaluate_models`` -- which rejects rank-4 output. Without the
+      ``point_view`` routing this raises at the END of a regime, i.e. roughly twelve hours
+      into the real sweep. Controls are left on here for that reason despite the cost.
+    """
+    import pandas as pd
+
+    from dmf.eval.report import PROBABILISTIC_COLUMNS
+    from dmf.train.experiment import GATE5_ALPHA, run_experiment
+
+    results = tmp_path / "results"
+    checkpoints = tmp_path / "checkpoints"
+    regimes = ("id", "unseen_seastate")
+    per_run = run_experiment(
+        _probabilistic_smoke_experiment(small_data_cfg),
+        small_corpus,
+        results_dir=results,
+        seeds=(0, 1, 2),
+        regimes=regimes,
+        device="cpu",
+        run_controls=True,
+        checkpoint_root=checkpoints,
+    )
+    assert not per_run.empty
+
+    # The control that would have failed twelve hours into the sweep: an untrained QUANTILE
+    # head, scored through its point projection because the null and the published Phase 3/4
+    # comparators are point forecasts (P5-D10).
+    controls = pd.read_csv(results / "baselines_controls.csv")
+    assert "untrained" in set(controls["control"]), sorted(set(controls["control"]))
+
+    for name in ("baselines.csv", "probabilistic.csv", "probabilistic_by_seed.csv"):
+        assert (results / name).exists(), name
+    table = pd.read_csv(results / "probabilistic.csv")
+    assert tuple(table.columns) == PROBABILISTIC_COLUMNS
+    assert set(table["regime"]) == set(regimes)
+    assert set(table["model"]) == {"dlinear_quantile", "dlinear_gaussian"}
+    assert set(table["head"]) == {"quantile", "gaussian"}
+    assert (table["alpha"] == GATE5_ALPHA).all()
+    # A point model has no predictive distribution and must not appear here at all.
+    assert "dlinear_ols" not in set(table["model"])
+    assert "persistence" not in set(table["model"])
+
+    # The head-specific stopping objective reaches the committed artifact (P5-D4).
+    assert set(table["val_loss_name"]) == {"pinball", "gaussian_nll"}
+    by_seed = pd.read_csv(results / "probabilistic_by_seed.csv")
+    assert set(by_seed["val_loss_name"]) == {"pinball", "gaussian_nll"}
+
+    # Sorting and the affine unit conversion, read off the published columns.
+    assert ((table["picp_mean"] >= 0.0) & (table["picp_mean"] <= 1.0)).all()
+    assert (table["mean_interval_width_mean"] > 0.0).all()
+    assert (table["width_ratio_mean"] > 0.0).all()
+    assert (table["picp_ci_lo"] <= table["picp_mean"] + 1e-12).all()
+    assert (table["picp_mean"] <= table["picp_ci_hi"] + 1e-12).all()
+    # The Gaussian head has no fan to cross; the quantile head's rate is a real fraction.
+    gaussian = table[table["head"] == "gaussian"]
+    assert (gaussian["crossing_rate_mean"] == 0.0).all()
+    quantile = table[table["head"] == "quantile"]
+    assert ((quantile["crossing_rate_mean"] >= 0.0) & (quantile["crossing_rate_mean"] <= 1.0)).all()
+
+    # P5-D5: the point row exists for every probabilistic row, scored against persistence.
+    baselines = pd.read_csv(results / "baselines.csv")
+    point_keys = set(
+        map(tuple, baselines[["model", "regime", "dof", "horizon_samples"]].values.tolist())
+    )
+    prob_keys = set(
+        map(tuple, table[["model", "regime", "dof", "horizon_samples"]].values.tolist())
+    )
+    assert prob_keys <= point_keys, sorted(prob_keys - point_keys)[:3]
+
+    # The two passes agree on the window set, which is what makes a row internally coherent.
+    merged = table.merge(
+        baselines, on=["model", "regime", "dof", "horizon_samples"], validate="one_to_one"
+    )
+    assert (merged["n_windows_x"] == merged["n_windows_y"]).all()
+    assert (merged["signal_std_x"] == merged["signal_std_y"]).all()
+
+    # P5-D4: one checkpoint per (label, seed). Keyed on the class name, as it was before
+    # Phase 5, the three dlinear variants would collide on one path per seed.
+    written = sorted(str(path.relative_to(checkpoints)) for path in checkpoints.rglob("*.pt"))
+    names = {Path(path).name for path in written}
+    assert any(name.startswith("dlinear_quantile_seed") for name in names), written
+    assert any(name.startswith("dlinear_gaussian_seed") for name in names), written
+    # Compared as paths, not basenames: checkpoints live under `<experiment>/<regime>/`, so
+    # two regimes writing the same basename is correct. What must not happen is two *labels*
+    # of one class colliding within a regime, which is what the per-regime count catches.
+    assert len(written) == len(set(written))
+    assert len(names) == len(set(written)) // len(regimes)
+
+
+def test_the_gate5_readout_is_repo_code_reading_committed_artifacts(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """The Gate 5 decision is taken by ``dmf.eval.gate``, from the CSVs, never by a script.
+
+    Gate 4 needed this and Gate 5 inherits it: a gate read by an ad-hoc script is a decision
+    that cannot be re-taken, and ``results/e02/gate4.md`` once declared a *superseded*
+    criterion while the README claimed the current one passed. Here the whole chain runs --
+    sweep, aggregate, read-out, document -- and the assertions are on the properties that
+    would let a wrong number ship:
+
+    - an absent gate cell **raises** rather than reporting an empty pass;
+    - a row with too few seeds is UNVERIFIED, which is not a pass;
+    - the rendered document names every non-passing row in its headline, so a reader who
+      stops after the outcome line cannot miss one (CLAUDE.md non-negotiable 6);
+    - the degradation table exists and never affects the verdict, because P5-D2 requires
+      the shift to be reported rather than fixed.
+    """
+    import pandas as pd
+
+    from dmf.eval.gate import (
+        GATE5_PICP_BAND,
+        VERDICT_PASS,
+        VERDICT_UNVERIFIED,
+        build_gate5_markdown,
+        coverage_degradation,
+        gate5_reading_passes,
+        gate5_readout,
+        write_gate5_report,
+    )
+    from dmf.train.experiment import run_experiment
+
+    results = tmp_path / "results"
+    regimes = ("id", "unseen_seastate")
+    run_experiment(
+        _probabilistic_smoke_experiment(small_data_cfg),
+        small_corpus,
+        results_dir=results,
+        seeds=(0, 1, 2),
+        regimes=regimes,
+        device="cpu",
+        run_controls=False,
+        checkpoint_root=tmp_path / "checkpoints",
+    )
+    # The fixture geometry has no 100-sample horizon, so the registered cell is genuinely
+    # absent -- which is the behaviour to assert, not to work around.
+    table = pd.read_csv(results / "probabilistic.csv")
+    with pytest.raises(ValueError, match="absent from the probabilistic table"):
+        gate5_readout(table)
+
+    cell_horizon = int(small_data_cfg.horizons[-1])
+    readout, csv_path, markdown_path = write_gate5_report(
+        results, dof="pitch", horizon_samples=cell_horizon
+    )
+    assert csv_path.exists() and markdown_path.exists()
+    assert (results / "gate5_degradation.csv").exists()
+    assert set(readout["reading"]) == {"A", "B"}
+    assert set(readout["regime"]) == {"id"}, "the gate is read on id alone"
+
+    reading_a = readout[readout["reading"] == "A"]
+    assert len(reading_a) == 2, "one row per (model, head)"
+    assert (reading_a["horizon_samples"] == cell_horizon).all()
+    assert (reading_a["band_lo"] == GATE5_PICP_BAND[0]).all()
+    assert (reading_a["band_hi"] == GATE5_PICP_BAND[1]).all()
+
+    # The verdict is the band, applied to the published column -- not a recomputation.
+    for row in readout.itertuples():
+        inside = GATE5_PICP_BAND[0] <= row.picp_mean <= GATE5_PICP_BAND[1]
+        if row.verdict != VERDICT_UNVERIFIED:
+            assert (row.verdict == VERDICT_PASS) == inside, row
+
+    document = build_gate5_markdown(
+        readout, degradation=coverage_degradation(table), results_dir=results
+    )
+    assert "# Gate 5 read-out" in document
+    assert "Simulated results only" in document
+    assert "reported, not fixed" in document
+    # Coverage and width are adjacent in every rendered table: PICP alone is gameable.
+    assert "picp_mean" in document and "mean_interval_width_mean" in document
+    for row in readout[readout["verdict"] != VERDICT_PASS].itertuples():
+        assert row.model in document, f"{row.model} did not pass and must be named"
+
+    # `gate5_reading_passes` is what the CLI takes its exit status from.
+    assert isinstance(gate5_reading_passes(readout, "A"), bool)
+    with pytest.raises(ValueError, match="not in the read-out"):
+        gate5_reading_passes(readout, "Z")

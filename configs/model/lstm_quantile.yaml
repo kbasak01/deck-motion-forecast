@@ -1,0 +1,27 @@
+# LSTM with a nine-level quantile head.
+#
+# Identical backbone to `configs/model/lstm.yaml`: two recurrent layers of hidden 128, the
+# top layer's final hidden state projected to every horizon step in ONE pass. The decoder is
+# still not recurrent -- an autoregressive rollout would compound error over 150 steps and
+# put a loop in the Phase 7 ONNX graph. Only the head widens, from Linear(128 -> H*C_out) to
+# Linear(128 -> H*C_out*Q).
+#
+# The nine levels are `dmf.models.heads.QUANTILE_FAN_9`; see `dlinear_quantile.yaml`.
+#
+# 1 246 628 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6) against the point
+# row's 317 828: 201 728 in the recurrent layers, unchanged, and the head 116 100 ->
+# 1 044 900. This is the largest model in the Phase 5 sweep and it is NOT parameter-matched
+# to anything it is compared with (P5-D5).
+#
+# `lstm` is in Phase 5 because it is the best point model at the Gate cell on `id` (0.8680
+# against `tcn` 0.8346, P5-D3). It also carries the P4-D9 handicap -- at cap 60 it
+# early-stopped mid-anneal and shipped 7.4 percent worse than an 18-epoch pilot -- so any
+# lstm-vs-tcn sentence, calibration included, inherits that asymmetry.
+name: lstm
+label: lstm_quantile
+head: quantile
+quantiles: [0.05, 0.1625, 0.275, 0.3875, 0.5, 0.6125, 0.725, 0.8375, 0.95]
+params:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.1

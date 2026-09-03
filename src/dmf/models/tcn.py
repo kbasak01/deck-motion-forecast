@@ -16,11 +16,13 @@ which shows up nowhere in the loss curve. The arithmetic is asserted in
 """
 
 from collections.abc import Sequence
+from typing import ClassVar
 
 from torch import Tensor, nn
 from torch.nn.utils.parametrizations import weight_norm
 
 from dmf.models.base import BaseForecaster
+from dmf.models.heads import HeadKind, clamp_log_variance
 from dmf.train.registry import register_model
 
 __all__ = ["TCN", "TemporalBlock", "receptive_field"]
@@ -152,6 +154,8 @@ class TCN(BaseForecaster):
     """Dilated causal convolution stack with a direct multi-horizon head."""
 
     FIT_KIND = "sgd"
+    #: All three heads: the projection widens by K and the reshape branch handles each.
+    SUPPORTED_HEADS: ClassVar[tuple[HeadKind, ...]] = ("point", "quantile", "gaussian")
 
     def __init__(
         self,
@@ -164,6 +168,7 @@ class TCN(BaseForecaster):
         dilations: Sequence[int] = (1, 2, 4, 8, 16, 32),
         dropout: float = 0.1,
         n_quantiles: int = 0,
+        head: HeadKind | None = None,
     ) -> None:
         """Configure the model and verify its receptive field.
 
@@ -179,13 +184,19 @@ class TCN(BaseForecaster):
                 documented type.
             dropout: Dropout probability, in [0, 1).
             n_quantiles: Quantile count ``Q``, or 0 for a point head.
+            head: Output head kind -- ``"point"``, ``"quantile"`` or ``"gaussian"``.
+                Defaults to ``"quantile"`` when ``n_quantiles > 0`` and ``"point"``
+                otherwise, so a point build is unchanged and a Gaussian head is asked for
+                by name (``docs/protocol.md`` P5-D1).
 
         Raises:
             ValueError: If ``receptive_field(kernel_size, dilations) < lookback``. Checked
                 at construction so that a misconfigured stack fails immediately rather
                 than training to a quietly degraded result.
         """
-        super().__init__(lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles)
+        super().__init__(
+            lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles, head
+        )
         self.dilations: tuple[int, ...] = tuple(int(d) for d in dilations)
         self.kernel_size = kernel_size
         self.n_filters = n_filters
@@ -205,7 +216,7 @@ class TCN(BaseForecaster):
         #: ``tests/test_models.py`` can assert causality on its ``(B, C, L)`` feature map,
         #: which the horizon head -- reading only the last step -- cannot show.
         self.blocks = nn.Sequential(*blocks)
-        self._head_width = max_horizon * n_target_channels * max(n_quantiles, 1)
+        self._head_width = max_horizon * n_target_channels * self.n_output_params
         self.head = nn.Linear(n_filters, self._head_width)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -220,11 +231,16 @@ class TCN(BaseForecaster):
             x: Input windows, shape ``(B, L, C_in)``, dimensionless.
 
         Returns:
-            Forecasts, shape ``(B, H, C_out)`` or ``(B, H, C_out, Q)``, dimensionless.
+            Forecasts, shape ``(B, H, C_out)`` for a point head, ``(B, H, C_out, Q)`` for
+            a quantile head, or ``(B, H, C_out, 2)`` carrying ``(mean, log_var)`` for a
+            Gaussian one. Dimensionless.
         """
         features: Tensor = self.blocks(x.transpose(1, 2))
         out: Tensor = self.head(features[:, :, -1])
-        # out: (B, H * C_out * max(Q, 1)) -> (B, H, C_out[, Q])
-        if self.n_quantiles > 0:
-            return out.view(x.shape[0], self.max_horizon, self.n_target_channels, self.n_quantiles)
-        return out.view(x.shape[0], self.max_horizon, self.n_target_channels)
+        # out: (B, H * C_out * K) -> (B, H, C_out[, K])
+        if self.head_kind == "point":
+            return out.view(x.shape[0], self.max_horizon, self.n_target_channels)
+        fanned = out.view(
+            x.shape[0], self.max_horizon, self.n_target_channels, self.n_output_params
+        )
+        return clamp_log_variance(fanned) if self.head_kind == "gaussian" else fanned

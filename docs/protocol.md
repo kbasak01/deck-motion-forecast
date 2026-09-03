@@ -1783,3 +1783,766 @@ position channels (P1-D5), all bootstrapped at 95% with no multiplicity control.
 **description of the table**, not 144 hypothesis tests, and a count of "cells where the interval
 excludes zero" should not be read as a family-wise error-controlled result. P4-D8 caveat 3
 records the smaller version of this for the three-seed envelope; this is the larger one.
+
+---
+
+## Phase 5 — probabilistic heads
+
+Entries P5-D1 .. P5-D6 are written **before** any Phase 5 training run, following the P4-D1
+precedent, so that the Gate 5 reading, the head design and the predicted `unseen_heading`
+artifact are on record as decisions rather than as rationalisations of a result. The Gate 5
+evidence section is added when the sweep lands.
+
+### P5-D1 — `heads.py` is the calibration seam, not a second projection mechanism
+
+`src/dmf/models/heads.py` shipped from Phase 0 as four stubs: `sort_quantiles`, and three
+`nn.Module`s (`PointHead`, `QuantileHead`, `GaussianHead`) whose declared contract is
+`forward(z: Tensor[B, d_in]) -> ...`, i.e. a projection of a flat encoder representation.
+**The three modules are removed. `sort_quantiles` is kept unchanged.** This is a deviation
+from a committed API and is recorded for that reason.
+
+**Why the declared contract cannot be adopted.** Phase 5 must attach both heads to DLinear
+(`docs/IMPLEMENTATION_PLAN.md` §Phase 5, and the task as given). DLinear is channel-independent:
+its head is a pair of `Linear(lookback, ·)` maps applied per channel to the trend and remainder
+of the *decomposed input series*, not a projection of a flat encoder vector. There is no `z`.
+Adopting the stub's contract would give the project two parallel head mechanisms and leave one
+of the two models the phase is required to serve outside the abstraction. An abstraction the
+required model cannot use is not the seam.
+
+**And the obvious workaround is a correctness trap.** The four SGD models already emit
+`(B, H, C, K)` for `K = max(n_quantiles, 1)`, so a Gaussian head could be had for free by
+building with `n_quantiles = 2` and reading channel 0 as the mean and channel 1 as the
+log-variance. That places `(mean, log_var)` on exactly the axis `sort_quantiles` is defined to
+sort ascending, and sorting them is silent, shape-preserving and catastrophic: it would swap the
+mean and the log-variance on every element where `log_var < mean`, producing intervals that are
+wrong without being malformed. `head` is therefore a first-class kind, not an arity.
+
+**What replaces them** (all in `dmf.models.heads`):
+
+- `HeadKind = Literal["point", "quantile", "gaussian"]` and `n_output_params(head, quantiles)`
+  returning 1 / `Q` / 2 — the single definition of the fan width, imported by `base.py`, by
+  every model that carries a head, and by `dmf.train.registry.build_model`. One place decides
+  `K`.
+- `QUANTILE_FAN_9` — the nine levels the removed `QuantileHead` docstring already named:
+  0.05 to 0.95 in steps of 0.1125, i.e.
+  `(0.05, 0.1625, 0.275, 0.3875, 0.5, 0.6125, 0.725, 0.8375, 0.95)`. The median is exactly 0.5
+  and the outermost pair is exactly the 90 percent interval PICP@90 scores, so neither has to
+  be interpolated.
+- `PredictiveDistribution` — a frozen value object over a raw model output carrying its
+  `HeadKind` and levels, exposing `.point()`, `.quantiles(levels)` and `.interval(alpha)`. It is
+  unit-agnostic, so it behaves identically in normalised and in corpus units. Ascending sorting
+  is applied on construction for the `quantile` kind; for the `gaussian` kind the quantile axis
+  does not exist and the trap above is **structurally unreachable** rather than merely avoided.
+- `IntervalPredictor` — the protocol a `ConformalWrapper` implements: `predict(x) ->
+  PredictiveDistribution`. A wrapper delegates to the model it holds and offsets the interval
+  endpoints from held-out residuals. No model file is touched, which is the requirement
+  `docs/IMPLEMENTATION_PLAN.md` §Phase 5 states and Project 6 depends on.
+
+The seam is asserted nowhere and exercised in `tests/test_probabilistic.py`: a `_ShiftCalibrator`
+test double implements `IntervalPredictor`, wraps a stub distribution and must move PICP by the
+amount it shifted, importing no model. A seam that is only claimed in a docstring is not a seam.
+
+### P5-D2 — Gate 5 reading, pre-registered. RECORDED 2026-08-31
+
+`docs/IMPLEMENTATION_PLAN.md` §Phase 5 states:
+
+> **Gate 5:** PICP@90 within `[0.85, 0.95]` on the `id` regime.
+
+The threshold and the band are **unchanged**. What the plan does not say is *which cell* the
+coverage is read at, and coverage varies strongly with lead time, so leaving that open until
+after the sweep would be cell selection. Registered now:
+
+- **Reading A — the gate.** Per (model, head), PICP@90 at the decision cell **pitch, 10 s
+  (100 samples)**, `id` regime. This is the same cell Gate 3 (P3-D12) and Gate 4 (P4-D1) are
+  read at, so all three gates read the same place and the phases stay comparable.
+- **Reading B — the surround.** The count of `id` cells whose PICP@90 falls inside `[0.85, 0.95]`,
+  of **216** (3 backbones x 2 heads x 6 DOFs x 6 horizons), reported in the same document. Gate 3
+  and Gate 4 both required a "what the gate does not say" section after the fact; here it is part
+  of the read-out from the start.
+
+Both readings ship. A head that misses the band is reported as missing it: nothing is widened,
+recalibrated, or dropped to make the gate pass (CLAUDE.md non-negotiable 6). Coverage is never
+reported without mean interval width beside it — coverage alone is trivially achievable by
+widening an interval until it is useless.
+
+### P5-D3 — Training budget: cap 60 kept, and what that costs Phase 5
+
+P4-D9 records that `dmf.train.loop._lr_at` sizes the warmup+cosine schedule by
+`epochs * steps_per_epoch`, so at cap 60 the `transformer` and `lstm` runs early-stopped
+mid-anneal and shipped **3.2% and 7.4% worse** than an 18-epoch pilot of the same models. It
+also states what a Phase 5 selecting "the best point model from Phase 4" would have to do about
+it: decouple the schedule length from the stopping criterion.
+
+**The budget is unchanged: cap 60, batch 1024, lr 2e-3, patience 15, identical to
+`e02_deep.yaml`.** Decided with the user before the sweep. Two reasons:
+
+- Changing `dmf.train.loop` now would make every Phase 5 point row non-comparable to the
+  committed `results/e02/` table, and the point rows are what a probabilistic row is judged
+  against.
+- Choosing a cap after measuring which cap favours which architecture is selecting a
+  hyperparameter on the results it produces — the failure P4-D9 declined to commit and Gate 4's
+  fairness rule exists to prevent.
+
+**The cost, stated rather than discovered later.** Any Phase 5 sentence comparing `lstm` to
+`tcn` — including a comparison of their *calibration* — inherits the P4-D9 asymmetry: `tcn` is
+cap-bound and still improving, `lstm` is early-stopped mid-anneal. The bound is on deep-vs-deep
+ranking, and P4-D14 restriction 4 records that it extends to deep-vs-baseline counts too.
+
+**The backbones are `tcn`, `lstm` and `dlinear`**, decided with the user rather than inherited.
+The plan guesses TCN; `lstm` is the best point model at the gate cell on `id` (0.8680 against
+`tcn` 0.8346), which is the regime Gate 5 is read on; `tcn` is the only deep model that wins
+outside `unseen_heading` (60-42 against `dlinear_ols`, P4-D14) and is the one not carrying the
+P4-D9 handicap. Both ship, so the choice does not have to be made on a contested ranking.
+`transformer` is not carried into Phase 5: it loses to `dlinear_ols` on every restriction in
+P4-D14 and adds a third of the sweep's wall time.
+
+### P5-D4 — The early-stopping criterion is now head-specific, and `best_val_loss` stops being comparable
+
+`dmf.train.loop.fit`'s docstring states:
+
+> The early-stopping criterion -- validation MSE in normalised space, patience from ``cfg`` --
+> is deliberately identical for every model in the project. Gate 4 compares architectures, and a
+> comparison in which one model was stopped on a different rule is not a comparison of
+> architectures.
+
+**That invariant cannot survive Phase 5 and is amended rather than quietly broken.** A quantile
+head has no MSE to stop on: its objective is pinball loss, a Gaussian head's is NLL, and
+stopping either on the MSE of a derived point forecast would select the epoch that is best for a
+statistic the model is not fitting. Each model is stopped on its own training objective.
+
+Two consequences:
+
+- `best_val_loss` is **not comparable across heads**. A pinball loss and an MSE are not the same
+  quantity and their ratio means nothing. A `val_loss_name` column (`mse` / `pinball` /
+  `gaussian_nll`) ships on `probabilistic_by_seed.csv` so the comparison cannot be made by
+  accident.
+- What *is* still identical for every model in the phase: the cap, the patience, the schedule
+  policy, the batch size, the learning rate, the data pipeline and the split. The fairness
+  property Gate 4 needed is preserved everywhere it can be.
+
+### P5-D5 — Every probabilistic row carries a point forecast, and which one it is
+
+CLAUDE.md non-negotiable 4 requires every accuracy result to be reported as skill against
+persistence. A probabilistic model must therefore also emit a point forecast, and the choice is
+recorded rather than left implicit:
+
+| head | point forecast |
+|---|---|
+| `quantile` | the **0.5 quantile** — present exactly in `QUANTILE_FAN_9`, so it is read off, not interpolated |
+| `gaussian` | the **mean** |
+
+RMSE, MAE, skill and `nrmse` ship for every probabilistic row against the same persistence
+denominator as every other row in the project. This is also what answers the question the phase
+would otherwise leave open — whether fitting a distribution costs point accuracy against the same
+architecture's point row in `results/e02/`.
+
+**The heads are not parameter-matched to their point rows, and the gap is large.** The final
+projection widens by `K`, and `max_horizon` is 150:
+
+| model | point | gaussian (`K=2`) | quantile (`K=9`) |
+|---|---:|---:|---:|
+| `dlinear` | 60 300 | 120 600 | 542 700 |
+| `tcn` | 196 804 | 255 304 | 664 804 |
+| `lstm` | 317 828 | 433 928 | 1 246 628 |
+
+So a quantile row against a point row, or a quantile row against a Gaussian row, is **not** a
+parameter-matched comparison. P3-D13 records this project publishing a wrong conclusion twice
+from a comparison whose confound was not held; the count is stated here in advance and belongs
+in the table caveats, not only in this file.
+
+### P5-D6 — Predicted before the sweep: `unseen_heading` coverage will be uninterpretable
+
+Recorded now so that it cannot be produced afterwards as an explanation of a number.
+
+`unseen_heading`'s test set *is* beam seas, where the P1-D2 pitch heading factor is clamped at
+`eps = 0.05` (~26 dB down), so test-set pitch and pitch_rate are an engineering residual floor
+rather than pitch physics. P3-D7 measured AR(20) at -49 skill there and P4-D11 measured the deep
+models at -79, -81 and -279. The prediction for coverage: a head fitted where pitch has amplitude
+will emit intervals scaled to that amplitude on a channel that has almost none, so **PICP on
+`unseen_heading` pitch and pitch_rate will sit near 1.0 with a mean interval width far wider than
+the signal** — coverage that looks excellent and means nothing. That is the exact failure mode the
+protocol's "report coverage and sharpness together" rule exists to catch, and it will be the
+clearest demonstration of it in the project.
+
+The regime is still run, and the numbers still ship. What is registered here is that a PICP near
+1.0 in those cells is not evidence of good calibration.
+
+### P5-D7 — `configs/experiment/e03_quantile.yaml` is named `e03_probabilistic.yaml`
+
+`docs/IMPLEMENTATION_PLAN.md` §0.1 lists the Phase 5 experiment as `e03_quantile.yaml`. The
+experiment carries the Gaussian rows too, and a file named for one of the two heads it runs would
+misdescribe half its own table. Renamed to `e03_probabilistic.yaml`; recorded because the plan
+names a path.
+
+### P5-D8 — Probabilistic scoring: three things the stubs did not pin down
+
+`src/dmf/eval/probabilistic.py` shipped from Phase 0 with five docstring contracts. Three of
+them were under-specified in ways that change a published number, so the resolutions are
+recorded rather than left in the implementation.
+
+**1. The CRPS quadrature is the rectangle rule, and the number is biased low.**
+`crps_from_quantiles` documents "the quantile-weighted integral of the pinball loss" without
+pinning the quadrature. Two readings are defensible: `2 * mean_q(PL_q)` (rectangle) and a
+trapezoid over the levels. They differ materially — on `QUANTILE_FAN_9` the trapezoid's weights
+total `q_max - q_min = 0.90`, so it returns `0.9 x MAE` where the definitional anchor (CRPS of a
+degenerate fan is the MAE) requires exactly `MAE`. **The rectangle rule is implemented.** Its
+cost, stated because it is a real bias and not a rounding detail: the tails beyond 0.05 and 0.95
+are represented only by their nearest level, so the reported figure is biased **low** against
+exact CRPS. Every docstring, the module header and the `n_quantiles` column label it an
+approximation, as the original stub already required.
+
+**2. Pinball averages over the level axis; it does not sum.** "Mean pinball loss" does not say.
+Averaging is forced by the same anchor family — pinball at the median must be exactly half the
+MAE — and summing would inflate the column ninefold at `Q = 9` while looking plausible. Pinned by
+a median/MAE test and a level-count-invariance test, so a future change to a sum fails the suite
+rather than silently rescaling a published column.
+
+**3. The crossed-interval refusal moved from the element to the table.** `picp` raises when any
+`lower > upper`; `mean_interval_width` on the same input returns a **negative width silently**.
+That asymmetry does not matter on the array path, but production streams *sums*, so `picp`'s
+elementwise guard is never reached and an unsorted fan would ship as a published number. The
+declared per-function contracts are unchanged; `probabilistic_table_from_sums` additionally
+refuses any reported cell whose mean width is negative, naming `sort_quantiles` in the message.
+Alongside it: `picp` and `crossing_rate` outside `[0, 1]` (which means the counts and the window
+total came from different passes) and non-finite or negative `winkler` / `crps` / `pinball` are
+refused. All are validated over the **reported** cells only, following the precedent
+`metrics_table_from_sums` set — a bad cell at a horizon the table never quotes must not fail a
+table that never quotes it.
+
+**Smaller resolutions, recorded because each is a place two reasonable implementations differ:**
+
+- **The interval is closed.** A target lying exactly on an endpoint counts as covered.
+- **Crossing is measured on the raw fan with strict inequality.** Equal adjacent levels are not an
+  inversion. `crossing_rate` must be accumulated *before* sorting: measuring it after yields
+  exactly zero and measures nothing. Both directions are asserted.
+- **Levels are refused, never repaired.** A `quantiles` tuple that is not strictly ascending in
+  (0, 1) raises rather than being sorted, because silently reordering the labels attaches the
+  wrong level to every column of the fan.
+- **`n_quantiles` and `alpha` ship as columns.** CRPS is a `Q`-level quadrature and PICP and
+  Winkler are `alpha`-dependent, so a row without them is not self-describing: a Gaussian head
+  scored at `Q = 2` and a quantile head at `Q = 9` would otherwise show two visually identical
+  CRPS columns holding different quantities. `alpha` labels the column only — it does not rescale
+  `winkler_sum`, which must be accumulated at the alpha it is reported at.
+- **`crps_sum` is a free input, not derived from `pinball_sum`.** For a quantile fan the two are
+  related by construction (`crps = 2 * mean_q pinball`), but the Gaussian head has a closed-form
+  CRPS and must be able to stream it through the same table. The consequence is that the table
+  cannot detect a caller that accumulates the two inconsistently; that guard belongs in
+  `prob_runner.py`, where the head kind is known, and is placed there.
+
+### P5-D9 — Four things the implementation forced, none of them in P5-D1 .. P5-D8
+
+**1. The attribute is `head_kind`, not `head`, and the reason is a `torch` trap.**
+`tcn`, `lstm` and `transformer` already assign `self.head = nn.Linear(...)`.
+`nn.Module.__setattr__` moves a Module assignment into `_modules` and *removes* the same name
+from `__dict__`, so a base-class `self.head = "gaussian"` would be silently clobbered and
+`model.head` would return the Linear layer — a head kind that reads as a tensor op, with no
+error anywhere. The alternative was renaming those layers, which changes the
+`head.weight`/`head.bias` keys of every checkpoint already written under
+`artifacts/checkpoints/`. The attribute was renamed instead of the layers.
+
+**2. `BaseForecaster.SUPPORTED_HEADS`, because passing `head` through `build_model` does not
+close the hole it was supposed to close.** P5-D1 assumed the existing accepted-keyword check
+in `build_model` would refuse `head: gaussian` on a model that cannot carry one. It refuses
+only classes that define their own `__init__` — `window_mean`, `damped_persistence`, `ar`,
+`dlinear_ols` — and `Persistence` defines none. It inherits `BaseForecaster.__init__`, so
+`head` is an accepted keyword, and `head: gaussian` on `persistence` would have constructed a
+model that *records itself as Gaussian* and emits a rank-3 point forecast. `SUPPORTED_HEADS`
+is a class variable defaulting to `("point",)` and catches exactly the classes the signature
+check cannot see. Both refusals are tested, because half a guard is worse than none: it
+creates the belief that the case is covered.
+
+**3. `quantile_fan(width)` — a model is constructed with a fan *width*, never with levels.**
+`build_model` passes `n_quantiles = len(cfg.quantiles)`; the levels themselves never reach the
+model. So the levels have to be recoverable from the width, or a model cannot say what its own
+columns mean. `quantile_fan(9) is QUANTILE_FAN_9`, and other widths are spaced 0.05 to 0.95 by
+the same rule. `build_model` now **raises** if a config's levels are not `quantile_fan` of
+their own length. Without that check a config could be *trained* on its own fan — `resolve_loss`
+reads `cfg.quantiles` — and *scored* on the project fan, so column `k` would carry one level in
+the loss and a different one in the table, and every number would be plausible.
+
+**4. Both heads are scored on the same nine levels, and the Gaussian CRPS is not closed form.**
+P5-D8 left `crps_sum` a free input specifically so a Gaussian head could stream an exact CRPS.
+It does not. A Gaussian head is evaluated at the same nine levels via `mean + z(q) * sigma` and
+put through the same rectangle-rule quadrature, so the `pinball` and `crps` columns are one
+estimator applied to two predictive distributions. An exact Gaussian CRPS beside a nine-level
+approximation of the quantile head's would have made the Gaussian row look better **by the
+quadrature bias alone** — the bias P5-D8 records as low — which is a comparison artifact, not a
+result. The consistency `crps == 2 * mean_q(pinball)` therefore holds by construction here and
+`dmf.eval.prob_runner._check_crps_pinball_consistency` asserts it per model, which is the guard
+P5-D8 said belongs where the head kind is known.
+
+### P5-D10 — The shuffle control was about to be silently absent, and what it does and does not certify
+
+`dmf.train.experiment._run_controls` selects the shuffle-control subject as
+`[m for m in experiment.models if "order" in m.params]` — i.e. the control runs **only if the
+experiment carries an AR config**. The first `e03_probabilistic.yaml` carried none. The sweep
+would have run, written `baselines_controls.csv`, and shipped a coverage table with **no
+leakage control at all**, with nothing in the artifact saying so.
+
+That is the P4-D15 defect exactly — quoting the control that passed while omitting the one that
+did not run — and it is worse here, because Gates 3 and 4 both cite the shuffle control as the
+evidence that their results are not leakage. `ar_p20.yaml` is added to the experiment. It is
+closed-form and slices from the moments the pass already accumulates, so it costs one Cholesky.
+`tests/test_models.py::test_the_probabilistic_experiment_config_is_one_run_at_the_phase_4_budget`
+now asserts the presence of a config carrying an `order` parameter, keyed on the mechanism
+`_run_controls` actually dispatches on rather than on the label, so renaming the row is safe and
+deleting its `order` parameter is not.
+
+**What the control does and does not certify, stated because the distinction matters here more
+than it did in Phase 4.** The shuffle control refits AR(20) — a **point** model — on
+time-shuffled targets. It certifies the point pipeline the probabilistic rows are built on. It
+is **not** a leakage control on the heads: no shuffled-target quantile or Gaussian head is
+fitted anywhere in this sweep, because refitting a deep head on shuffled targets would cost
+roughly what the sweep costs. So a coverage number here carries less certification than a skill
+number does, and no sentence about Gate 5 should imply otherwise.
+
+The untrained control has the same shape of gap. Its subject is `sgd_cfgs[0]`, which in this
+experiment is `dlinear_quantile`, and it is scored through its **point projection** (the 0.5
+quantile) because the null and the published Phase 3/4 comparators are point forecasts. So it
+controls an untrained median, not an untrained interval. **There is no control on an untrained
+interval in this phase.**
+
+### P5-D11 — `width_ratio`: a mean interval width is not readable on its own
+
+A width of 2.3 deg is sharp for roll at 15 s and uselessly wide for pitch at 1 s, so the width
+column the plan asks for cannot be read without a reference. `dmf.eval.report.width_ratio`
+divides it by the width an **unconditional** interval would need for the same nominal level
+using only the scored partition's own spread, `2 * z(1 - alpha/2) * signal_std`:
+
+> `width_ratio = 1.0` means the interval is no sharper than knowing nothing but the variance.
+
+This is deliberately the same device `nrmse` provides for RMSE (P4-D3), where 1.0 means "no
+better than predicting the partition mean", and it is adopted for the same reason: P3-D1 and
+P4-D16 establish that absolute magnitudes on this corpus flatter every model, so only
+dimensionless, referenced quantities are readable across DOFs, horizons and regimes.
+
+`signal_std` is **carried over from the point pass rather than recomputed.** It is a property of
+the targets alone, `evaluate_models` already accumulates it once per batch and shares it across
+every model by object identity (P4-D3), and a second float64 reduction of the same values in a
+different order would disagree in the last bits — producing two `signal_std` columns in one
+results directory that are almost, but not exactly, the same number.
+
+It is a **sharpness** measure and says nothing about calibration alone. A ratio below 1.0 with
+PICP at nominal is an informative interval; a ratio below 1.0 with PICP well under nominal is
+just an interval that is too narrow. The two columns are rendered adjacent for that reason.
+
+### P5-D12 — Coverage degradation is reported unpaired, and could not honestly be otherwise
+
+`dmf.eval.gate.coverage_degradation` reports `picp_delta` and `width_delta` from `id` to each
+held-out regime **with no confidence interval on the delta**, and that is deliberate.
+
+`id` and `unseen_seastate` score **different realizations** — different seed ordinals in the
+first case, an entirely held-out sea state in the second. The paired bootstrap P4-D4 wired
+(`paired_skill_difference_ci`) works by drawing one multinomial resample of realizations and
+scoring both subjects on it, which is exactly what makes it exact for two models on one
+partition. Two *partitions* share no realizations, so there is no common resample to draw and
+the paired machinery does not apply. Each side ships its own realization bootstrap
+(`picp_ci_lo`/`picp_ci_hi`) and the difference ships none.
+
+P3-D13 records this project publishing a wrong conclusion **twice** from reading unpaired
+marginal intervals as if they were a paired contrast. A delta interval here would be the third
+occurrence, dressed better. The absence is stated in `gate5.md`'s notes rather than left for a
+reader to notice.
+
+### P5-D13 — Correction: P5-D6's prediction was half right, and the half it got wrong is the finding
+
+P5-D6, registered before the sweep, predicted that on `unseen_heading` **PICP on pitch and
+pitch_rate would sit near 1.0 with a mean interval width far wider than the signal** — coverage
+that looks excellent and means nothing — for the P1-D2 residual-floor reason. Measured, median
+over the six horizons:
+
+| model | pitch PICP | pitch `width_ratio` | pitch_rate PICP | pitch_rate `width_ratio` |
+|---|---:|---:|---:|---:|
+| `dlinear_quantile` | **1.000** | **5.19** | **1.000** | **5.49** |
+| `dlinear_gaussian` | **1.000** | **5.73** | **1.000** | **6.06** |
+| `tcn_quantile` | 0.387 | 1.43 | 0.396 | 1.58 |
+| `tcn_gaussian` | 0.454 | 2.23 | 0.538 | 2.65 |
+| `lstm_quantile` | 0.254 | 1.75 | 0.286 | 2.57 |
+| `lstm_gaussian` | 0.242 | 2.08 | 0.258 | 3.04 |
+
+**The prediction is exactly right for the two DLinear rows and exactly wrong for the four deep
+ones.** DLinear covers 100% of targets with intervals five to six times wider than an
+unconditional interval — the predicted "perfect coverage, meaningless width". The deep models
+instead **under-cover catastrophically**, at 0.24 to 0.54 against a nominal 0.90.
+
+**Why the prediction failed, which is the useful part.** P5-D6 reasoned only about interval
+*width*: a head fitted where pitch has amplitude emits intervals scaled to an amplitude the test
+set does not contain, therefore over-covers. That reasoning silently assumed the interval stays
+*centred on the target*. It does not. P4-D11 already recorded the mechanism and P5-D6 did not
+carry it across: the two channel-independent DLinear rows forecast pitch from pitch history alone
+and structurally cannot import amplitude from roll, so their point forecast tracks the floored
+signal and their oversized interval swallows it. The deep models do import cross-channel
+structure, so they impose a roll-driven amplitude on a channel that has none — point skill at
+pitch / 10 s measured here at **-133 (`tcn_quantile`) and -337 (`lstm_quantile`)** against
+`dlinear_ols`'s +0.577. **A wide interval centred in the wrong place still misses.** Coverage
+depends on location and width jointly, and P5-D6 modelled one of them.
+
+**The larger correction: the deep models' interval failure is NOT confined to the floored
+channels.** On the four channels the P1-D2 floor does not touch — roll, roll_rate, heave,
+heave_rate — median PICP over that regime is:
+
+| `dlinear_gaussian` | `dlinear_quantile` | `tcn_gaussian` | `lstm_quantile` | `lstm_gaussian` | `tcn_quantile` |
+|---:|---:|---:|---:|---:|---:|
+| 0.928 | 0.914 | 0.294 | 0.176 | 0.166 | 0.185 |
+
+The deep heads cover **17-29%** of targets on channels where their *point* forecasts are
+respectable (roll at 10 s: `tcn_gaussian` 0.796, `lstm_quantile` 0.693 skill). So this is not the
+corpus artifact and it is not bad point accuracy — it is an interval that is far too narrow for a
+heading the model never saw, on channels where the model still forecasts well. This is the same
+shape as the README's existing Phase 4 statement that "the floor does not explain the direction on
+the other channels", and it is much starker for intervals than it was for point error.
+
+Recorded as a correction rather than edited into P5-D6, following P4-D9: the reasoning that
+produced the wrong prediction is what a reader needs, and the entry was written in advance
+precisely so that being wrong would be visible.
+
+### P5-D14 — P5-D3's carried-forward handicap largely does not apply, and the reason is the objective
+
+P5-D3 carried P4-D9 forward as a stated bound on every Phase 5 claim: at cap 60 the `lstm` runs
+early-stop mid-anneal, checkpointing a best epoch reached while the learning rate is still high,
+and ship measurably worse than a shorter-cap pilot would. That was recorded in advance as the
+cost of keeping the budget unchanged.
+
+**Measured on the sweep, it mostly does not happen.** `epochs_run` over all 72 SGD runs, cap 60,
+patience 15:
+
+| model | objective | runs at the cap | early-stopped | range |
+|---|---|---:|---:|---|
+| `dlinear_quantile` | pinball | 12 / 12 | 0 | 60 |
+| `dlinear_gaussian` | gaussian_nll | 12 / 12 | 0 | 60 |
+| `tcn_quantile` | pinball | 12 / 12 | 0 | 60 |
+| `tcn_gaussian` | gaussian_nll | 12 / 12 | 0 | 60 |
+| `lstm_quantile` | pinball | **10 / 12** | 2 | 34-60 |
+| `lstm_gaussian` | gaussian_nll | **7 / 12** | 5 | 28-60 |
+
+In Phase 4 the *point* `lstm` early-stopped in **every** run (33 / 32 / 34 epochs on `id`, P4-D9).
+Under pinball it runs to the cap in 10 of 12, and under NLL in 7 of 12. **The head's objective
+changes the optimisation trajectory enough to change whether early stopping fires at all.** The
+plausible reading — untested, and recorded as such — is that a pinball or NLL validation curve is
+noisier and less prone to a 16-epoch plateau than an MSE one, so patience 15 is harder to trip.
+
+**Consequence for Phase 5's claims, and it runs in the unfavourable direction for the deep
+models.** `lstm` is no longer the *under*-trained row P5-D3 warned about; it is cap-bound like the
+others, so a Phase 5 statement that `lstm_quantile` calibrates worse out of distribution than
+`dlinear_quantile` cannot be explained away by a truncated budget. What remains true, and is now
+the residual asymmetry, is that `lstm_gaussian` still early-stops in 5 of 12 runs — notably all
+three `unseen_vessel` seeds (28 / 36 / 43) — so **that one row is under-trained on the regime it
+is scored worst on**, and a `lstm_gaussian`-on-`unseen_vessel` claim carries the P4-D9 caveat while
+the other five rows no longer do.
+
+Within a model, seed 0 early-stops where seeds 1 and 2 run to the cap (`lstm_quantile` on `id`:
+37 / 60 / 60). That is P4-D13: `make_dataloader`'s generator is never reset between seeds, so the
+three seeds are consecutive segments of one stream and receive different data orders.
+
+Recorded as a correction to P5-D3 rather than an edit to it, per P4-D9's own precedent.
+
+### Gate 5 evidence
+
+Sweep: `configs/experiment/e03_probabilistic.yaml`, `ideal`, 2026-08-31 14:21 -> 2026-09-03 08:25
+(**66 h 04 m**, exit 0), one A4000. 60.6 h of that is the 72 SGD fits; the balance is the
+closed-form rows, four scoring passes and the controls. Artifacts in `results/e03/`: nine files.
+`results/` and `results/imu/` (Gate 3) and `results/e02/` (Gate 4) are untouched.
+
+**Gate 5 is read on Reading A and PASSES; Reading B is reported beside it and does not.**
+
+| Reading | Cell | Result |
+|---|---|---|
+| A — the gate (P5-D2, registered before the sweep) | `id`, pitch, 100 samples | **6 of 6 PASS** |
+| B — the surround, every `id` cell | `id`, all 6 DOFs x 6 horizons x 6 rows | **102 of 216 in band** |
+
+| Criterion | Evidence |
+|---|---|
+| Table covers every model / regime / DOF / horizon | `probabilistic.csv` **864 rows** = 6 models x 4 regimes x 6 DOFs x 6 horizons, exactly; `probabilistic_by_seed.csv` 2592 = 864 x 3 seeds |
+| Three seeds on every stochastic row | `n_seeds == 3` on all 864 rows; there are no deterministic probabilistic rows, so the P3-D10 exemption never applies here |
+| One nominal level throughout | `alpha == 0.1` on all 864 rows; `n_quantiles == 9` for **both** heads, because a Gaussian head is scored at the same nine levels rather than in closed form (P5-D9 item 4) |
+| Every probabilistic row carries its point accuracy | **864 of 864** join to a row of `baselines.csv` on (model, regime, DOF, horizon) — the P5-D5 requirement, and what makes CLAUDE.md non-negotiable 4 hold for a coverage table |
+| Reference is exact | `persistence` skill **bitwise 0.0** in all 144 cells of `baselines.csv` |
+| Not attributable to leakage | Shuffle control **0 failing rows of 144**, worst excess **+0.0095** against a 2% tolerance — identical to the Gate 4 figure. Note what it does *not* certify: it refits AR(20), a point model, so it is a control on the point pipeline, **not** on the heads (P5-D10) |
+| Untrained control reported, not suppressed | Fails **107 of 144** rows, worst excess +0.8146. Expected and predicted: P3-D9 records that the plan's literal criterion is wrong on this task, and it is kept with its failures reported rather than tuned. Its subject is `dlinear_quantile` scored through its point projection, so it controls an untrained *median*, not an untrained interval — **no control on an untrained interval exists in this phase** (P5-D10) |
+| Phase 4 reproduced as a positive control | `persistence`, `window_mean`, `damped_persistence` and `dlinear_ols` reproduce `results/e02/baselines.csv` **bitwise (max abs diff 0.0)** across all 144 cells each; `ar20` to **4.8e-06 relative** (its largest absolute departures sit on the `unseen_heading` cells where skill is order -50, i.e. BLAS reduction order on a Cholesky, not a pipeline change). `dlinear_ols` at the gate cell: **0.568282 in both phases**. Nothing in the corpus, splits, normalisation or closed-form solvers moved between Phase 4 and Phase 5 |
+| Optimisation state traceable, and checked rather than assumed | `epochs_run` on every run: cap-bound in 12/12 for `dlinear_*` and `tcn_*`, 10/12 for `lstm_quantile`, 7/12 for `lstm_gaussian` (P5-D14) |
+| No verdict rests on an unmeasured row | `gate5.csv` carries **0 UNVERIFIED** rows of 222 |
+| Normalisation provenance | Asserted at scoring time in both passes, fails closed (P3-D11); the probabilistic pass additionally asserts its realization keys equal the point pass's, so a row's `picp` and its `rmse` cannot describe different windows |
+
+### P5-D15 — What Gate 5 does *not* say: the heads are miscalibrated in the operational band
+
+Gate 5 Reading A passes on six rows of 216. The surrounding counts change the reading, and the
+pattern is the same one P4-D14 restriction 2 found for Gate 4 — **the gate is read in the horizon
+band where the deep models look best.**
+
+Cells inside `[0.85, 0.95]` on `id`, split by lead time:
+
+| band | `dlinear_q` | `dlinear_g` | `tcn_q` | `tcn_g` | `lstm_q` | `lstm_g` |
+|---|---:|---:|---:|---:|---:|---:|
+| **1-5 s** (24 cells) — the operational band CLAUDE.md §1 names | **12** | 10 | 1 | 3 | 4 | 6 |
+| **10-15 s** (12 cells) — where Gate 5 Reading A is read | 9 | 9 | **12** | **12** | **12** | **12** |
+
+**The four deep rows are perfectly calibrated at 10-15 s — 12 of 12 each, median PICP 0.914-0.916 —
+and systematically over-cover at 1-5 s**, where 18 to 23 of their 24 cells sit above 0.95 (median
+PICP 0.972-0.979) and not one sits below 0.85. DLinear is the reverse: the best-calibrated family
+in the operational band and the worse one at long lead.
+
+The mechanism is not mysterious. P3-D1 records that this corpus is saturated at short lead — AR(20)
+reaches 0.999 skill at 1 s — so a deep model's residual at 1-5 s is very small, and its learned
+interval, while extremely sharp in absolute terms (median `width_ratio` **0.019-0.035**, i.e. about
+3% the width of an unconditional interval), is still wider than the residual warrants. The heads
+are conservative exactly where the forecast is easiest.
+
+**Reading A's cell was registered in P5-D2 before the sweep ran, on the Gate 3 and Gate 4 reasoning,
+so this is not post-hoc cell selection.** But the consequence was unstated and is stated now: a
+sentence of the form "the probabilistic heads are well calibrated in-distribution" is true at the
+gate cell and at 10-15 s, and false across the band this project exists to serve. Any Gate 5 claim
+must carry the band it is read in.
+
+### P5-D16 — Post-hoc quantile sorting is not cosmetic, and the gate cell hides that
+
+CLAUDE.md §Known traps requires quantile outputs be sorted post-hoc. Measured crossing rate — the
+fraction of `(window, horizon, channel)` elements whose **raw** fan had at least one adjacent
+inversion, over all 144 cells per model:
+
+| model | median | max |
+|---|---:|---:|
+| `tcn_quantile` | 0.0006 | 0.266 |
+| `lstm_quantile` | 0.0205 | 0.155 |
+| `dlinear_quantile` | **0.0626** | **0.966** |
+
+**At the gate cell the rates are 0.000005 to 0.0038, which reads as "sorting is a no-op".** Over the
+full table it is not: `dlinear_quantile` crosses on a median 6% of elements and, in its worst cell,
+on **96.6%** — a fan that is very nearly fully inverted. Every published PICP and width for that
+model depends on the sort having been applied. Recorded because an earlier draft of this phase's
+summary described crossing as "negligible" on the strength of the gate cell alone, which is the
+single-cell generalisation P3-D12 and P4-D11 both warn about, committed again.
+
+**It is a short-horizon phenomenon, and it is worst exactly where P5-D15 says the intervals are
+already suspect.** Median crossing rate on `id`, by lead time:
+
+| model | 1 s | 2 s | 3 s | 5 s | 10 s | 15 s |
+|---|---:|---:|---:|---:|---:|---:|
+| `dlinear_quantile` | **0.563** | 0.314 | 0.107 | 0.073 | 0.002 | 0.000 |
+| `lstm_quantile` | 0.045 | 0.057 | 0.077 | 0.073 | 0.016 | 0.015 |
+| `tcn_quantile` | 0.011 | 0.007 | 0.005 | 0.002 | 0.000 | 0.000 |
+
+`dlinear_quantile`'s raw fan is inverted on **56% of elements at a 1 s lead** and essentially never
+at 15 s. The mechanism is the same one behind P5-D15: at short lead this corpus is nearly
+deterministic (P3-D1), so the predictive spread is tiny — median `width_ratio` **0.019 at 1 s**
+against 0.911 at 15 s — and nine levels squeezed into that width are numerically
+indistinguishable, so fitting noise reorders them. The sort is doing real work precisely in the
+1-5 s operational band and nowhere else.
+
+The column exists because `dmf.eval.prob_runner` reads the raw fan before
+`PredictiveDistribution` sorts it (P5-D8). Had it measured after, it would report exactly zero and
+this would be invisible.
+
+### P5-D17 — What the Gate 5 adversarial audit falsified, before anything was published
+
+Run against a draft of the README's Phase 5 section. Three claims in that draft were wrong and
+are recorded here rather than quietly fixed, because two of them are errors this protocol had
+already warned against in writing.
+
+**1. "The ordering reverses" is false, and it is a single-cell generalisation — the exact defect
+P5-D16 records me committing earlier the same phase.** The draft said the models best calibrated
+in-distribution degrade worst. Cells inside `[0.85, 0.95]` on `id`, of 36, with the median
+absolute departure from nominal beside it:
+
+| model | in band on `id` | median \|PICP - 0.90\| |
+|---|---:|---:|
+| `dlinear_quantile` | **21** | **0.0411** |
+| `dlinear_gaussian` | 19 | 0.0427 |
+| `lstm_gaussian` | 18 | 0.0511 |
+| `lstm_quantile` | 16 | 0.0584 |
+| `tcn_gaussian` | 15 | 0.0580 |
+| `tcn_quantile` | 13 | 0.0695 |
+
+**DLinear is the best-calibrated family in-distribution as well**, so nothing reverses; the
+ordering is monotone. The "reversal" exists only at the single registered gate cell, where the
+deep rows sit at 0.912-0.918 and DLinear at 0.858-0.865 — one cell of 36, and the only one where
+the sign flips. Withdrawn. The supported statement is "DLinear is the best-calibrated family in
+every regime, and the gap widens out of distribution".
+
+**2. The `unseen_heading` PICP range 0.24-0.61 is not reproducible from any cell.** The draft
+paired `width_ratio` 4.3-8.5 — which is the pitch / 100-sample cell — with a PICP range taken
+from P5-D13's *median over six horizons*. At the cell the widths come from, deep coverage is
+**0.500, 0.570, 0.612, 0.832**. The draft's range both mixed two aggregations and excluded
+`tcn_gaussian` at 0.832, which is the row that most weakens the location-not-width argument.
+Withdrawn; the cell is quoted with all four rows and their seed spreads, which are large
+(`lstm_gaussian` 0.5696 +/- **0.3047**).
+
+**3. "The quantile heads beat their point rows" attributes to the head an effect three confounds
+account for.** The draft compared `results/e03` rows to `results/e02` rows:
+
+- **Training length.** `lstm` in e02 early-stopped at **32/33/34** epochs on `id`; `lstm_quantile`
+  here ran **37/60/60**. The quantile row received roughly twice the optimisation, and P4-D9
+  measured that truncation as costing `lstm` 7.4% — an order of magnitude more than the +0.0029
+  median gain claimed.
+- **Parameter count.** 1 246 628 against 317 828 (P5-D5).
+- **The point projection is an order statistic.** `PredictiveDistribution` sorts on construction,
+  so `.point()` returns the 5th order statistic of the **sorted** fan, not the trained q=0.5
+  output. With `lstm_quantile` crossing on a median 4.3% of `id` elements (up to 15% in the 1-5 s
+  band), the published point forecast is in part a median-of-fan smoother, and order-statistic
+  smoothing lowers RMSE by itself.
+
+The effect does clear the seed spread (median |delta| / pooled seed sd = 3.3 for `lstm_quantile`,
+7.4 for `tcn_quantile`; sign consistent in 36/36 and 34/36 cells), so CLAUDE.md non-negotiable 5
+is satisfied — the failure is attribution, not significance. **Reduced to "no measurable point-
+accuracy cost".** Also required by non-negotiable 6 and omitted from the draft:
+`dlinear_gaussian` **loses to `dlinear` in 28 of 36 `id` cells**.
+
+**4. The audit's most useful finding: two proper scoring rules in the same file contradict the
+PICP story, and the draft used neither.** `probabilistic.csv` carries `winkler_mean` and
+`crps_mean`, which score location and sharpness jointly. Mean rank of 6, per regime:
+
+| regime | best -> worst by Winkler |
+|---|---|
+| `id` | `lstm_g` 1.75, `lstm_q` 1.94, `tcn_g` 2.97, `tcn_q` 3.36, **`dlinear_q` 5.36, `dlinear_g` 5.61** |
+| `unseen_seastate` | `tcn_g` 1.61, `tcn_q` 1.64, `lstm_g` 3.78, `dlinear_g` 4.11, `dlinear_q` 4.58, `lstm_q` 5.28 |
+| `unseen_vessel` | `tcn_q` 2.06, `tcn_g` 3.00, `dlinear_q` 3.03, `lstm_g` 3.89, `dlinear_g` 3.94, `lstm_q` 5.08 |
+| `unseen_heading` | `dlinear_q` 1.22, `dlinear_g` 1.83, `tcn_g` 3.19, `tcn_q` 4.22, `lstm_q` 5.00, `lstm_g` 5.53 |
+
+CRPS gives the same ordering, except on `unseen_vessel` where `dlinear_q` (2.92) and `tcn_g`
+(3.22) swap 2nd and 3rd. **DLinear is last on `id` and mid-table out of distribution; it wins
+only on `unseen_heading`, the floored regime.** So "DLinear is the robustly calibrated family" is a
+PICP-in-band result that both proper scores contradict everywhere except the artifact regime.
+Selecting the metric that suits the narrative after both were computed is cherry-picking, and the
+band counts now ship with the Winkler and CRPS ranks beside them.
+
+**5. "Coverage collapses under sea-state shift" describes two models, not one model shifted.**
+`dmf.data.splits.build_split` gives the `id` model seeds 0-31 of **every** cell, SS6 included,
+while the `unseen_seastate` model trains on SS3-SS5 only. `0.858 -> 0.648` is therefore a contrast
+between two separately fitted models on two disjoint test sets: the training corpus changed as
+well as the test distribution. P5-D12 recorded the deltas as unpaired but justified it only by the
+realizations differing, not by the rows being different fits. The numbers stand; the mechanism
+sentence is corrected to "a model trained without SS6 covers 0.65 on SS6, against 0.86 for a model
+trained with it".
+
+**6. Smaller corrections carried into the README.** Two of the six passing Reading A rows have a
+realization bootstrap reaching **below** the band floor (`dlinear_gaussian` `picp_ci_lo` 0.8489,
+`dlinear_quantile` 0.8410); the verdict is on the seed mean, which is the registered rule, but the
+interval belongs beside it. The `unseen_heading` "covers 1.000 at `width_ratio` 11.8" figure is
+**pitch specifically** — at the same cell DLinear covers 0.890 on roll and 0.919 on heave — and
+stating it as a property of the regime is the P4-D14 pattern again. The -133 and -337 skills are
+`-132.30 +/- 41.41` and `-336.99 +/- 121.49`, and the `signal_std` there is **0.0933 deg**, i.e.
+the P1-D2 floor.
+
+**7. There is no probabilistic baseline anywhere in this phase.** All five non-head rows in `e03`
+are point models, so `probabilistic.csv` contains six learned heads and nothing else. CLAUDE.md
+non-negotiable 4 is satisfied for the point column and **has no analogue for the coverage column**:
+a reader cannot tell whether 102 of 216 is good, because nothing trivial was measured on that axis.
+An empirical-residual interval around `persistence` or `dlinear_ols`, fitted on the validation
+split, is closed-form and nearly free, and would be near-perfectly calibrated on `id` by
+construction. Its absence means "the heads are calibrated in-distribution" clears no floor. This is
+the largest gap in the phase and it is recorded, not fixed — Phase 6 should add it before any
+further interval claim.
+
+**8. Sweep wall time was stated as 65 h 04 m and is 66 h 04 m.** Corrected in the evidence section.
+`results/e03/sweep.log` is 0 bytes (Python block-buffers stdout to a file), so the wall clock and
+exit status are not traceable to a committed artifact — only the per-run `fit_time_s` column is,
+and it sums to 60.65 h of SGD.
+
+No leakage was found. The audit checked realization-level seed disjointness with the held-out-axis
+assertion, the normalisation provenance guard, that `realization_seed_sequence` hashes the full
+coordinate tuple so SS3-seed-5 and SS6-seed-5 share no phases, that windows never span a
+realization boundary, and that `crossing_rate` is accumulated on the raw fan before sorting.
+
+### P5-D18 — One audit finding checked and rejected, and one routing defect it exposed
+
+**The audit's note N4 is wrong, and the check that refutes it is worth recording.** It stated that
+`picp_ci_lo`/`picp_ci_hi` on the aggregated rows are the **mean** of the per-seed realization
+bootstraps, and so carry no seed-to-seed component. `dmf.eval.report.build_probabilistic_table`
+aggregates them as `min`/`max` — the P3-D22 envelope — and it does so on **864 of 864 rows**;
+only 24 rows also happen to match the mean. The finding came from checking one row
+(`dlinear_gaussian` at the gate cell, per-seed 0.8489 / 0.8490 / 0.8490) where the three seeds
+agree to four decimals, so `min` and `mean` are indistinguishable there. On the rows where the
+seeds genuinely disagree the two differ by up to **0.61** (`lstm_gaussian`, `unseen_heading`,
+pitch @ 100: envelope 0.2411 against a mean of 0.5596) and the published value is unambiguously
+the envelope.
+
+Recorded rather than silently ignored, because the reviewer's method — verify on one row — is the
+same single-cell generalisation P5-D16 and P5-D17 item 1 record *me* committing twice this phase.
+It is a cheap error to make in either direction, and the defence is the same: check a row where
+the quantity being distinguished actually varies.
+
+**The finding it did expose is a routing defect, and that one is real.** P5-D17 item 7 calls the
+absent probabilistic baseline "the largest gap in the phase", and the Gate 5 carry-forward block
+written into `docs/IMPLEMENTATION_PLAN.md` §Phase 6 did not mention it. A gap identified as the
+largest in a phase and then not routed to the phase that should close it is exactly what the
+carry-forward mechanism exists to prevent — the Gate 3 carry-forward's item 1 (quiescence
+detection) was ignored for two phases for want of the same discipline. It is now item 2 of that
+block, with the implementation note that it needs a new closed-form branch in
+`dmf.train.experiment._fit_one`.
+
+### P5-D19 — The deep point path is unchanged by Phase 5, measured rather than argued
+
+The Gate 5 positive control (evidence table) covers `persistence`, `window_mean`,
+`damped_persistence`, `ar20` and `dlinear_ols` — every one of them closed-form or
+parameter-free. **None of them touches `dmf.train.loop`, `dmf.train.losses` or the SGD path**,
+all of which changed this phase along with `base.py` and the four model files. So nothing in
+`results/e03/` showed that the deep *point* path still behaves as it did in Phase 4, and the
+Phase 5 point-accuracy comparison quotes `results/e02` rows produced by the earlier code. The
+Gate 5 audit raised this as its S8 finding; it was a genuine hole.
+
+Closed by measurement. `tcn` was re-fitted at `head="point"` on `id`, three seeds, under current
+code and the committed `e02_deep.yaml` budget:
+
+| | seed 0 | seed 1 | seed 2 | `epochs_run` |
+|---|---|---|---|---|
+| Phase 5 code | 0.120901 | 0.121961 | 0.120818 | 60 / 60 / 60 |
+| Phase 4 (`results/e02`) | 0.120901 | 0.121961 | 0.120818 | 60 / 60 / 60 |
+
+**Bitwise across the whole table**: 108 of 108 per-seed per-cell skill values identical, max
+absolute difference **0.0**. The head plumbing — `head: HeadKind | None = None` resolving to
+`"point"`, `n_output_params` returning 1, `resolve_loss` returning `mse_loss`, the `loss_fn`
+keyword defaulting on all three loop entry points — is behaviour-preserving for point models, and
+that is now a measurement rather than a reading of the diff. Incidentally it also shows `tcn` *is*
+bitwise reproducible run-to-run, which P4-D6 left open for two of the three deep architectures.
+
+**One usability wrinkle found on the way, recorded not fixed.** The control run raised at the very
+end, after all three fits had completed: `dmf.train.experiment._contrast_frame` refuses a run in
+which a deep model is scored but no `PAIRED_CONTRASTS` pair matches the label list, and a cut-down
+two-model config (`persistence` + `tcn`) matches none. The guard is deliberate — it exists so a
+mistyped contrast label fails loudly instead of writing an empty file — but it makes an ad-hoc
+single-model control run raise on a config that is otherwise valid. **No work was lost**, because
+`run_experiment` writes `baselines_by_seed.csv` and `baselines_by_cell.csv` before the contrast
+step precisely so a late failure cannot destroy finished fits, and the numbers above were read
+from those files. That recoverability design earned its keep here.
+
+### P5-D20 — The correction to P5-D17 repeated P5-D17's own defect, twice
+
+The Gate 5 checkpoint review, run against the *corrected* text, found two failures in the two
+paragraphs P5-D17 had just rewritten. Both are the same defect class P5-D17 exists to record: **a
+ranking stated as universal when one regime contradicts it.**
+
+**1. "DLinear is the best-calibrated family in every regime" is false on `unseen_seastate`.**
+P5-D17 item 1 withdrew "the ordering reverses" and endorsed that sentence as "the supported
+statement". It is not supported. Cells in band of 36 on `unseen_seastate`: `dlinear_quantile`
+**0**, `dlinear_gaussian` **0**, `tcn_gaussian` **2**, `tcn_quantile` **3**. By median departure
+from nominal, `tcn_quantile` is best at 0.1945 and `dlinear_quantile` is **fourth of six** at
+0.2796. Worse, the README line supporting it compared `dlinear_quantile` 21/0/19/19 against
+`lstm_quantile` 16/0/0/0 alone — the single deep row that scores zero in every OOD regime, and
+therefore the comparator that most flatters the claim. `tcn_quantile`, the row that falsifies it,
+was not shown. **Withdrawing a single-cell generalisation and replacing it with a
+three-of-four-regimes generalisation supported by a hand-picked comparator is not a correction.**
+All six rows are now printed.
+
+**2. "Roughly ten times wider relative to signal spread in every regime" is false on the same
+regime.** Median `width_ratio` for `dlinear_quantile` against the sharpest deep row: `id` 9.4x,
+`unseen_vessel` 13.6x, `unseen_heading` 3.4x, **`unseen_seastate` 2.5x** — and only **1.09x**
+against `lstm_gaussian` there. That matters specifically because `unseen_seastate` is the regime
+the "DLinear's coverage is bought with width" argument leans on hardest; there the width advantage
+is essentially absent.
+
+**3. Also corrected: "CRPS gives the same ordering" as Winkler.** True on three regimes; on
+`unseen_vessel` `dlinear_quantile` (2.92) and `tcn_gaussian` (3.22) swap 2nd and 3rd. The swap
+mildly *helps* DLinear, so this one was not narrative-serving — it was simply unchecked.
+
+**4. The sweep wall time was stated as fact and is not traceable.** `results/e03/sweep.log` is
+0 bytes because Python block-buffers stdout to a file, so 66 h comes from file timestamps, not from
+a committed artifact. The README now says so; the traceable figure is the 60.65 h that
+`fit_time_s` sums to. P5-D17 item 8 recorded this and the README had not carried it.
+
+**The pattern is now three-for-three in this phase** — P5-D16 (crossing "negligible", from the gate
+cell), P5-D17 item 1 (the ordering "reverses", from the gate cell), and this entry (two rankings
+"in every regime", from three regimes). Every one was a true statement about a subset published as
+a statement about the whole, and every one was caught by an adversarial reader rather than by the
+person writing it. The cheap defence, adopted here: **when a claim ranks models, print every model
+and every regime the claim quantifies over, and let the table carry the exception.** A sentence
+that needs a subset to be true should quote the subset in the sentence.

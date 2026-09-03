@@ -1,0 +1,19 @@
+# LSTM with a Gaussian head -- mean and log-variance per (horizon, channel).
+#
+# Identical backbone to `configs/model/lstm.yaml`, direct multi-horizon as always. Only the
+# head widens, from Linear(128 -> H*C_out) to Linear(128 -> H*C_out*2).
+#
+# `quantiles` is EMPTY and must be: the head emits (mean, log_var), not a fan
+# (docs/protocol.md P5-D1). The log-variance is clamped to [-14, 14] in the model; see
+# `dlinear_gaussian.yaml` for the reasoning.
+#
+# 433 928 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6) against the point row's
+# 317 828: recurrent layers unchanged at 201 728, head 116 100 -> 232 200.
+name: lstm
+label: lstm_gaussian
+head: gaussian
+quantiles: []
+params:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.1

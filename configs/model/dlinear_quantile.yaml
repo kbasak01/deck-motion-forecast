@@ -1,0 +1,29 @@
+# DLinear with a nine-level quantile head -- the cheap probabilistic baseline.
+#
+# Identical backbone to `configs/model/dlinear.yaml`: same channel-independent decomposition,
+# same 25-sample (2.5 s) trend kernel, same shared pair of L -> H maps. Only the width of
+# those maps changes, from H to H*Q per channel, so a difference between this row and the
+# `dlinear` point row is the head and not the architecture.
+#
+# The nine levels are `dmf.models.heads.QUANTILE_FAN_9`: 0.05 to 0.95 in steps of 0.1125.
+# They are the fan and not a fan -- `dmf.train.registry.build_model` refuses a config whose
+# levels are not what a model of that width reports. 0.5 is present exactly, so the point
+# forecast this row is scored against persistence with is READ OFF the fan rather than
+# interpolated (docs/protocol.md P5-D5), and 0.05/0.95 are present exactly, so PICP@90 and
+# the 90 percent interval width are read off it too.
+#
+# 542 700 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6) against the point row's
+# 60 300: the projection widens by Q=9. This row is therefore NOT parameter-matched to its
+# point twin or to the Gaussian one, which P5-D5 records in advance and which belongs in
+# the table caveats.
+#
+# Trained on pinball loss and early-stopped on it (P5-D4), so `best_val_loss` here is not
+# comparable to the MSE the point row stops on. Everything else -- cap, patience, schedule,
+# batch, lr, pipeline, split -- is identical.
+name: dlinear
+label: dlinear_quantile
+head: quantile
+quantiles: [0.05, 0.1625, 0.275, 0.3875, 0.5, 0.6125, 0.725, 0.8375, 0.95]
+params:
+  kernel_size: 25
+  individual: false

@@ -1,0 +1,29 @@
+# DLinear with a Gaussian head -- mean and log-variance per (horizon, channel).
+#
+# Identical backbone to `configs/model/dlinear.yaml`; only the projection width changes,
+# from H to H*2 per channel. Cheaper than the quantile fan and it assumes a symmetric
+# predictive distribution -- whether that assumption costs anything on deck motion is the
+# empirical question this row exists to answer, against `dlinear_quantile` on the same
+# backbone.
+#
+# `quantiles` is EMPTY and `dmf.config.load_model` requires it to be: a Gaussian head emits
+# (mean, log_var), not a fan, and a config listing levels beside it would document an output
+# the model never produces. The head kind is also not an arity -- building this as a
+# two-level quantile fan would put (mean, log_var) on exactly the axis
+# `dmf.models.heads.sort_quantiles` sorts ascending, which is silent, shape-preserving and
+# wrong (docs/protocol.md P5-D1).
+#
+# The log-variance is clamped to [-14, 14] in the model, so sigma stays in
+# [9.1e-4, 1.1e3] against a unit-scale normalised target and the NLL's precision factor is
+# capped at exp(14). Unclamped, the NLL drives log_var down without limit on any element it
+# fits well, and it does so as a loss that keeps improving rather than as a NaN.
+#
+# 120 600 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6), exactly twice the
+# point row's 60 300. Trained and early-stopped on Gaussian NLL (P5-D4).
+name: dlinear
+label: dlinear_gaussian
+head: gaussian
+quantiles: []
+params:
+  kernel_size: 25
+  individual: false
