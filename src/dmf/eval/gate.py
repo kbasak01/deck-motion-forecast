@@ -927,3 +927,500 @@ def write_gate4_report(
         build_gate4_markdown(readout, results_dir=results_dir), encoding="utf-8"
     )
     return readout, csv_path, markdown_path
+
+
+# ======================================================================================
+# Gate 5 -- probabilistic calibration.
+#
+# Same shape as the Gate 4 read-out above and for the same reason: the number a reader sees
+# and the number the gate was read at are one object, computed by repository code from the
+# committed CSVs rather than by a script that cannot be re-run.
+#
+# The criterion is `docs/IMPLEMENTATION_PLAN.md` Phase 5 verbatim -- PICP@90 within
+# [0.85, 0.95] on `id` -- and the band is unchanged. What `docs/protocol.md` P5-D2 added,
+# BEFORE the sweep ran, is the cell it is read at, because the plan does not say and
+# coverage varies strongly with lead time. Choosing that afterwards would be cell selection.
+# ======================================================================================
+
+#: Regime the gate is read on. The out-of-distribution regimes are reported beside it and
+#: are explicitly **not** what it turns on: P5-D2 and the task both require the degradation
+#: to be reported rather than fixed, so a regime failing here is a finding, not a gate.
+GATE5_REGIME = "id"
+
+#: The cell Reading A is read at -- the same cell Gates 3 and 4 are read at (P3-D12, P4-D1),
+#: so all three phases turn on one place: the decision horizon, on the DOF that binds.
+GATE5_DOF = "pitch"
+GATE5_HORIZON_SAMPLES = 100
+
+#: The band, verbatim from ``docs/IMPLEMENTATION_PLAN.md`` Phase 5. Inclusive at both ends:
+#: the plan says "within [0.85, 0.95]", and a coverage landing exactly on 0.95 is within it.
+GATE5_PICP_BAND: tuple[float, float] = (0.85, 0.95)
+
+#: Nominal coverage the band applies to. Carried as a named constant so the document can
+#: state what "PICP@90" means rather than leaving the reader to infer it from ``alpha``.
+GATE5_NOMINAL = 0.90
+
+#: Schema of ``gate5.csv``.
+GATE5_COLUMNS: tuple[str, ...] = (
+    "reading",
+    "model",
+    "head",
+    "regime",
+    "dof",
+    "horizon_samples",
+    "horizon_s",
+    "n_seeds",
+    "picp_mean",
+    "picp_std",
+    "picp_ci_lo",
+    "picp_ci_hi",
+    "band_lo",
+    "band_hi",
+    "verdict",
+    "mean_interval_width_mean",
+    "width_ratio_mean",
+    "crossing_rate_mean",
+    "n_params",
+)
+
+#: Schema of ``gate5_degradation.csv``.
+DEGRADATION_COLUMNS: tuple[str, ...] = (
+    "model",
+    "head",
+    "regime",
+    "dof",
+    "horizon_samples",
+    "horizon_s",
+    "picp_id",
+    "picp_ood",
+    "picp_delta",
+    "width_id",
+    "width_ood",
+    "width_delta",
+    "width_ratio_id",
+    "width_ratio_ood",
+)
+
+
+def _picp_verdict(row: "pd.Series[Any]") -> str:
+    """Classify one coverage row against the band.
+
+    A row that cannot be evaluated is :data:`VERDICT_UNVERIFIED`, never a pass. Following
+    the Gate 4 precedent exactly: ``nan >= 0.85`` is ``False`` in IEEE arithmetic, so a
+    naive comparison would silently *fail* an unmeasured row, and filling the NaN would
+    silently pass it. Both are wrong, and the distinction is the reader's to see.
+
+    Args:
+        row: One aggregated coverage row.
+
+    Returns:
+        One of :data:`VERDICT_PASS`, :data:`VERDICT_FAIL`, :data:`VERDICT_UNVERIFIED`.
+    """
+    picp = float(row["picp_mean"])
+    seeds = row.get("n_seeds", np.nan)
+    if not np.isfinite(picp):
+        return VERDICT_UNVERIFIED
+    if not np.isfinite(float(seeds)) or int(seeds) < MIN_SEEDS:
+        return VERDICT_UNVERIFIED
+    low, high = GATE5_PICP_BAND
+    return VERDICT_PASS if low <= picp <= high else VERDICT_FAIL
+
+
+def gate5_readout(
+    table: pd.DataFrame,
+    *,
+    regime: str = GATE5_REGIME,
+    dof: str = GATE5_DOF,
+    horizon_samples: int = GATE5_HORIZON_SAMPLES,
+) -> pd.DataFrame:
+    """Compute both Gate 5 readings from the aggregated probabilistic table.
+
+    - **Reading A**, the gate: one row per (model, head) at :data:`GATE5_DOF` /
+      :data:`GATE5_HORIZON_SAMPLES`.
+    - **Reading B**, the surround: every cell of the regime, so the pass count is visible
+      beside the gate cell rather than discovered later. Gates 3 and 4 both needed a "what
+      the gate does not say" section written after the fact; here it is part of the read-out.
+
+    Args:
+        table: ``probabilistic.csv``, i.e. :data:`dmf.eval.report.PROBABILISTIC_COLUMNS`.
+        regime: Regime to read. Defaults to ``id``, which is what the gate names.
+        dof: DOF Reading A is read at. Defaults to the registered cell; parameterised only
+            so a fixture-scale table can be exercised, never so a caller can choose a
+            kinder cell after seeing the numbers.
+        horizon_samples: Horizon Reading A is read at, samples. Same caveat as ``dof``.
+
+    Returns:
+        One frame with :data:`GATE5_COLUMNS`, Reading A rows first.
+
+    Raises:
+        ValueError: If a required column is missing, or if the gate cell is absent -- a
+            missing gate cell is fatal, never an empty pass.
+    """
+    missing = sorted(
+        {
+            "model",
+            "head",
+            "regime",
+            "dof",
+            "horizon_samples",
+            "horizon_s",
+            "n_seeds",
+            "picp_mean",
+            "picp_std",
+            "picp_ci_lo",
+            "picp_ci_hi",
+            "mean_interval_width_mean",
+            "width_ratio_mean",
+            "crossing_rate_mean",
+            "n_params",
+        }
+        - set(table.columns)
+    )
+    if missing:
+        raise ValueError(f"the probabilistic table is missing columns {missing}")
+
+    scoped = table[table["regime"] == regime]
+    if scoped.empty:
+        raise ValueError(
+            f"the probabilistic table carries no rows for regime {regime!r}; Gate 5 is read "
+            f"on {GATE5_REGIME!r} and cannot be read from a table that does not contain it"
+        )
+    dof_column = _resolve_gate_dof(scoped, dof)
+    cell = scoped[(scoped["dof"] == dof_column) & (scoped["horizon_samples"] == horizon_samples)]
+    if cell.empty:
+        raise ValueError(
+            f"the gate cell (regime={regime!r}, dof={dof_column!r}, "
+            f"horizon_samples={horizon_samples}) is absent from the probabilistic "
+            f"table. Gate 5 cannot be read, and an absent cell is not a pass"
+        )
+
+    frames = []
+    for key, rows in ((READING_A.key, cell), (READING_B.key, scoped)):
+        frame = rows.copy()
+        frame.insert(0, "reading", key)
+        frames.append(frame)
+    readout = pd.concat(frames, ignore_index=True)
+    readout["band_lo"] = GATE5_PICP_BAND[0]
+    readout["band_hi"] = GATE5_PICP_BAND[1]
+    readout["verdict"] = readout.apply(_picp_verdict, axis=1)
+    ordered = readout.sort_values(
+        ["reading", "model", "head", "dof", "horizon_samples"], kind="stable"
+    ).reset_index(drop=True)
+    return ordered[list(GATE5_COLUMNS)]
+
+
+def gate5_reading_passes(readout: pd.DataFrame, key: str) -> bool:
+    """Report whether every row of one reading passes.
+
+    Args:
+        readout: The frame :func:`gate5_readout` returned.
+        key: ``"A"`` or ``"B"``.
+
+    Returns:
+        ``True`` only if the reading has rows and every one is :data:`VERDICT_PASS`. An
+        :data:`VERDICT_UNVERIFIED` row is not a pass.
+
+    Raises:
+        ValueError: If ``key`` names no reading in ``readout``.
+    """
+    rows = readout[readout["reading"] == key]
+    if rows.empty:
+        raise ValueError(
+            f"reading {key!r} is not in the read-out; it carries {sorted(set(readout['reading']))}"
+        )
+    return bool((rows["verdict"] == VERDICT_PASS).all())
+
+
+def coverage_degradation(table: pd.DataFrame, *, base_regime: str = GATE5_REGIME) -> pd.DataFrame:
+    """Tabulate how coverage and sharpness move from ``id`` to each held-out regime.
+
+    **This is the finding, not a defect to fix.** ``docs/IMPLEMENTATION_PLAN.md`` Phase 5
+    and P5-D2 both require the degradation to be reported rather than corrected: it is the
+    coverage-under-domain-shift story that motivates split conformal prediction, measured on
+    a concrete operational task.
+
+    **The comparison is UNPAIRED, and that has to be stated wherever it is read.** ``id``
+    and ``unseen_seastate`` score different realizations -- different seeds in the first
+    case, an entirely held-out sea state in the second -- so there is no common resample
+    over which a paired interval could be drawn. Each side carries its own realization
+    bootstrap and the difference carries none. ``docs/protocol.md`` P3-D13 records this
+    project publishing a wrong conclusion twice from exactly this mistake, which is why the
+    delta columns ship without an interval rather than with one that would be wrong.
+
+    ``width_delta`` is reported beside ``picp_delta`` and neither is interpretable alone. An
+    out-of-distribution interval can hold its coverage purely by getting wider, which is not
+    calibration surviving the shift; and P5-D6 predicts, before the sweep, that
+    ``unseen_heading`` will show near-perfect coverage at meaningless width on pitch for the
+    P1-D2 residual-floor reason.
+
+    Args:
+        table: ``probabilistic.csv``.
+        base_regime: The reference regime. Defaults to ``id``.
+
+    Returns:
+        One row per (model, head, out-of-distribution regime, DOF, horizon), columns
+        :data:`DEGRADATION_COLUMNS`. Empty if the table carries only ``base_regime``.
+
+    Raises:
+        ValueError: If ``base_regime`` is absent from the table.
+    """
+    keys = ["model", "head", "dof", "horizon_samples"]
+    base = table[table["regime"] == base_regime]
+    if base.empty:
+        raise ValueError(
+            f"the probabilistic table carries no {base_regime!r} rows, so there is nothing "
+            f"to measure degradation against"
+        )
+    other = table[table["regime"] != base_regime]
+    if other.empty:
+        return pd.DataFrame(columns=list(DEGRADATION_COLUMNS))
+    columns = [*keys, "horizon_s", "picp_mean", "mean_interval_width_mean", "width_ratio_mean"]
+    merged = other[[*columns, "regime"]].merge(
+        base[columns], on=keys, suffixes=("_ood", "_id"), validate="many_to_one"
+    )
+    merged["picp_id"] = merged["picp_mean_id"]
+    merged["picp_ood"] = merged["picp_mean_ood"]
+    merged["picp_delta"] = merged["picp_ood"] - merged["picp_id"]
+    merged["width_id"] = merged["mean_interval_width_mean_id"]
+    merged["width_ood"] = merged["mean_interval_width_mean_ood"]
+    merged["width_delta"] = merged["width_ood"] - merged["width_id"]
+    merged["width_ratio_id"] = merged["width_ratio_mean_id"]
+    merged["width_ratio_ood"] = merged["width_ratio_mean_ood"]
+    merged["horizon_s"] = merged["horizon_s_ood"]
+    ordered = merged.sort_values(
+        ["regime", "model", "head", "dof", "horizon_samples"], kind="stable"
+    ).reset_index(drop=True)
+    return ordered[list(DEGRADATION_COLUMNS)]
+
+
+#: Columns rendered into the Gate 5 tables. The CSV keeps everything; the document keeps
+#: what a reader making the decision needs, with coverage and width **always adjacent** --
+#: PICP alone is trivially gameable by widening, and the protocol forbids reporting it that
+#: way (P5-D2, and the `forecast-protocol` skill).
+_GATE5_RENDERED: tuple[str, ...] = (
+    "model",
+    "head",
+    "dof",
+    "horizon_s",
+    "n_seeds",
+    "picp_mean",
+    "picp_std",
+    "picp_ci_lo",
+    "picp_ci_hi",
+    "mean_interval_width_mean",
+    "width_ratio_mean",
+    "verdict",
+)
+
+
+def _gate5_headline(readout: pd.DataFrame, key: str) -> str:
+    """Summarise one reading in a sentence that names every row that did not pass."""
+    rows = readout[readout["reading"] == key]
+    total = len(rows)
+    passed = int((rows["verdict"] == VERDICT_PASS).sum())
+    verdict = "PASS" if passed == total and total else "NOT PASSED"
+    sentence = f"**Reading {key} -- {verdict}**: {passed} of {total} rows inside the band."
+    failures = rows[rows["verdict"] != VERDICT_PASS]
+    if failures.empty:
+        return sentence
+    named = ", ".join(
+        f"`{r.model}`/{r.head} {r.dof}@{r.horizon_s:g}s {r.picp_mean:.3f} ({r.verdict})"
+        for r in list(failures.itertuples())[:8]
+    )
+    more = "" if len(failures) <= 8 else f", and {len(failures) - 8} more"
+    return f"{sentence} Outside: {named}{more}."
+
+
+def gate5_notes(readout: pd.DataFrame, degradation: pd.DataFrame | None = None) -> tuple[str, ...]:
+    """Return the caveats that must travel with any Gate 5 number.
+
+    Args:
+        readout: The frame from :func:`gate5_readout`.
+        degradation: The frame from :func:`coverage_degradation`, if it was computed.
+
+    Returns:
+        Caveat lines, rendered as a bullet list by :func:`build_gate5_markdown`.
+    """
+    notes = [
+        "Simulated results only. The generator has no process noise, so the achievable "
+        "sharpness is unrealistically high and every interval here is narrower than one "
+        "fitted to real deck motion would be (`docs/protocol.md` P4-D16).",
+        "**Coverage is never a result on its own.** A wide enough interval covers "
+        "everything. `width_ratio` is the reading that makes the width interpretable: it is "
+        "the interval width over that of an unconditional interval matched to the scored "
+        "partition's own spread, so **1.0 means no sharper than knowing only the variance**, "
+        "the same device `nrmse` provides for RMSE (P4-D3).",
+        "**The heads are not parameter-matched** to each other or to their Phase 4 point "
+        "rows: the final projection widens with the head, so a quantile head carries ~9x the "
+        "head parameters of a point one (P5-D5). A head-vs-head difference is not an "
+        "architecture result.",
+        "**`best_val_loss` is not comparable across heads** -- each model is early-stopped on "
+        "its own objective, named in `val_loss_name` (P5-D4).",
+    ]
+    unverified = readout[readout["verdict"] == VERDICT_UNVERIFIED]
+    if not unverified.empty:
+        named = ", ".join(
+            f"`{r.model}`/{r.head} {r.dof}@{r.horizon_s:g}s"
+            for r in list(unverified.itertuples())[:6]
+        )
+        notes.append(
+            f"**{len(unverified)} row(s) are UNVERIFIED, which is not a pass**: {named}. A "
+            f"row with fewer than {MIN_SEEDS} seeds or a non-finite coverage is an unmeasured "
+            f"gate, not a passed one."
+        )
+    if degradation is not None and not degradation.empty:
+        regimes = ", ".join(f"`{name}`" for name in sorted(set(degradation["regime"])))
+        notes.append(
+            f"The degradation table covers {regimes} and is **reported, not fixed** -- it is "
+            f"the finding this phase exists to produce, and the same coverage-under-shift "
+            f"story that motivates conformal prediction. The deltas are **unpaired**: the "
+            f"two regimes score different realizations, so no common resample exists and no "
+            f"interval on a delta would be honest (P3-D13)."
+        )
+        notes.append(
+            "On `unseen_heading`, coverage on pitch and pitch_rate is **predicted in advance** "
+            "to be near 1.0 at meaningless width: that regime's test set is beam seas, where "
+            "the pitch heading factor sits on the P1-D2 residual floor ~26 dB down, so a head "
+            "fitted where pitch has amplitude emits intervals scaled to a signal the test set "
+            "does not contain (P5-D6). Near-perfect coverage there is not calibration."
+        )
+    return tuple(notes)
+
+
+def build_gate5_markdown(
+    readout: pd.DataFrame,
+    *,
+    degradation: pd.DataFrame | None = None,
+    results_dir: Path | None = None,
+) -> str:
+    """Render the Gate 5 read-out as Markdown.
+
+    Args:
+        readout: The frame from :func:`gate5_readout`.
+        degradation: The frame from :func:`coverage_degradation`, rendered as its own
+            section when given.
+        results_dir: Directory the CSVs were read from, for the provenance line.
+
+    Returns:
+        The rendered Markdown document.
+
+    Raises:
+        ValueError: If ``readout`` is empty -- an empty gate document reads as "nothing
+            failed".
+    """
+    if readout.empty:
+        raise ValueError("refusing to render an empty Gate 5 read-out")
+    where = "beside this document" if results_dir is None else f"`{_display_dir(results_dir)}`"
+    low, high = GATE5_PICP_BAND
+    parts: list[str] = [
+        "# Gate 5 read-out",
+        "",
+        f"Simulated results only. Gate 5: **PICP@{GATE5_NOMINAL:.0%} within "
+        f"[{low}, {high}] on the `{GATE5_REGIME}` regime** "
+        "(`docs/IMPLEMENTATION_PLAN.md` Phase 5, band unchanged). The cell it is read at "
+        "was registered before the sweep ran (`docs/protocol.md` P5-D2) and is the cell "
+        "Gates 3 and 4 are read at: the decision horizon, on the DOF that binds.",
+        "",
+        f"Computed from `probabilistic.csv` in {where}; the point accuracy of the same runs "
+        f"is in `baselines.csv` beside it, and the per-run source of truth is "
+        f"`probabilistic_by_seed.csv`.",
+        "",
+        "## Outcome",
+        "",
+    ]
+    present = [key for key in ("A", "B") if key in set(readout["reading"])]
+    parts += [f"- {_gate5_headline(readout, key)}" for key in present]
+    parts.append("")
+
+    titles = {
+        "A": f"the gate -- {GATE5_DOF} at {GATE5_HORIZON_SAMPLES} samples",
+        "B": f"the surround -- every cell of `{GATE5_REGIME}`",
+    }
+    for key in present:
+        subset = readout[readout["reading"] == key].reset_index(drop=True)
+        parts += [
+            f"## Reading {key} -- {titles[key]}",
+            "",
+            f"Regime `{subset['regime'].iloc[0]}`. PASS iff "
+            f"`{low} <= picp_mean <= {high}`, inclusive at both ends.",
+            "",
+            _gate5_headline(readout, key),
+            "",
+            to_markdown(subset[list(_GATE5_RENDERED)]),
+            "",
+        ]
+
+    if degradation is not None and not degradation.empty:
+        parts += [
+            "## Coverage under distribution shift -- reported, not fixed",
+            "",
+            "Each row is one cell's move from `id` to a held-out regime. Read `picp_delta` "
+            "and `width_delta` **together**: an interval that keeps its coverage by growing "
+            "has not kept its calibration.",
+            "",
+            to_markdown(degradation),
+            "",
+        ]
+
+    notes = gate5_notes(readout, degradation)
+    parts += ["## Notes", "", *[f"- {note}" for note in notes], ""]
+    return "\n".join(parts)
+
+
+def read_gate5_inputs(results_dir: Path) -> pd.DataFrame:
+    """Read ``probabilistic.csv`` from a results directory.
+
+    Args:
+        results_dir: Directory holding the artifacts.
+
+    Returns:
+        The aggregated probabilistic table.
+
+    Raises:
+        FileNotFoundError: If ``probabilistic.csv`` is absent.
+    """
+    path = results_dir / "probabilistic.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found; Gate 5 is read from the committed artifacts of a Phase 5 "
+            f"sweep, never from a live model"
+        )
+    return pd.read_csv(path)
+
+
+def write_gate5_report(
+    results_dir: Path,
+    out_dir: Path | None = None,
+    *,
+    dof: str = GATE5_DOF,
+    horizon_samples: int = GATE5_HORIZON_SAMPLES,
+) -> tuple[pd.DataFrame, Path, Path]:
+    """Read the artifacts, compute the read-out and the degradation table, and write both.
+
+    Args:
+        results_dir: Directory holding ``probabilistic.csv``.
+        out_dir: Where to write ``gate5.csv``, ``gate5_degradation.csv`` and ``gate5.md``.
+            Defaults to ``results_dir``.
+        dof: DOF Reading A is read at. See :func:`gate5_readout`.
+        horizon_samples: Horizon Reading A is read at, samples. See :func:`gate5_readout`.
+
+    Returns:
+        ``(readout, csv_path, markdown_path)``.
+
+    Raises:
+        FileNotFoundError: If ``probabilistic.csv`` is absent.
+        ValueError: Anything :func:`gate5_readout` raises -- a missing gate cell is fatal.
+    """
+    destination = results_dir if out_dir is None else out_dir
+    table = read_gate5_inputs(results_dir)
+    readout = gate5_readout(table, dof=dof, horizon_samples=horizon_samples)
+    degradation = coverage_degradation(table)
+    csv_path = write_table(readout, destination / "gate5.csv")
+    if not degradation.empty:
+        write_table(degradation, destination / "gate5_degradation.csv")
+    markdown_path = destination / "gate5.md"
+    markdown_path.write_text(
+        build_gate5_markdown(readout, degradation=degradation, results_dir=results_dir),
+        encoding="utf-8",
+    )
+    return readout, csv_path, markdown_path

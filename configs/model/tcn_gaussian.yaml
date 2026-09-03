@@ -1,0 +1,21 @@
+# TCN with a Gaussian head -- mean and log-variance per (horizon, channel).
+#
+# Identical backbone to `configs/model/tcn.yaml`, receptive field 253 samples against a
+# 200-sample lookback, unchanged. Only the final Linear(64 -> .) widens, from H*C_out to
+# H*C_out*2.
+#
+# `quantiles` is EMPTY and must be: the head emits (mean, log_var), which is not a two-level
+# fan and is never sorted (docs/protocol.md P5-D1). The log-variance is clamped to [-14, 14]
+# in the model; see `dlinear_gaussian.yaml` for the reasoning.
+#
+# 255 304 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6) against the point row's
+# 196 804: blocks unchanged at 138 304, head 58 500 -> 117 000.
+name: tcn
+label: tcn_gaussian
+head: gaussian
+quantiles: []
+params:
+  n_filters: 64
+  kernel_size: 3
+  dilations: [1, 2, 4, 8, 16, 32]
+  dropout: 0.1

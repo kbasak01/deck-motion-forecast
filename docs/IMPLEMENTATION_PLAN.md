@@ -402,6 +402,57 @@ This phase is also the clean bridge into Projects 6 and 7 from the source doc �
 
 ### Phase 6 — Evaluation, quiescence, ablations (1 day)
 
+> **Before you start — carried forward from Gate 5. Read `docs/protocol.md` §Phase 5 first.**
+>
+> Phases 3–5 measured things that change this section. The text below is the original plan and has
+> **not** been rewritten; these are the deltas.
+>
+> **1. Quiescence detection is still not built, and it is now three phases overdue.** The Gate 3
+> carry-forward said to implement `src/dmf/eval/quiescence.py` *before* the deep models, because
+> `id` RMSE cannot separate architectures. It was not done, and Phase 4 and Phase 5 both confirmed
+> the prediction: Gate 4 passed on a cell where all three deep models clear the bar by two orders
+> of magnitude, and Gate 5 passes on six rows of 216. All seven functions in `quiescence.py` are
+> still `raise NotImplementedError`. **Do this first, before any ablation.** The operational
+> metric is the only one left that discriminates, and P3-D4 already made `heave_rate` a forecast
+> target specifically so this metric could supply its own decision variable.
+>
+> **2. There is no probabilistic baseline anywhere in Phase 5, and it is that phase's largest
+> gap.** All five non-head rows in `e03` are point models, so `probabilistic.csv` holds six learned
+> heads and nothing else. CLAUDE.md non-negotiable 4 is satisfied for the point column and has **no
+> analogue for the coverage column**: nobody can say whether 102 of 216 cells in band is good,
+> because nothing trivial was measured on that axis. Build it before any further interval claim --
+> an empirical-residual interval around `persistence` or `dlinear_ols`, with the residual quantiles
+> taken from the **validation** split, is closed-form, costs one pass, and would be near-perfectly
+> calibrated on `id` by construction. That is exactly what makes it the right floor: a head that
+> cannot beat it has learned nothing conditional about its own uncertainty. It needs a new
+> closed-form branch in `dmf.train.experiment._fit_one`, which dispatches on `issubclass`
+> (P5-D17 item 7).
+>
+> **3. The probabilistic heads change what quiescence detection can be.** A landing decision is a
+> decision under uncertainty, and there are now calibrated intervals to make it with. Detecting a
+> quiescent window from the 0.05 quantile of each channel — "will the deck *stay* inside limits
+> with 95% confidence" — is a different and more defensible operational rule than thresholding a
+> point forecast, and the plan's §6.2 predates the heads existing. Report both; the point-forecast
+> rule is the baseline the interval rule has to beat.
+>
+> **4. Coverage is band-dependent, so an ablation that pools horizons will mislead.** P5-D15: the
+> deep heads are calibrated 12 of 12 at 10–15 s on `id` and over-cover in 18–23 of 24 cells at
+> 1–5 s. Any Phase 6 table that reports one coverage number per model is averaging two opposite
+> behaviours.
+>
+> **5. The observation-mode ablation (§6.3) is the one Phase 5 could not do.** `e03` is `ideal`
+> only, for the same reason `e02` was. P1-D6 forbids mixing an `imu` input with an `ideal` target,
+> so `imu` is a separate task definition and a separate sweep — and at Phase 5 rates that is
+> another ~65 h. Budget it explicitly or cut the model list; do not assume it is cheap.
+>
+> **6. Two integrity gaps are inherited, both recorded and neither fixed** (P5-D10): there is no
+> shuffle control on any *head* — the one that runs refits AR, a point model — and no untrained
+> control on an interval. If Phase 6 makes a claim that turns on interval quality, it needs a
+> control that turns on interval quality.
+>
+> **7. `results/e03/` is the Phase 5 record and must not be regenerated.** `results/`, `results/imu/`
+> and `results/e02/` are likewise the Gate 3 and Gate 4 records. Phase 6 writes its own directory.
+
 #### 6.1 Core metric table (`eval/metrics.py`)
 
 For every (model, regime, DOF, horizon): RMSE, MAE, skill score vs persistence, phase lag at max cross-correlation.

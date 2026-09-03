@@ -1,0 +1,111 @@
+# Gate 5 -- the probabilistic table.
+#
+# ELEVEN models in ONE run: five cheap deterministic rows and the six probabilistic ones, on
+# one data pipeline, one normalisation, one horizon definition and one budget. Splitting
+# them across runs is how those silently drift apart, which is the failure Gate 4's fairness
+# requirement exists to prevent and which Gate 5 inherits unchanged.
+#
+# Named `e03_probabilistic` and not `e03_quantile` as docs/IMPLEMENTATION_PLAN.md 0.1 has
+# it: the experiment carries the Gaussian rows too, and a file named for one of the two
+# heads it runs would misdescribe half its own table (docs/protocol.md P5-D7).
+#
+# --- What the five deterministic rows are for ---
+#
+#   1. `persistence` is FIRST because it is the denominator of every skill score in the
+#      project and `dmf.eval.runner.evaluate_models` requires it in the model set. Every
+#      probabilistic row also carries a point forecast -- the 0.5 quantile, read off the fan,
+#      or the Gaussian mean (P5-D5) -- and it is scored against this row.
+#   2. `window_mean` is the zero-parameter trivial forecast and the shuffle control's null.
+#      It beats persistence in 107 of 144 cells (P3-D20), so a probabilistic row whose point
+#      forecast does not clear it has learned nothing the window mean does not already carry.
+#   3. `damped_persistence` is the reference Gate 4 names.
+#   4. `ar20` is here for ONE reason: `_run_controls` runs the shuffle control -- the only
+#      control in this project that answers "is this leakage?" -- only when the experiment
+#      carries an AR config, and it refits AR(20) on time-shuffled targets. Without this row
+#      the sweep would ship a coverage table with no leakage control at all, which is the
+#      P4-D15 defect (quoting the control that passed and omitting the one that did not run).
+#      It is closed-form and slices from the cached moments, so it costs one Cholesky.
+#   5. `dlinear_ols` is the P4-D10-style positive control: it is solved in CLOSED FORM from
+#      the training moments, so it is budget-independent and seed-independent, and its `id`
+#      gate-cell skill must reproduce `results/e02/baselines.csv` EXACTLY. If it does not,
+#      the pipeline moved between phases and no number in this table is comparable to the
+#      Phase 4 one. It is also the strongest linear baseline, at the exact optimum of its own
+#      objective, so no epoch budget can handicap it.
+#
+# The heads are attached to `dlinear`, `tcn` and `lstm` (P5-D3, decided with the user rather
+# than inherited: the plan guesses TCN). `transformer` is NOT carried into Phase 5 -- it
+# loses to `dlinear_ols` on every restriction in P4-D14 and would add a third of the sweep's
+# wall time.
+#
+# --- Budget continuity: the train block below is BYTE-IDENTICAL to e02_deep.yaml's ---
+#
+# Cap 60, batch 1024, lr 2e-3, patience 15, warmup 5 percent, bf16. Unchanged on purpose
+# (P5-D3), for two reasons. Changing `dmf.train.loop` now would make every point row here
+# non-comparable to the committed `results/e02/` table, and the point rows are what a
+# probabilistic row is judged against. And choosing a cap after measuring which cap favours
+# which architecture is selecting a hyperparameter on the results it produces.
+#
+# The cost is stated rather than discovered later: P4-D9 measured `lstm` early-stopping
+# mid-anneal at this cap and shipping 7.4 percent worse than an 18-epoch pilot, while `tcn`
+# is cap-bound and still improving. Every lstm-vs-tcn sentence here, calibration included,
+# inherits that asymmetry.
+#
+# --- What is NOT identical across the rows, and what still is (P5-D4) ---
+#
+# Each model is early-stopped on ITS OWN training objective: MSE for a point head, pinball
+# for a quantile head, Gaussian NLL for a Gaussian one. A quantile head has no MSE to stop
+# on, and stopping it on the MSE of a derived point forecast would select the epoch that is
+# best for a statistic it is not fitting. `best_val_loss` is therefore NOT comparable across
+# heads and ships beside a `val_loss_name` column so the comparison cannot be made by
+# accident. Identical for every row: the cap, the patience, the schedule policy, the batch
+# size, the learning rate, the data pipeline and the split.
+#
+# The heads are also not parameter-matched to each other or to their Phase 4 point rows --
+# dlinear 60 300 / 120 600 / 542 700, tcn 196 804 / 255 304 / 664 804, lstm 317 828 /
+# 433 928 / 1 246 628 for point / gaussian / quantile. P5-D5 records this in advance; it
+# belongs in the table caveats, not only in the protocol.
+#
+# --- Three consequences of the model list, stated here so none is a surprise ---
+#
+# `_run_controls` takes the untrained-control subject to be the FIRST SGD config in this
+# list, which here is `dlinear_quantile`. An untrained quantile head is scored through its
+# point projection (the 0.5 quantile), which is the quantity comparable to the Phase 3/4
+# untrained rows; P3-D9 records why that control's literal criterion is wrong on this task
+# and is reported rather than enforced.
+#
+# The shuffle control refits AR(20), a POINT model, so it certifies the point pipeline the
+# probabilistic rows are built on -- it is not a leakage control on the heads themselves.
+# There is no shuffle control for a quantile or Gaussian head in this sweep, and refitting a
+# deep head on shuffled targets would cost as much as the sweep. Stated so the coverage
+# numbers are not read as carrying more certification than they do.
+#
+# `imu` is not run in this phase, as in Phase 4: P1-D6 forbids mixing an imu input with an
+# ideal target, so the two observation modes are separate task definitions.
+name: probabilistic
+data: ../data/default.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p20.yaml
+  - ../model/dlinear_ols.yaml
+  - ../model/dlinear_quantile.yaml
+  - ../model/dlinear_gaussian.yaml
+  - ../model/tcn_quantile.yaml
+  - ../model/tcn_gaussian.yaml
+  - ../model/lstm_quantile.yaml
+  - ../model/lstm_gaussian.yaml
+
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [id, unseen_seastate, unseen_heading, unseen_vessel]

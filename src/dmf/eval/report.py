@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 from dmf.data.channels import channel_aliases
 
@@ -862,3 +863,214 @@ def build_results_report(results_dir: Path, out_path: Path) -> Path:
             :func:`build_baselines_markdown`.
     """
     raise NotImplementedError
+
+
+# --------------------------------------------------------------------------------------
+# Phase 5: the probabilistic table.
+#
+# Structured exactly like the baselines table above -- one row per (model, head, regime,
+# DOF, horizon), aggregated over seeds by the same rules, with the same >= 3 seed floor and
+# the same envelope treatment of bootstrap intervals -- so that a reader who has learned to
+# read one can read the other. What differs is what the columns mean, and that is the point
+# of the caveats below rather than of a different schema.
+# --------------------------------------------------------------------------------------
+
+#: Grouping keys. ``head`` joins the baselines keys because one backbone ships two heads,
+#: and a table keyed on ``model`` alone would silently average a quantile row into a
+#: Gaussian one.
+PROBABILISTIC_GROUP_COLS: tuple[str, ...] = ("model", "head", "regime", "dof", "horizon_samples")
+
+#: Metrics aggregated mean +/- std over seeds.
+PROBABILISTIC_METRIC_COLS: tuple[str, ...] = (
+    "picp",
+    "mean_interval_width",
+    "width_ratio",
+    "winkler",
+    "crps",
+    "pinball",
+    "crossing_rate",
+)
+
+#: Schema of ``probabilistic.csv``.
+PROBABILISTIC_COLUMNS: tuple[str, ...] = (
+    "model",
+    "head",
+    "regime",
+    "dof",
+    "horizon_samples",
+    "horizon_s",
+    "n_seeds",
+    "deterministic",
+    "n_windows",
+    "n_quantiles",
+    "alpha",
+    "picp_mean",
+    "picp_std",
+    "picp_ci_lo",
+    "picp_ci_hi",
+    "mean_interval_width_mean",
+    "mean_interval_width_std",
+    "width_ratio_mean",
+    "width_ratio_std",
+    "signal_std",
+    "winkler_mean",
+    "winkler_std",
+    "crps_mean",
+    "crps_std",
+    "pinball_mean",
+    "pinball_std",
+    "crossing_rate_mean",
+    "crossing_rate_std",
+    "n_params",
+    "val_loss_name",
+    "fit_time_s_mean",
+)
+
+#: Artifacts a Phase 5 run writes, and what each is for. Rendered into every document's
+#: provenance line, as :data:`BASELINES_ARTIFACTS` is.
+PROBABILISTIC_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("probabilistic.csv", "aggregated"),
+    ("probabilistic_by_seed.csv", "one row per run, the source of truth"),
+    ("baselines.csv", "the point accuracy of the same runs, scored against persistence"),
+)
+
+
+def width_ratio(mean_width: pd.Series, signal_std: pd.Series, alpha: pd.Series) -> pd.Series:
+    """Express interval width as a fraction of an unconditional interval's width.
+
+    A mean interval width in degrees is not interpretable on its own: 2 deg is sharp for
+    roll at 15 s and uselessly wide for pitch at 1 s. The reference is the width an
+    unconditional Gaussian interval would need to reach the same nominal level using only
+    the scored partition's own spread -- ``2 * z(1 - alpha/2) * signal_std`` -- so
+
+        ``width_ratio = mean_interval_width / (2 * z(1 - alpha/2) * signal_std)``
+
+    and **1.0 means the interval is no sharper than knowing nothing but the partition's
+    variance**. This is deliberately the same device ``nrmse`` uses for RMSE (P4-D3), where
+    1.0 means "no better than predicting the partition mean", and it exists for the same
+    reason: on this corpus the absolute magnitudes flatter every model, so a dimensionless
+    reference is what makes a column readable across DOFs and horizons.
+
+    It is a **sharpness** measure and says nothing about calibration on its own. A ratio
+    below 1.0 with PICP at nominal is a genuinely informative interval; a ratio below 1.0
+    with PICP well under nominal is just an interval that is too narrow.
+
+    Args:
+        mean_width: Mean interval width, corpus units.
+        signal_std: Standard deviation of the target at that lead time and channel over the
+            scored partition, corpus units. Comes from the point pass, which already
+            computes it for ``nrmse``.
+        alpha: Nominal miscoverage the width was measured at.
+
+    Returns:
+        Dimensionless ratio, one value per input row.
+
+    Raises:
+        ValueError: If any ``signal_std`` is not finite and strictly positive.
+    """
+    std = np.asarray(signal_std, dtype=np.float64)
+    if not np.all(np.isfinite(std)) or np.any(std <= 0.0):
+        raise ValueError(
+            "signal_std must be finite and strictly positive to normalise an interval "
+            "width; a zero-variance channel has no unconditional interval to compare to"
+        )
+    z = norm.ppf(1.0 - np.asarray(alpha, dtype=np.float64) / 2.0)
+    return pd.Series(
+        np.asarray(mean_width, dtype=np.float64) / (2.0 * z * std),
+        index=mean_width.index,
+        dtype=float,
+    )
+
+
+def build_probabilistic_table(by_seed: pd.DataFrame) -> pd.DataFrame:
+    """Build ``results/<dir>/probabilistic.csv`` from the per-run probabilistic table.
+
+    ``probabilistic_by_seed.csv`` is the source of truth; this is the only place the
+    aggregated artifact is built, so its schema is defined once.
+
+    ``picp_ci_lo``/``picp_ci_hi`` are the **envelope** of the per-run realization bootstrap
+    intervals, min of the lows and max of the highs, for exactly the reason P3-D22 records
+    for ``skill_ci``: the mean of several finished intervals is not an interval for
+    anything, and it is invariant to seed disagreement, which is the one thing a reader
+    would consult it to detect.
+
+    Args:
+        by_seed: Per-run rows carrying :data:`PROBABILISTIC_GROUP_COLS`, ``horizon_s``,
+            ``seed``, ``deterministic``, ``n_windows``, ``n_quantiles``, ``alpha``,
+            ``signal_std``, ``picp_ci_lo``, ``picp_ci_hi``, ``n_params``, ``val_loss_name``,
+            ``fit_time_s`` and every column in :data:`PROBABILISTIC_METRIC_COLS` except
+            ``width_ratio``, which is derived here.
+
+    Returns:
+        One row per (model, head, regime, DOF, horizon), columns
+        :data:`PROBABILISTIC_COLUMNS`, sorted by ``regime, model, head, dof,
+        horizon_samples``.
+
+    Raises:
+        ValueError: If a required column is missing, or if ``signal_std``, ``n_windows``,
+            ``n_quantiles`` or ``alpha`` varies between the runs of one cell -- which would
+            mean the runs of a single cell were not scored over one window set at one
+            nominal level, and no aggregate of them would mean anything.
+    """
+    derived = {"width_ratio"}
+    required = {
+        *PROBABILISTIC_GROUP_COLS,
+        "horizon_s",
+        "seed",
+        "deterministic",
+        "n_windows",
+        "n_quantiles",
+        "alpha",
+        "signal_std",
+        "picp_ci_lo",
+        "picp_ci_hi",
+        "n_params",
+        "val_loss_name",
+        "fit_time_s",
+        *(set(PROBABILISTIC_METRIC_COLS) - derived),
+    }
+    missing = sorted(required - set(by_seed.columns))
+    if missing:
+        raise ValueError(f"by_seed is missing columns {missing}")
+
+    frame = by_seed.copy()
+    frame["width_ratio"] = width_ratio(
+        frame["mean_interval_width"], frame["signal_std"], frame["alpha"]
+    )
+    keys = list(PROBABILISTIC_GROUP_COLS)
+    for name in ("signal_std", "n_windows", "n_quantiles", "alpha"):
+        spread = frame.groupby(keys, sort=False)[name].nunique(dropna=False)
+        varying = spread[spread > 1]
+        if not varying.empty:
+            raise ValueError(
+                f"{name!r} varies between the runs of {len(varying)} cell(s), e.g. "
+                f"{varying.index[0]}. Every model in a regime is scored in one pass over "
+                f"one window set at one nominal level, so this can only mean the runs were "
+                f"not comparable."
+            )
+
+    aggregated = aggregate_results(
+        frame, PROBABILISTIC_GROUP_COLS, metric_cols=PROBABILISTIC_METRIC_COLS
+    )
+    carried = frame.groupby(keys, as_index=False, sort=False).agg(
+        horizon_s=("horizon_s", "first"),
+        deterministic=("deterministic", "first"),
+        n_windows=("n_windows", "first"),
+        n_quantiles=("n_quantiles", "first"),
+        alpha=("alpha", "first"),
+        signal_std=("signal_std", "first"),
+        # Envelope, never the mean -- see the docstring and P3-D22.
+        picp_ci_lo=("picp_ci_lo", "min"),
+        picp_ci_hi=("picp_ci_hi", "max"),
+        n_params=("n_params", "first"),
+        val_loss_name=("val_loss_name", "first"),
+        fit_time_s_mean=("fit_time_s", "mean"),
+    )
+    aggregated = aggregated.drop(
+        columns=[c for c in carried.columns if c not in keys and c in aggregated.columns]
+    )
+    merged = aggregated.merge(carried, on=keys, validate="one_to_one")
+    ordered = merged.sort_values(
+        ["regime", "model", "head", "dof", "horizon_samples"], kind="stable"
+    ).reset_index(drop=True)
+    return ordered[list(PROBABILISTIC_COLUMNS)]

@@ -14,10 +14,13 @@ across the Phase 4 line-up is a caveat to report beside the results table, not s
 engineer away by quietly substituting a pooled or last-token head.
 """
 
+from typing import ClassVar
+
 import torch
 from torch import Tensor, nn
 
 from dmf.models.base import BaseForecaster
+from dmf.models.heads import HeadKind, clamp_log_variance
 from dmf.train.registry import register_model
 
 __all__ = ["PatchEmbedding", "TransformerForecaster"]
@@ -80,6 +83,8 @@ class TransformerForecaster(BaseForecaster):
     """
 
     FIT_KIND = "sgd"
+    #: All three heads: the projection widens by K and the reshape branch handles each.
+    SUPPORTED_HEADS: ClassVar[tuple[HeadKind, ...]] = ("point", "quantile", "gaussian")
 
     def __init__(
         self,
@@ -94,6 +99,7 @@ class TransformerForecaster(BaseForecaster):
         d_ff: int = 256,
         dropout: float = 0.1,
         n_quantiles: int = 0,
+        head: HeadKind | None = None,
     ) -> None:
         """Configure the model.
 
@@ -110,12 +116,18 @@ class TransformerForecaster(BaseForecaster):
             d_ff: Feed-forward hidden width.
             dropout: Dropout probability, in [0, 1).
             n_quantiles: Quantile count ``Q``, or 0 for a point head.
+            head: Output head kind -- ``"point"``, ``"quantile"`` or ``"gaussian"``.
+                Defaults to ``"quantile"`` when ``n_quantiles > 0`` and ``"point"``
+                otherwise, so a point build is unchanged and a Gaussian head is asked for
+                by name (``docs/protocol.md`` P5-D1).
 
         Raises:
             ValueError: If ``lookback`` is not a multiple of ``patch_len``, or ``d_model``
                 is not divisible by ``n_heads``.
         """
-        super().__init__(lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles)
+        super().__init__(
+            lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles, head
+        )
         if patch_len < 1:
             raise ValueError(f"patch_len must be positive, got {patch_len}")
         if lookback % patch_len != 0:
@@ -140,7 +152,7 @@ class TransformerForecaster(BaseForecaster):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self._head_width = max_horizon * n_target_channels * max(n_quantiles, 1)
+        self._head_width = max_horizon * n_target_channels * self.n_output_params
         self.head = nn.Linear(self.n_tokens * d_model, self._head_width)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -150,12 +162,17 @@ class TransformerForecaster(BaseForecaster):
             x: Input windows, shape ``(B, L, C_in)``, dimensionless.
 
         Returns:
-            Forecasts, shape ``(B, H, C_out)`` or ``(B, H, C_out, Q)``, dimensionless.
+            Forecasts, shape ``(B, H, C_out)`` for a point head, ``(B, H, C_out, Q)`` for
+            a quantile head, or ``(B, H, C_out, 2)`` carrying ``(mean, log_var)`` for a
+            Gaussian one. Dimensionless.
         """
         tokens: Tensor = self.embed_dropout(self.patch_embed(x) + self.pos_embed)
         encoded: Tensor = self.encoder(tokens)
         out: Tensor = self.head(encoded.reshape(x.shape[0], self.n_tokens * self.d_model))
-        # out: (B, H * C_out * max(Q, 1)) -> (B, H, C_out[, Q])
-        if self.n_quantiles > 0:
-            return out.view(x.shape[0], self.max_horizon, self.n_target_channels, self.n_quantiles)
-        return out.view(x.shape[0], self.max_horizon, self.n_target_channels)
+        # out: (B, H * C_out * K) -> (B, H, C_out[, K])
+        if self.head_kind == "point":
+            return out.view(x.shape[0], self.max_horizon, self.n_target_channels)
+        fanned = out.view(
+            x.shape[0], self.max_horizon, self.n_target_channels, self.n_output_params
+        )
+        return clamp_log_variance(fanned) if self.head_kind == "gaussian" else fanned

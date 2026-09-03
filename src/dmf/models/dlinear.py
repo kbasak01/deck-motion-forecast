@@ -23,11 +23,14 @@ its own row, so the difference between the two is the shortfall of 60 epochs of 
 not part of any architecture comparison.
 """
 
+from typing import ClassVar
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F  # noqa: N812
 
 from dmf.models.base import BaseForecaster
+from dmf.models.heads import HeadKind, clamp_log_variance
 from dmf.train.registry import register_model
 
 __all__ = ["DLinear", "moving_average", "series_decompose"]
@@ -95,6 +98,8 @@ class DLinear(BaseForecaster):
     """
 
     FIT_KIND = "sgd"
+    #: All three heads: the projection widens by K and the reshape branch handles each.
+    SUPPORTED_HEADS: ClassVar[tuple[HeadKind, ...]] = ("point", "quantile", "gaussian")
 
     def __init__(
         self,
@@ -105,6 +110,7 @@ class DLinear(BaseForecaster):
         kernel_size: int = 25,
         individual: bool = False,
         n_quantiles: int = 0,
+        head: HeadKind | None = None,
     ) -> None:
         """Configure the model.
 
@@ -117,16 +123,22 @@ class DLinear(BaseForecaster):
             individual: If True, learn a separate linear map per channel instead of
                 sharing one across channels.
             n_quantiles: Quantile count ``Q``, or 0 for a point head.
+            head: Output head kind -- ``"point"``, ``"quantile"`` or ``"gaussian"``.
+                Defaults to ``"quantile"`` when ``n_quantiles > 0`` and ``"point"``
+                otherwise, so a point build is unchanged and a Gaussian head is asked for
+                by name (``docs/protocol.md`` P5-D1).
 
         Raises:
             ValueError: If ``kernel_size`` is not in ``[1, lookback]``.
         """
-        super().__init__(lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles)
+        super().__init__(
+            lookback, max_horizon, n_input_channels, n_target_channels, n_quantiles, head
+        )
         if not 1 <= kernel_size <= lookback:
             raise ValueError(f"kernel_size must be in [1, lookback={lookback}], got {kernel_size}")
         self.kernel_size = kernel_size
         self.individual = individual
-        self._per_channel_out = max_horizon * max(n_quantiles, 1)
+        self._per_channel_out = max_horizon * self.n_output_params
         n_maps = n_target_channels if individual else 1
         self.trend = nn.ModuleList(
             nn.Linear(lookback, self._per_channel_out) for _ in range(n_maps)
@@ -142,7 +154,9 @@ class DLinear(BaseForecaster):
             x: Input windows, shape ``(B, L, C_in)``, dimensionless.
 
         Returns:
-            Forecasts, shape ``(B, H, C_out)`` or ``(B, H, C_out, Q)``, dimensionless.
+            Forecasts, shape ``(B, H, C_out)`` for a point head, ``(B, H, C_out, Q)`` for
+            a quantile head, or ``(B, H, C_out, 2)`` carrying ``(mean, log_var)`` for a
+            Gaussian one. Dimensionless.
         """
         targets = x[:, :, : self.n_target_channels]
         trend, remainder = series_decompose(targets, self.kernel_size)
@@ -156,10 +170,10 @@ class DLinear(BaseForecaster):
             out = torch.stack(parts, dim=1)
         else:
             out = self.trend[0](trend) + self.remainder[0](remainder)
-        # out: (B, C_out, H * max(Q, 1)) -> (B, H, C_out[, Q])
-        if self.n_quantiles > 0:
-            fanned = out.view(
-                x.shape[0], self.n_target_channels, self.max_horizon, self.n_quantiles
-            )
-            return fanned.permute(0, 2, 1, 3)
-        return out.transpose(1, 2)
+        # out: (B, C_out, H * K) -> (B, H, C_out[, K])
+        if self.head_kind == "point":
+            return out.transpose(1, 2)
+        fanned = out.view(
+            x.shape[0], self.n_target_channels, self.max_horizon, self.n_output_params
+        ).permute(0, 2, 1, 3)
+        return clamp_log_variance(fanned) if self.head_kind == "gaussian" else fanned

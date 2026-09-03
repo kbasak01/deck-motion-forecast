@@ -1,0 +1,26 @@
+# TCN with a nine-level quantile head.
+#
+# Identical backbone to `configs/model/tcn.yaml`: same six residual blocks, same kernel 3
+# and dilations [1, 2, 4, 8, 16, 32], so the receptive field is still
+# 1 + 2*(3-1)*63 = 253 samples = 25.3 s against the 200-sample lookback, and the constructor
+# still raises if that inequality ever fails. Only the final Linear(64 -> .) widens, from
+# H*C_out to H*C_out*Q.
+#
+# The nine levels are `dmf.models.heads.QUANTILE_FAN_9`; see `dlinear_quantile.yaml` for why
+# 0.05, 0.5 and 0.95 are members of it exactly.
+#
+# 664 804 parameters at the P3 geometry (L=200, H=150, C_in=C_out=6) against the point row's
+# 196 804: the 138 304 in the residual blocks are unchanged and the head goes from 58 500 to
+# 526 500. Not parameter-matched to its point twin (P5-D5).
+#
+# `tcn` is in Phase 5 because it is the only deep model that wins outside `unseen_heading`
+# (60-42 against `dlinear_ols`, P4-D14) and the one not carrying the P4-D9 schedule handicap.
+name: tcn
+label: tcn_quantile
+head: quantile
+quantiles: [0.05, 0.1625, 0.275, 0.3875, 0.5, 0.6125, 0.725, 0.8375, 0.95]
+params:
+  n_filters: 64
+  kernel_size: 3
+  dilations: [1, 2, 4, 8, 16, 32]
+  dropout: 0.1

@@ -32,7 +32,7 @@ from dmf.config import TrainConfig
 from dmf.data.dataset import DeckMotionDataset
 from dmf.data.normalize import NormStats, normalize_target
 from dmf.models.base import BaseForecaster
-from dmf.train.losses import mse_loss
+from dmf.train.losses import LossFn, mse_loss
 
 __all__ = ["EarlyStopper", "TrainResult", "fit", "set_seed", "train_one_epoch", "validate"]
 
@@ -51,7 +51,10 @@ class TrainResult:
     Attributes:
         seed: The training seed. Recorded so that a results row can always be traced back
             to the run that produced it.
-        best_val_loss: Lowest validation loss reached, dimensionless.
+        best_val_loss: Lowest validation loss reached, dimensionless, **in the objective
+            the model was trained on** -- MSE, pinball or Gaussian NLL. Comparable across
+            epochs and seeds of one model and not across heads (``docs/protocol.md``
+            P5-D4); the experiment driver ships a ``val_loss_name`` column beside it.
         best_epoch: Epoch at which ``best_val_loss`` occurred, zero-indexed.
         epochs_run: Total epochs completed before early stopping or exhaustion.
         train_losses: Per-epoch training loss, dimensionless.
@@ -226,6 +229,7 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     *,
+    loss_fn: LossFn = mse_loss,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
 ) -> float:
@@ -237,6 +241,11 @@ def train_one_epoch(
         cfg: Optimisation settings.
         epoch: Zero-indexed epoch number, used to position the cosine schedule.
         total_epochs: Total planned epochs, used to position the cosine schedule.
+        loss_fn: The training objective, ``(pred, target) -> scalar``, from
+            :func:`dmf.train.losses.resolve_loss`. Keyword-only and defaulted to MSE,
+            following the ``optimizer`` precedent below, so every pre-Phase-5 call site is
+            unchanged. A model is trained on the objective its head defines (P5-D4); the
+            loop does not branch on the head.
         optimizer: The optimiser to step. Keyword-only and defaulted so the documented
             positional signature still calls, but :func:`fit` always supplies one:
             constructing a fresh AdamW here would reset the moment estimates every epoch,
@@ -269,7 +278,7 @@ def train_one_epoch(
         target = _normalised_target(y, window_mean, stats)
         opt.zero_grad(set_to_none=True)
         with _autocast(device, cfg):
-            loss = mse_loss(model(x).float(), target.float())
+            loss = loss_fn(model(x).float(), target.float())
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
             scaler.unscale_(opt)
@@ -289,6 +298,8 @@ def validate(
     model: BaseForecaster,
     loader: DataLoader[tuple[Tensor, Tensor, Tensor]],
     cfg: TrainConfig,
+    *,
+    loss_fn: LossFn = mse_loss,
 ) -> float:
     """Evaluate the model on the validation partition.
 
@@ -301,9 +312,16 @@ def validate(
         model: The model to evaluate.
         loader: Validation minibatches of ``(x, y, window_mean)``.
         cfg: Optimisation settings, for the autocast dtype.
+        loss_fn: The objective to report, ``(pred, target) -> scalar``. Defaults to MSE.
+            It must be the **same** objective the model is trained on: early stopping
+            compares this number across epochs, and stopping a quantile model on the MSE of
+            a forecast it is not fitting would select the epoch that is best for a
+            statistic the model does not optimise (P5-D4).
 
     Returns:
-        Mean validation loss, dimensionless.
+        Mean validation loss, dimensionless. Comparable across epochs and across seeds of
+        one model, and **not** across heads: a pinball loss and an MSE are different
+        quantities.
     """
     device = next(model.parameters()).device
     stats = _target_scale(loader)
@@ -317,7 +335,7 @@ def validate(
             window_mean = window_mean.to(device, non_blocking=True)
             target = _normalised_target(y, window_mean, stats)
             with _autocast(device, cfg):
-                loss = mse_loss(model(x).float(), target.float())
+                loss = loss_fn(model(x).float(), target.float())
             n = int(y.shape[0])
             total += float(loss.detach()) * n
             count += n
@@ -331,13 +349,25 @@ def fit(
     cfg: TrainConfig,
     seed: int,
     checkpoint_dir: Path,
+    *,
+    loss_fn: LossFn = mse_loss,
+    label: str = "",
 ) -> TrainResult:
     """Train one model at one seed to convergence or early stop.
 
-    The early-stopping criterion -- validation MSE in normalised space, patience from
-    ``cfg`` -- is deliberately identical for every model in the project. Gate 4 compares
-    architectures, and a comparison in which one model was stopped on a different rule is
-    not a comparison of architectures.
+    **Each model is stopped on its own training objective** -- validation MSE for a point
+    head, pinball loss for a quantile head, Gaussian NLL for a Gaussian one, all in
+    normalised space with patience from ``cfg``. Until Phase 5 this was "validation MSE,
+    identical for every model in the project"; that invariant cannot survive a quantile
+    head, which has no MSE to stop on, and stopping one on the MSE of a derived point
+    forecast would select the epoch that is best for a statistic the model is not fitting.
+    ``docs/protocol.md`` P5-D4 records the amendment and its consequence:
+    :attr:`TrainResult.best_val_loss` is **not comparable across heads**.
+
+    What remains identical for every model in an experiment, which is the fairness property
+    Gate 4 needed: the epoch cap, the patience, the schedule policy, the batch size, the
+    learning rate, the data pipeline and the split. ``TrainConfig`` has no per-model
+    override.
 
     Args:
         model: The model to train.
@@ -347,6 +377,13 @@ def fit(
         seed: Training seed, passed to :func:`set_seed` and recorded in the result.
         checkpoint_dir: Directory for best-epoch weights. Lives under ``artifacts/`` and
             is gitignored.
+        loss_fn: The training and early-stopping objective, from
+            :func:`dmf.train.losses.resolve_loss`. Defaults to MSE, so a point model's call
+            site is unchanged.
+        label: Results-table label, used for the checkpoint filename. Defaults to the class
+            name, which is what the filename used to be built from unconditionally -- and
+            which in ``e03`` is a three-way collision between the point, quantile and
+            Gaussian variants of one class, all three writing ``dlinear_seed0.pt``.
 
     Returns:
         The run's outcome, including the loss curves and checkpoint path.
@@ -359,7 +396,8 @@ def fit(
     )
     stopper = EarlyStopper(cfg.patience)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"{type(model).__name__.lower()}_seed{seed}.pt"
+    stem = label or type(model).__name__.lower()
+    checkpoint_path = checkpoint_dir / f"{stem}_seed{seed}.pt"
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -368,10 +406,17 @@ def fit(
     for epoch in range(cfg.epochs):
         train_losses.append(
             train_one_epoch(
-                model, train_loader, cfg, epoch, cfg.epochs, optimizer=optimizer, scaler=scaler
+                model,
+                train_loader,
+                cfg,
+                epoch,
+                cfg.epochs,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                scaler=scaler,
             )
         )
-        val_loss = validate(model, val_loader, cfg)
+        val_loss = validate(model, val_loader, cfg, loss_fn=loss_fn)
         val_losses.append(val_loss)
         improved = val_loss < stopper.best_loss
         should_stop = stopper.update(val_loss)
