@@ -27,7 +27,7 @@ Read here:
 - `e03/probabilistic.csv` (864 rows) -- the Phase 5 heads as committed, read for the section 6.4 comparison
 - `e04/reference_reproducibility.csv` (36 rows) -- the RevIN arm's closed-form rows against results/e02/ (P6-D13)
 - `e04/metrics_by_cell.csv` (185760 rows) -- section 6.1 broken out by (vessel, sea state, heading, speed); **not rendered here**, and no number below is read from it
-- `e04/quiescence_lead_times.csv` (2075284 rows) -- raw per-match lead times, so the distribution is not only its quantiles; **not rendered here**, and no number below is read from it
+- `e04/quiescence_lead_times.csv.gz` (2075284 rows) -- raw per-match lead times, so the distribution is not only its quantiles; **not rendered here**, and no number below is read from it
 
 ## 6.1 Point accuracy
 
@@ -21199,7 +21199,7 @@ Source: `e04/quiescence.csv` | csv_rows: 17290 | rendered_rows: 8778 | table_id:
 | deep | window_mean | unseen_vessel | strict | point | sea_state | SS6 | n/a | n/a | 1 | yes | 0.0512 | 0.0000 | n/a | n/a | n/a | 0.0000 | 55680.0000 |
 | probabilistic | window_mean | unseen_vessel | strict | point | sea_state | SS6 | n/a | n/a | 1 | yes | 0.0512 | 0.0000 | n/a | n/a | n/a | 0.0000 | 55680.0000 |
 
-The distribution is not only its three quantiles: the raw per-match lead times are in `e04/quiescence_lead_times.csv` (2075284 rows), which this document summarises rather than reproduces.
+The distribution is not only its three quantiles: the raw per-match lead times are in `e04/quiescence_lead_times.csv.gz` (2075284 rows), which this document summarises rather than reproduces.
 
 ## 6.3 Ablations
 

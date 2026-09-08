@@ -91,7 +91,12 @@ SCORING_ARTIFACTS: dict[str, str] = {
     "metrics_full": "metrics_full.csv",
     "metrics_by_cell": "metrics_by_cell.csv",
     "quiescence": "quiescence.csv",
-    "quiescence_lead_times": "quiescence_lead_times.csv",
+    # Gzipped, alone among the scoring artifacts. The raw per-match dump is ~181 MB of
+    # 2M rows and compresses 11x; GitHub hard-rejects a blob over 100 MB, so an
+    # uncompressed file could not be committed, and a cited source that is absent from a
+    # fresh clone breaks Gate 6 predicate 3 (docs/protocol.md P6-D22). pandas infers the
+    # codec from the extension on both read and write, so nothing else changes.
+    "quiescence_lead_times": "quiescence_lead_times.csv.gz",
     "probabilistic": "probabilistic_by_seed.csv",
 }
 

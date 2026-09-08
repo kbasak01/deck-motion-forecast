@@ -1429,7 +1429,7 @@ REPORT_SOURCES: tuple[ReportSource, ...] = (
     ),
     ReportSource(
         key="quiescence_lead_times",
-        candidates=("quiescence_lead_times.csv",),
+        candidates=("quiescence_lead_times.csv.gz", "quiescence_lead_times.csv"),
         what="raw per-match lead times, so the distribution is not only its quantiles",
         required=False,
         rendered=False,

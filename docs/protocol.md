@@ -3961,3 +3961,39 @@ enumerates every fitted model of every committed arm against the assembled contr
 unless each one either reaches a row or carries a stated reason. **That test was written for this
 defect and it is the thing that stops the next one**; when it was first added it failed against the
 committed `ablations.csv`, which is what confirmed the fix had not yet reached the artifact.
+
+### P6-D25 — `quiescence_lead_times` is stored gzipped, and what that costs predicate 1's evidence. RECORDED 2026-09-08
+
+`results/e04/quiescence_lead_times.csv` is 181.3 MB — 2 075 284 rows of raw per-match lead times.
+**GitHub hard-rejects any blob over 100 MB**, so the file as written could not be committed, and a
+source cited by `results.md` that is absent from a fresh clone breaks Gate 6 predicate 3 on exactly
+the standard P6-D22 set ("a derivation cited in a docstring and unauditable on any other checkout is
+not a derivation").
+
+It is therefore written as **`quiescence_lead_times.csv.gz`, 16.1 MB — an 11x reduction**, the file
+being 2M rows of repeated float patterns. pandas infers the codec from the extension on both read and
+write, so the change is one filename in `dmf.eval.scoring.SCORING_ARTIFACTS` and one candidate tuple
+in `dmf.eval.report`; the reader still accepts the uncompressed name, so an older results directory
+is not orphaned. It is the only gzipped artifact in the project: `metrics_by_cell.csv` at 50.7 MB is
+the next largest and sits under the limit.
+
+**The branch history was rewritten** to remove the uncompressed blob from all four commits, because
+the object is pushed with the branch regardless of a later deletion. `backup-pre-rewrite` holds the
+pre-rewrite tip.
+
+**What this costs, stated because it is a real weakening.** The end-to-end `make eval` that gave
+predicate 1 its evidence (8 h 45 m, exit 0, `artifacts/logs/e04/gate6_full_endtoend.log`) ran
+**before** this change, and the document was regenerated afterwards with `--render-only` rather than
+by re-running the 8-hour pass. So:
+
+- **Predicates 2-7 are freshly verified** on the current document — in particular the byte-for-byte
+  re-render, which is the one that makes traceability structural.
+- **Predicate 1's evidence describes the pre-gzip run.** The scoring stage is deterministic given the
+  checkpoints, and the end-to-end run demonstrated that directly (every accuracy number bitwise
+  identical, only `fit_time_s` moving by <= 0.04 s), so the claim that a fresh `make eval` would
+  again exit 0 is well supported — **but it is inference from a prior run, not an artifact of the
+  current one.**
+
+That trade was made deliberately rather than spending another 8 h 45 m to restore a strictly fresh
+predicate 1, and it is recorded here rather than left for a reader to reconstruct from timestamps —
+which is precisely how the *previous* predicate-1 defect was found (third adversarial audit).
