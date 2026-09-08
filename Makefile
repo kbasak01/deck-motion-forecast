@@ -3,6 +3,11 @@
 # on a clean shell -- `make eval` exited 127 for that reason, which would have failed Gate 6
 # predicate 1 for an environment cause unrelated to the phase. Overridable: `make PY=python`.
 PY ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
+# Same reasoning for the tooling: `make lint` exited 127 on a clean shell because `ruff` and
+# `mypy` are only on PATH with the venv activated. Overridable: `make RUFF=ruff MYPY=mypy`.
+RUFF ?= $(shell [ -x .venv/bin/ruff ] && echo .venv/bin/ruff || echo ruff)
+MYPY ?= $(shell [ -x .venv/bin/mypy ] && echo .venv/bin/mypy || echo mypy)
+PYTEST ?= $(shell [ -x .venv/bin/pytest ] && echo .venv/bin/pytest || echo pytest)
 
 CFG ?= configs/experiment/e01_baselines.yaml
 SIMCFG ?= configs/sim/corpus.yaml
@@ -36,8 +41,8 @@ gate6-full: eval
 	python scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DIR) --eval-exit-code 0
 
 bench:  ; $(PY) scripts/benchmark.py --export --parity --latency
-test:   ; pytest
-lint:   ; ruff check src tests && ruff format --check src tests && mypy src
-format: ; ruff format src tests && ruff check --fix src tests
+test:   ; $(PYTEST)
+lint:   ; $(RUFF) check src tests && $(RUFF) format --check src tests && $(MYPY) src
+format: ; $(RUFF) format src tests && $(RUFF) check --fix src tests
 
 all: data train eval bench
