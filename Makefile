@@ -38,7 +38,7 @@ gate6:  ; $(PY) scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DI
 # and --eval-exit-code 0 records that rather than assuming it. `make gate6` alone reports
 # predicate 1 as UNVERIFIED, which is not a pass.
 gate6-full: eval
-	python scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DIR) --eval-exit-code 0
+	$(PY) scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DIR) --eval-exit-code 0
 
 bench:  ; $(PY) scripts/benchmark.py --export --parity --latency
 test:   ; $(PYTEST)

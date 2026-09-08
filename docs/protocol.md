@@ -2556,6 +2556,17 @@ ran and before any Phase 6 table existed, following the P4-D1 / P5-D2 pattern, s
 evaluation choices are on record as decisions rather than as rationalisations of a result. Entries
 recording what the tables then showed are numbered from P6-D8 and are dated separately.
 
+**The ordering of these entries is self-reported and is not checkable from the git history.** All of
+P6-D1 .. P6-D24 landed in one commit, so nothing in the repository separates an entry written before
+the run it governs from one written after — and P6-D8/P6-D9 carry the same date as the pre-registered
+block without belonging to it. This matters most for P6-D21, whose legitimacy as a *calibration*
+rather than a relaxed threshold rests entirely on P6-D16 having been written first. Splitting the
+commit retroactively was rejected: it would manufacture the appearance of a timeline rather than
+evidence one, which is a stronger claim than this disclosure. **A reader should treat the
+pre-registration claims here as asserted, not proven**, and future phases should commit a
+pre-registration entry before the run it governs, which costs one commit and converts the assertion
+into evidence.
+
 Phase 6 writes `results/e04/` and `results/results.md`. `results/`, `results/imu/`, `results/e02/`
 and `results/e03/` are the Gate 3, Gate 3-imu, Gate 4 and Gate 5 records and are **read, never
 regenerated** (`docs/IMPLEMENTATION_PLAN.md` §Phase 6 carry-forward item 7).
@@ -3917,8 +3928,16 @@ lead:
 | **15 s** | **+0.0214** | **-0.1975** |
 | mean, 36 cells | **+0.0076** | **-0.0616** |
 
-Worst cell: `pitch` at 15 s, **-0.6637, CI [-1.1797, -0.3258]** — excludes zero. Second worst
--0.4798 [-0.7272, -0.2821].
+Worst cell: `pitch` at 15 s, **-0.4883 +/- 0.1713 over three seeds, CI [-1.1797, -0.1725]** —
+excludes zero. Next: `pitch_rate` at 10 s, -0.5098 at its worst seed.
+
+> **Corrected 2026-09-08.** This entry first read "worst cell -0.6637 ... second worst -0.4798".
+> Those are **seed 0 and seed 2 of the same cell**, presented as two cells, and -0.6637 is a
+> single-seed extreme quoted without its spread — which CLAUDE.md non-negotiable 5 forbids and
+> which `results.md` never rendered. The true second-most-negative row is `pitch_rate` at 10 s
+> (-0.5098). Every aggregate in this entry reproduced exactly; only the two illustrative extremes
+> were wrong. Sixth correction of the phase, and the third of the same family: a subset (here, one
+> seed) published as the whole.
 
 **The finding.** Doubling the lookback is worth about +0.02 skill in-distribution at 10-15 s and
 costs 0.15-0.20 out of distribution at the same leads, with nothing happening either way below 5 s.
