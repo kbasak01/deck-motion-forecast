@@ -62,6 +62,8 @@ def build_model(
     window_spec: WindowSpec,
     n_input_channels: int,
     n_target_channels: int,
+    *,
+    revin: bool = False,
 ) -> "BaseForecaster":
     """Instantiate the model named by a config.
 
@@ -72,6 +74,16 @@ def build_model(
             samples.
         n_input_channels: Input channel count ``C_in``.
         n_target_channels: Target channel count ``C_out``.
+        revin: Whether to attach reversible instance normalisation, from
+            ``DataConfig.revin``. It is a property of the *task* rather than of the model,
+            which is why it arrives here as an argument and not through ``cfg.params``: one
+            data config sets it for every model in the experiment, which is the same
+            fairness property ``TrainConfig`` has by having no per-model override.
+
+            Applied to SGD-fitted models only (:func:`dmf.models.base.revin_applies`). On a
+            ``revin: true`` arm the closed-form and trivial rows are therefore **the
+            reference arm's rows**, and a table that lists them under the RevIN arm has to
+            say so.
 
     Returns:
         The constructed model, on CPU and untrained.
@@ -90,6 +102,7 @@ def build_model(
     # Deferred for the same reason as the line above: every model module imports this one
     # to register itself, so a module-level import of anything under `dmf.models` here
     # would close the cycle.
+    from dmf.models.base import revin_applies
     from dmf.models.heads import quantile_fan
 
     if cfg.name not in MODEL_REGISTRY:
@@ -128,10 +141,13 @@ def build_model(
             f"model {cfg.name!r} ({cls.__qualname__}) does not accept {unknown}; "
             f"accepted keyword arguments are {sorted(accepted)}"
         )
-    return cls(
+    model = cls(
         lookback=window_spec.lookback,
         max_horizon=window_spec.max_horizon,
         n_input_channels=n_input_channels,
         n_target_channels=n_target_channels,
         **kwargs,  # type: ignore[arg-type]
     )
+    if revin and revin_applies(cls):
+        model.enable_revin()
+    return model

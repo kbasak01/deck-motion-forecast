@@ -155,7 +155,7 @@ class TransformerForecaster(BaseForecaster):
         self._head_width = max_horizon * n_target_channels * self.n_output_params
         self.head = nn.Linear(self.n_tokens * d_model, self._head_width)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Embed, attend over patches, and project to the horizon.
 
         Args:

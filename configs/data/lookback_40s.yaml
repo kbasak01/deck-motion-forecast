@@ -1,0 +1,23 @@
+# Phase 6.3 ablation arm: lookback -- 40 s
+#
+# Differs from `configs/data/default.yaml` in `lookback` (200 -> 400) and nothing else, so the contrast
+# isolates one variable. Read `docs/protocol.md` P6-D4 for what is and is not matched across
+# arms before comparing any two of these tables.
+#
+# At L=400 this arm has 1091 windows per realization, origins 399..5849 -- the intersection
+# every lookback arm is scored on (P6-D4 item 1). It is the binding arm: the other two are
+# truncated to match it.
+#
+# `tcn` needs `configs/model/tcn_l400.yaml` here, not `configs/model/tcn.yaml`: the receptive
+# field must be >= lookback (`CLAUDE.md` Known traps) and the L=200 dilation ladder reaches
+# only 253. That changes the parameter count, so this arm is NOT parameter-matched to the
+# reference and does not claim to be (P6-D4 item 2).
+fs_hz: 10.0
+lookback: 400
+horizons: [10, 20, 30, 50, 100, 150]
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: ideal
+revin: false
+condition_on_sea_state: false

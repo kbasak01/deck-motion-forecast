@@ -147,7 +147,7 @@ class DLinear(BaseForecaster):
             nn.Linear(lookback, self._per_channel_out) for _ in range(n_maps)
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Forecast by summing the trend and remainder projections.
 
         Args:

@@ -68,7 +68,7 @@ class Persistence(BaseForecaster):
 
     FIT_KIND = "none"
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Broadcast the final lookback sample across the horizon.
 
         The expression is **bitwise identical** to the inline forecast in
@@ -321,7 +321,7 @@ class DampedPersistence(BaseForecaster):
         """One decay constant per target channel."""
         return self.n_target_channels if self._fitted else 0
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Forecast an exponential decay toward the per-window mean.
 
         Args:

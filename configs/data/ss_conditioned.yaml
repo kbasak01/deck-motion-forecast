@@ -1,0 +1,33 @@
+# Phase 6.3 ablation arm: sea-state conditioning -- one-hot SS as an input feature
+#
+# Differs from `configs/data/default.yaml` in `condition_on_sea_state` and nothing else, so the contrast
+# isolates one variable. Read `docs/protocol.md` P6-D4 for what is and is not matched across
+# arms before comparing any two of these tables.
+#
+# THIS ARM IS AN UPPER BOUND, NOT A DEPLOYABLE RESULT. At deployment sea state is estimated
+# online from the same motion record the forecaster consumes; a ground-truth one-hot is
+# information the deployed system does not have. `docs/IMPLEMENTATION_PLAN.md` 6.3 requires
+# this to be said, and P6-D4 item 5 requires it said in the table, not only in prose.
+#
+# Three defects found before this arm was ever fitted (docs/protocol.md P6-D8):
+#   1. `dlinear_ols` is structurally blind to the indicator -- DLinear slices
+#      `x[:, :, :C_out]` -- so for it this arm is a no-op and its contrast is exactly zero
+#      as an architectural artefact. `tcn` is the vehicle here.
+#   2. `ar20` is NOT FITTABLE on this arm in `unseen_seastate`: the SS6 indicator is constant
+#      zero in that regime's training split, so the normal equations are singular and
+#      `_solve_centred_whitened` refuses them. That is the finding -- a one-hot cannot
+#      transfer to a level that was never hot in training -- and the row ships as
+#      `not fittable` with that reason.
+#   3. `revin: true` here would silently zero the indicator; `load_data` refuses the pair.
+#
+# The indicator is appended AFTER every motion channel, never interleaved, so `target_dofs`
+# stays a prefix of the motion inputs and the P2-D4 persistence guard still holds.
+fs_hz: 10.0
+lookback: 200
+horizons: [10, 20, 30, 50, 100, 150]
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: ideal
+revin: false
+condition_on_sea_state: true

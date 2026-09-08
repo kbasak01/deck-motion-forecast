@@ -63,12 +63,14 @@ from dmf.models.base import BaseForecaster
 from dmf.models.dlinear_ols import DLinearOLS
 from dmf.models.heads import point_view
 from dmf.models.persistence import TAU_WINDOW_MEAN, DampedPersistence
+from dmf.models.residual_interval import EmpiricalResidualInterval
 from dmf.train.closed_form import (
     TrainingMoments,
     accumulate_training_moments,
     fit_ar,
     fit_damped_persistence,
     fit_dlinear_ols,
+    fit_residual_interval,
 )
 from dmf.train.loop import fit, set_seed
 from dmf.train.losses import resolve_loss
@@ -85,6 +87,8 @@ __all__ = [
     "PERSISTENCE_LABEL",
     "RunRecord",
     "VAL_LOSS_NAMES",
+    "load_or_fit",
+    "resolve_checkpoint",
     "run_experiment",
 ]
 
@@ -259,7 +263,13 @@ class RunRecord:
 
 
 def _instantiate(
-    cfg: ModelConfig, spec: WindowSpec, n_in: int, n_out: int, seed: int
+    cfg: ModelConfig,
+    spec: WindowSpec,
+    n_in: int,
+    n_out: int,
+    seed: int,
+    *,
+    revin: bool = False,
 ) -> BaseForecaster:
     """Build one model, seeding first so that a random initialisation is reproducible.
 
@@ -270,12 +280,16 @@ def _instantiate(
         n_out: Target channel count ``C_out``.
         seed: Seed applied before construction, so that weight initialisation is part of
             what the seed controls.
+        revin: ``DataConfig.revin`` -- whether this arm normalises each window reversibly
+            inside the model. It comes from the experiment's *data* config, so every model
+            in an arm gets the same answer, and it reaches SGD rows only
+            (:func:`dmf.models.base.revin_applies`).
 
     Returns:
         The constructed model, on CPU.
     """
     set_seed(seed)
-    return build_model(cfg, spec, n_in, n_out)
+    return build_model(cfg, spec, n_in, n_out, revin=revin)
 
 
 def _fit_one(
@@ -314,7 +328,11 @@ def _fit_one(
     kind = MODEL_REGISTRY[cfg.name].FIT_KIND
 
     if kind == "none":
-        model = _instantiate(cfg, spec, n_in, n_out, experiment.seeds[0])
+        # `revin` is passed on every branch, not only the SGD one, so that the policy lives
+        # in `dmf.models.base.revin_applies` and not in four call sites that must agree.
+        model = _instantiate(
+            cfg, spec, n_in, n_out, experiment.seeds[0], revin=experiment.data.revin
+        )
         model.eval()
         return [RunRecord(cfg.label, 0, model, True, model.n_fitted_parameters, 0.0)]
 
@@ -337,6 +355,31 @@ def _fit_one(
                     True,
                     decay_report.n_fitted_parameters,
                     decay_report.fit_time_s,
+                )
+            ]
+        if issubclass(MODEL_REGISTRY[cfg.name], EmpiricalResidualInterval):
+            # Checked before the DLinearOLS branch even though it is not a subclass of it,
+            # so that the ordering stays correct if that ever changes. The fit needs `val`
+            # -- and only `val`: the residual quantiles come from the validation split, and
+            # `fit_residual_interval` refuses any other partition rather than trusting this
+            # call site to pass the right one.
+            interval_model, interval_report = fit_residual_interval(
+                moments,
+                val,
+                kernel_size=int(cfg.params["kernel_size"]),
+                ridge=float(cfg.params.get("ridge", 0.0)),
+                n_quantiles=len(cfg.quantiles),
+                num_workers=experiment.train.num_workers,
+                **common,
+            )
+            return [
+                RunRecord(
+                    cfg.label,
+                    0,
+                    interval_model,
+                    True,
+                    interval_report.n_fitted_parameters,
+                    interval_report.fit_time_s,
                 )
             ]
         if issubclass(MODEL_REGISTRY[cfg.name], DLinearOLS):
@@ -397,7 +440,7 @@ def _fit_one(
     # reaches a mismatched objective here.
     loss_fn = resolve_loss(cfg.head, cfg.quantiles)
     for seed in experiment.seeds:
-        model = _instantiate(cfg, spec, n_in, n_out, seed).to(device)
+        model = _instantiate(cfg, spec, n_in, n_out, seed, revin=experiment.data.revin).to(device)
         result = fit(
             model,
             train_loader,
@@ -423,6 +466,154 @@ def _fit_one(
                 best_epoch=result.best_epoch,
                 epochs_run=result.epochs_run,
                 best_val_loss=result.best_val_loss,
+                val_loss_name=VAL_LOSS_NAMES[cfg.head],
+            )
+        )
+    return records
+
+
+def resolve_checkpoint(checkpoint_dir: Path, cfg: ModelConfig, seed: int) -> Path:
+    """Locate the committed best-epoch weights for one (model, regime, seed).
+
+    **Two naming conventions are on disk and both are load-bearing.**
+    :func:`dmf.train.loop.fit` writes ``f"{label or type(model).__name__.lower()}_seed{k}.pt"``,
+    and the ``label=cfg.label`` argument at the ``_fit_one`` call site only landed in the
+    Phase 5 commit. So ``artifacts/checkpoints/deep/`` (Phase 4) holds
+    ``lstmforecaster_seed0.pt`` and ``transformerforecaster_seed0.pt`` -- lowercased *class*
+    names -- while ``artifacts/checkpoints/probabilistic/`` (Phase 5) holds
+    ``lstm_quantile_seed0.pt`` and every other file under its *label*. A resolver that knew
+    only one convention would silently find nothing for half the deep rows, and a caller
+    that fell back to training or to random init on a miss would score an untrained model as
+    a trained one -- the worst failure available to a scoring pass, because it is invisible
+    in the output schema.
+
+    Both candidates are therefore tried, and **an ambiguity is refused rather than
+    resolved**: if a label-named and a class-named file both exist for the same triple, the
+    two were written by different runs and picking either is a guess. That is the exact
+    condition the ``label=`` argument was added to prevent (three heads of one class all
+    writing ``dlinear_seed0.pt``), so it is checked rather than assumed away.
+
+    Args:
+        checkpoint_dir: Directory for one (experiment, regime), e.g.
+            ``artifacts/checkpoints/deep/id``.
+        cfg: The model configuration whose weights are wanted.
+        seed: Training seed.
+
+    Returns:
+        Path to the checkpoint file.
+
+    Raises:
+        FileNotFoundError: If neither candidate exists. Every path tried is listed, because
+            the usual cause is an experiment name or a regime that does not match the
+            directory layout, not a missing run.
+        ValueError: If both candidates exist and differ.
+    """
+    stems = [cfg.label or cfg.name]
+    class_stem = MODEL_REGISTRY[cfg.name].__name__.lower()
+    if class_stem not in stems:
+        stems.append(class_stem)
+    candidates = [checkpoint_dir / f"{stem}_seed{seed}.pt" for stem in stems]
+    present = [path for path in candidates if path.is_file()]
+    if not present:
+        raise FileNotFoundError(
+            f"no checkpoint for model {cfg.label or cfg.name!r} at seed {seed}; tried "
+            f"{[str(path) for path in candidates]}. Scoring falls back to nothing: a "
+            f"randomly initialised model scored as a trained one is indistinguishable from "
+            f"a real result in every column of the table."
+        )
+    if len(present) > 1:
+        raise ValueError(
+            f"ambiguous checkpoints for model {cfg.label or cfg.name!r} at seed {seed}: "
+            f"{[str(path) for path in present]} both exist. They were written by different "
+            f"runs under the two naming conventions dmf.train.loop.fit has used, and "
+            f"choosing one would be a guess about which run the table is reporting."
+        )
+    return present[0]
+
+
+def load_or_fit(
+    cfg: ModelConfig,
+    *,
+    spec: WindowSpec,
+    train: DeckMotionDataset,
+    val: DeckMotionDataset,
+    experiment: ExperimentConfig,
+    moments_holder: dict[str, TrainingMoments],
+    device: str,
+    checkpoint_dir: Path,
+) -> list[RunRecord]:
+    """Return scored-ready models without retraining anything that was already trained.
+
+    The same dispatch as :func:`_fit_one`, with one substitution: an ``sgd`` model **loads
+    its committed ``state_dict``** instead of running the training loop. Closed-form and
+    untrained models are re-fitted, because they are cheap -- they share the one cached
+    :class:`dmf.train.closed_form.TrainingMoments` pass per regime -- and because a solve is
+    reproducible in a way a 60-epoch run is not.
+
+    This is what lets ``make eval`` regenerate every table from ``artifacts/`` in minutes,
+    and it is what :mod:`dmf.eval.scoring` calls.
+
+    **What it deliberately does not do:** fall back to training, or to a random
+    initialisation, when a checkpoint is missing. :func:`resolve_checkpoint` raises instead,
+    and ``load_state_dict`` is called with ``strict=True`` so that a checkpoint written at a
+    different geometry -- a different lookback, a different head width, RevIN on rather than
+    off -- fails loudly rather than loading the keys that happen to match.
+
+    Args:
+        cfg: Model configuration.
+        spec: Window geometry.
+        train: Training partition, for the moments pass the closed-form rows share.
+        val: Validation partition, for the residual-interval fit.
+        experiment: The experiment config, for seeds and the data settings.
+        moments_holder: One-element per-regime cache, as in :func:`_fit_one`.
+        device: Torch device the loaded models are placed on.
+        checkpoint_dir: Directory holding this (experiment, regime)'s weights.
+
+    Returns:
+        One record per run, in the same shape :func:`_fit_one` returns. SGD records carry
+        ``fit_time_s = nan`` and no epoch counts: those describe the training run that
+        wrote the checkpoint, and are already committed in that run's
+        ``baselines_by_seed.csv``. Reporting 0.0 here would put a free-looking training time
+        in a table whose whole purpose is comparing costs.
+
+    Raises:
+        FileNotFoundError: If a checkpoint an SGD row needs is absent.
+        ValueError: If the model declares an unknown fit kind, or the checkpoint is
+            ambiguous.
+        RuntimeError: From ``load_state_dict`` if the committed weights do not fit the
+            model the config builds.
+    """
+    kind = MODEL_REGISTRY[cfg.name].FIT_KIND
+    if kind != "sgd":
+        return _fit_one(
+            cfg,
+            spec=spec,
+            train=train,
+            val=val,
+            experiment=experiment,
+            moments_holder=moments_holder,
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+        )
+
+    n_in = len(train.input_columns)
+    n_out = len(train.target_columns)
+    records: list[RunRecord] = []
+    for seed in experiment.seeds:
+        model = _instantiate(cfg, spec, n_in, n_out, seed, revin=experiment.data.revin)
+        state = torch.load(
+            resolve_checkpoint(checkpoint_dir, cfg, seed), map_location="cpu", weights_only=True
+        )
+        model.load_state_dict(state, strict=True)
+        model.to(device).eval()
+        records.append(
+            RunRecord(
+                cfg.label,
+                seed,
+                model,
+                False,
+                model.n_fitted_parameters,
+                float("nan"),
                 val_loss_name=VAL_LOSS_NAMES[cfg.head],
             )
         )
@@ -473,6 +664,11 @@ def _decompose_kernel(experiment: ExperimentConfig) -> int | None:
     solve a different model under the configured label, and accumulating it when nothing
     reads it would spend a 400x400 float64 Gram per batch for nothing.
 
+    :class:`dmf.models.residual_interval.EmpiricalResidualInterval` counts too. It is not a
+    ``DLinearOLS`` -- it *holds* one, by composition, so that :func:`_fit_one` cannot route
+    it into the point-model branch -- so a membership test on ``DLinearOLS`` alone would
+    leave the moments without a decomposed design and fail its solve at fit time.
+
     Args:
         experiment: The experiment config.
 
@@ -487,7 +683,8 @@ def _decompose_kernel(experiment: ExperimentConfig) -> int | None:
     kernels = {
         int(m.params["kernel_size"])
         for m in experiment.models
-        if issubclass(MODEL_REGISTRY[m.name], DLinearOLS) and "kernel_size" in m.params
+        if issubclass(MODEL_REGISTRY[m.name], (DLinearOLS, EmpiricalResidualInterval))
+        and "kernel_size" in m.params
     }
     if len(kernels) > 1:
         raise ValueError(

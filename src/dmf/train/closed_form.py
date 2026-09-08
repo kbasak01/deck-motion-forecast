@@ -56,25 +56,39 @@ from dmf.data.normalize import normalize_target
 from dmf.models.ar import ARForecaster, lag_features
 from dmf.models.dlinear import series_decompose
 from dmf.models.dlinear_ols import DLinearOLS
+from dmf.models.heads import quantile_fan
 from dmf.models.persistence import DampedPersistence, DecayFit, solve_decay_tau
+from dmf.models.residual_interval import EmpiricalResidualInterval
 from dmf.typedefs import FloatArray, IntArray
 
 __all__ = [
+    "RESIDUAL_QUANTILE_MAX_WINDOWS",
     "ARFitReport",
     "DecayFitReport",
     "DecayMoments",
     "DecompFitReport",
     "DecompMoments",
     "LagMoments",
+    "ResidualIntervalFitReport",
     "TrainingMoments",
     "accumulate_training_moments",
     "fit_ar",
     "fit_damped_persistence",
     "fit_dlinear_ols",
+    "fit_residual_interval",
     "solve_ar_coefficients",
     "solve_decomp_coefficients",
     "subset_columns",
 ]
+
+#: Windows the empirical residual quantiles are estimated from, at most. ``id/val`` holds
+#: 240 realizations x 1131 windows = 271 440 windows, and the residual array is
+#: ``(N, H, C_out)``, so the full split would be 977 MB of float32 for an estimate that is
+#: not 30x better than a 25 000-window one: consecutive windows are 0.5 s apart on a signal
+#: whose roll period is ~12 s, so the effective sample size is a small fraction of ``N``
+#: either way. 25 000 windows still puts ~1250 samples in each 5 percent tail, per
+#: ``(horizon, channel)`` cell.
+RESIDUAL_QUANTILE_MAX_WINDOWS = 25_000
 
 #: Seed for the target permutation and the batch order used by the shuffle control. Fixed
 #: so that the control is reproducible; it is the only RNG in this module, and it is never
@@ -270,6 +284,38 @@ class DecompFitReport:
     cond_r: float
     n_fitted_parameters: int
     residual_train_mse: float
+    fit_time_s: float
+
+
+@dataclass(frozen=True)
+class ResidualIntervalFitReport:
+    """Diagnostics from one :class:`dmf.models.residual_interval.EmpiricalResidualInterval` fit.
+
+    Attributes:
+        point: The inner closed-form DLinear's own report, carried whole so the interval
+            row's point half is auditable against the ``dlinear_ols`` row it duplicates.
+        fitted_on: Provenance of the residual quantiles, e.g. ``"id/val"``. Recorded on the
+            report -- and asserted at fit time -- because the one thing that can make this
+            baseline dishonest is fitting its own residuals on the split it is scored on.
+        n_windows_total: Windows in the validation partition.
+        n_windows_used: Windows the quantiles were actually estimated from.
+        window_stride: Sub-sampling stride over the validation window index, windows. 1
+            means every window was used.
+        residual_val_mse: Mean squared residual of the point model over the sub-sampled
+            validation windows, dimensionless. Comparable in units to
+            :attr:`DecompFitReport.residual_train_mse`, and on a different partition.
+        n_fitted_parameters: Point-model coefficients plus ``H * C_out * Q`` quantiles.
+        fit_time_s: Wall-clock seconds, including the validation pass but excluding the
+            training moments pass the point half is solved from.
+    """
+
+    point: DecompFitReport
+    fitted_on: str
+    n_windows_total: int
+    n_windows_used: int
+    window_stride: int
+    residual_val_mse: float
+    n_fitted_parameters: int
     fit_time_s: float
 
 
@@ -912,4 +958,143 @@ def fit_dlinear_ols(
         n_fitted_parameters=model.n_fitted_parameters,
         residual_train_mse=residual,
         fit_time_s=elapsed,
+    )
+
+
+def fit_residual_interval(
+    moments: TrainingMoments,
+    val: DeckMotionDataset,
+    *,
+    kernel_size: int,
+    ridge: float,
+    lookback: int,
+    n_input_channels: int,
+    n_target_channels: int,
+    n_quantiles: int = len(quantile_fan(9)),
+    batch_size: int = 4096,
+    num_workers: int = 0,
+    max_windows: int = RESIDUAL_QUANTILE_MAX_WINDOWS,
+) -> tuple[EmpiricalResidualInterval, ResidualIntervalFitReport]:
+    """Fit the unconditional interval baseline: a closed-form point model plus its residuals.
+
+    Two solves, no epochs. The point half comes from ``moments`` -- the same single pass
+    every other closed-form row is solved from, so this row adds no pass over the *training*
+    split. The fan comes from one streaming pass over the **validation** split, sub-sampled
+    at a fixed stride.
+
+    **Validation, structurally.** Train residuals are the point model's own fitting error
+    and are narrower than its test error by exactly the amount it overfits, so an interval
+    built on them is too tight in the direction that flatters coverage; test residuals are
+    the leak itself. The partition is therefore checked here rather than documented.
+
+    Deterministic: no RNG enters, the loader is unshuffled, and the sub-sampling is a fixed
+    stride over the window index -- so the row is ``deterministic=True`` and exempt from the
+    three-seed rule, like every other closed-form row.
+
+    Args:
+        moments: One training-moments pass, accumulated with ``decompose_kernel`` set.
+        val: The **validation** partition, built with the training split's normalisation
+            statistics.
+        kernel_size: Trend-extraction window of the inner DLinear, samples.
+        ridge: Tikhonov strength the inner model is solved under, dimensionless.
+        lookback: Input window length ``L``, samples.
+        n_input_channels: Input channel count ``C_in``.
+        n_target_channels: Target channel count ``C_out``.
+        n_quantiles: Fan width ``Q``; the levels are :func:`dmf.models.heads.quantile_fan`
+            of that width, so this row is scored at exactly the levels every other quantile
+            row is.
+        batch_size: Windows per batch of the validation pass. Affects speed only.
+        num_workers: DataLoader worker processes.
+        max_windows: Upper bound on the windows the quantiles are estimated from; the
+            stride is chosen to respect it. Recorded on the report.
+
+    Returns:
+        Tuple ``(model, report)``; the model is fitted and in eval mode.
+
+    Raises:
+        ValueError: If ``val`` is not a validation partition, if its geometry disagrees
+            with the requested one, or if ``max_windows`` is not positive. Anything the
+            inner solve rejects propagates from :func:`fit_dlinear_ols`.
+    """
+    if val.partition != "val":
+        raise ValueError(
+            f"the empirical residual quantiles must be fitted on the validation partition, "
+            f"got {val.regime}/{val.partition}. Train residuals understate the point "
+            f"model's error by the amount it overfits, and test residuals are the leak "
+            f"itself (CLAUDE.md non-negotiable 2)."
+        )
+    if max_windows < 1:
+        raise ValueError(f"max_windows must be positive, got {max_windows}")
+    spec = val.window_spec
+    if spec.lookback != lookback or len(val.target_columns) != n_target_channels:
+        raise ValueError(
+            f"the validation partition holds L={spec.lookback}, C_out="
+            f"{len(val.target_columns)} but the model wants L={lookback}, "
+            f"C_out={n_target_channels}"
+        )
+
+    started = time.perf_counter()
+    point_model, point_report = fit_dlinear_ols(
+        moments,
+        kernel_size=kernel_size,
+        ridge=ridge,
+        lookback=lookback,
+        n_input_channels=n_input_channels,
+        n_target_channels=n_target_channels,
+    )
+
+    n_total = len(val)
+    stride = max(1, -(-n_total // max_windows))
+    stats = val.norm_stats.subset(val.target_columns)
+    loader = make_dataloader(
+        val, batch_size=batch_size, shuffle=False, num_workers=num_workers, seed=0
+    )
+    chunks: list[FloatArray] = []
+    position = 0
+    with torch.no_grad():
+        for x, y, window_mean in loader:
+            n = int(x.shape[0])
+            # The loader is unshuffled, so `position + i` is the global window index and
+            # this offset makes the selection an exact every-`stride`-th window over the
+            # whole partition, not a per-batch approximation of one.
+            offset = (-position) % stride
+            position += n
+            if offset >= n:
+                continue
+            x_sub = x[offset::stride]
+            y_sub = y[offset::stride]
+            mean_sub = window_mean[offset::stride]
+            residual = normalize_target(y_sub, stats, mean_sub) - point_model(x_sub)
+            chunks.append(residual.numpy())
+    residuals = np.concatenate(chunks, axis=0)
+
+    levels = np.asarray(quantile_fan(n_quantiles), dtype=np.float64)
+    # (Q, H, C) -> (H, C, Q). Linear interpolation between order statistics, numpy's
+    # default: at 25 000 windows the two neighbouring order statistics of the 5 percent
+    # level differ far below the width being reported, so the interpolation rule is not
+    # load-bearing -- unlike reading a level off a nine-member fan, which is why
+    # QUANTILE_FAN_9 contains 0.05 and 0.95 exactly.
+    fan = np.quantile(residuals.astype(np.float64), levels, axis=0).transpose(1, 2, 0)
+
+    model = EmpiricalResidualInterval(
+        lookback=lookback,
+        max_horizon=spec.max_horizon,
+        n_input_channels=n_input_channels,
+        n_target_channels=n_target_channels,
+        kernel_size=kernel_size,
+        ridge=ridge,
+        n_quantiles=n_quantiles,
+    )
+    model.point_model.load_state_dict(point_model.state_dict())
+    model.set_residual_quantiles(fan)
+    model.eval()
+    return model, ResidualIntervalFitReport(
+        point=point_report,
+        fitted_on=f"{val.regime}/{val.partition}",
+        n_windows_total=n_total,
+        n_windows_used=int(residuals.shape[0]),
+        window_stride=stride,
+        residual_val_mse=float(np.mean(np.square(residuals.astype(np.float64)))),
+        n_fitted_parameters=model.n_fitted_parameters,
+        fit_time_s=time.perf_counter() - started,
     )

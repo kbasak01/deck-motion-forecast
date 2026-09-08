@@ -1,0 +1,51 @@
+# Phase 6.3 ablation arm d -- lookback -- 10 s instead of 20 s.
+#
+# Scored on the window-matched origin set shared by all three lookback arms: the leading 60
+# windows are dropped, leaving 1091 origins 399..5849 per realization (P6-D4 item 1).
+# Not parameter-matched -- `dlinear_ols` has `L * C_in * H * C_out` weights by construction --
+# and no parameter-matched reading is claimed (P6-D4 item 2).
+#
+# The `train` block is byte-identical to `configs/experiment/e02_deep.yaml`: epochs 60,
+# batch 1024, lr 2e-3, patience 15, bf16. One budget, one schedule, one stopping rule, so the
+# arms differ in the DATA definition and in nothing else. Changing it would make this a
+# comparison of two training regimes wearing an ablation's name.
+#
+# The reference arm is NOT re-run. `results/e02/` already fitted `tcn` (3 seeds) and
+# `dlinear_ols` on every regime under this exact train block and `configs/data/default.yaml`;
+# its committed rows are read, never regenerated (docs/IMPLEMENTATION_PLAN.md Phase 6
+# carry-forward item 7). The one exception is the lookback ablation, where the reference is
+# re-SCORED from e02's checkpoints on the window-matched origin set (P6-D4 item 1) -- a
+# forward pass, not a refit.
+#
+# `persistence` must be first: it is the skill-score denominator and
+# `dmf.eval.runner.evaluate_models` requires it.
+#
+# Regime split across two configs, because `ExperimentConfig.regimes` applies to every model in
+# the list and the two vehicles have different budgets. This file carries the deep vehicle on
+# `id` and `unseen_seastate`; `configs/experiment/e04d_lookback_10s_ood.yaml` carries the closed-form vehicles on
+# `unseen_heading` and `unseen_vessel`, where they cost minutes and the deep model would cost
+# another ~15 h per arm. `dlinear_ols` therefore reports all four regimes and `tcn` reports two,
+# and each table says which.
+name: e04d_lookback_10s
+data: ../data/lookback_10s.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p20.yaml
+  - ../model/dlinear_ols.yaml
+  - ../model/tcn.yaml
+
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [id, unseen_seastate]

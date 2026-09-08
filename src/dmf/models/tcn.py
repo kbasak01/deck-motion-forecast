@@ -219,7 +219,7 @@ class TCN(BaseForecaster):
         self._head_width = max_horizon * n_target_channels * self.n_output_params
         self.head = nn.Linear(n_filters, self._head_width)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Encode the lookback with the dilated stack and project to the horizon.
 
         Only the **last** encoded step is read. That is the principled choice here rather
