@@ -1,0 +1,32 @@
+# TCN for the 40 s lookback arm of the Phase 6 lookback ablation (L = 400 samples).
+#
+# Identical to configs/model/tcn.yaml in every hyperparameter except `dilations`, which
+# gains one block (64). The receptive field is
+#
+#   RF = 1 + 2*(k-1)*sum(dilations) = 1 + 2*2*(1+2+4+8+16+32+64) = 509 samples = 50.9 s
+#
+# against the arm's 400-sample (40 s) lookback. The L=200 stack's 253 CANNOT be reused here:
+# it would see only the most recent 25.3 s of a 40 s window and the older 14.7 s would be
+# invisible -- which shows up nowhere in the loss curve, only as a quietly worse number that
+# would then be reported as "a longer lookback does not help". The arithmetic is asserted in
+# tests/test_models.py::test_tcn_l400_receptive_field_covers_the_forty_second_lookback, and
+# dmf.models.tcn.TCN raises at construction if it fails; this comment is not the guard.
+#
+# NOT parameter-matched to `tcn`, and the plan says so rather than hiding it (P6-D4):
+# 221 636 parameters here against 196 804 at L=200, +24 832 (+12.6%), all of it the seventh
+# residual block -- the head is Linear(64 -> H*C_out) = 58 500 in both, since it reads the
+# last encoded step only and is therefore independent of L. Parameter matching is impossible
+# for a lookback ablation in any case: `dlinear_ols` parameters scale with C_in*L by
+# construction. Both counts ship in every lookback row.
+#
+# The label differs from `tcn` so the two rows cannot collide in a results table or in a
+# checkpoint filename (dmf.train.loop.fit names the file from the label).
+name: tcn
+label: tcn_l400
+head: point
+quantiles: []
+params:
+  n_filters: 64
+  kernel_size: 3
+  dilations: [1, 2, 4, 8, 16, 32, 64]
+  dropout: 0.1

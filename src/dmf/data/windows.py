@@ -16,6 +16,7 @@ __all__ = [
     "WindowSpec",
     "make_windows",
     "n_windows",
+    "window_origins",
     "window_spec_from_config",
     "window_start_indices",
 ]
@@ -108,6 +109,27 @@ def window_start_indices(n_samples: int, spec: WindowSpec) -> IntArray:
     """
     count = n_windows(n_samples, spec)
     return np.arange(count, dtype=np.int64) * spec.stride
+
+
+def window_origins(n_samples: int, spec: WindowSpec) -> IntArray:
+    """Compute the forecast origin of every window in a realization.
+
+    The origin is the **last observed sample** of the window, ``s + L - 1``: the moment the
+    decision is taken, and the sample the forecast is anchored to. It lives here, beside
+    :func:`window_start_indices`, because it is the *other* index a window has and because
+    two modules need one definition of it -- :class:`dmf.data.dataset.DeckMotionDataset`
+    restricts itself to a chosen origin set, and :mod:`dmf.eval.ablations` intersects the
+    origin sets of two geometries -- so the dataset that keeps a window and the table that
+    pairs it cannot disagree about which sample it was anchored to.
+
+    Args:
+        n_samples: Length of the realization, samples.
+        spec: Window geometry.
+
+    Returns:
+        Origins, shape ``(n_windows,)``, ascending.
+    """
+    return window_start_indices(n_samples, spec) + spec.lookback - 1
 
 
 def make_windows(series: FloatArray, spec: WindowSpec) -> tuple[FloatArray, FloatArray]:

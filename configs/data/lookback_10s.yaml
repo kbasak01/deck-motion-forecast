@@ -1,0 +1,20 @@
+# Phase 6.3 ablation arm: lookback -- 10 s
+#
+# Differs from `configs/data/default.yaml` in `lookback` (200 -> 100) and nothing else, so the contrast
+# isolates one variable. Read `docs/protocol.md` P6-D4 for what is and is not matched across
+# arms before comparing any two of these tables.
+#
+# Window matching (P6-D4 item 1): a window starting at sample `s` has forecast origin
+# `t = s + L - 1`, so matching on `s` would compare forecasts of different absolute times.
+# At L=100 this arm has 1151 windows per 6000-sample realization with origins 99..5849;
+# the matched comparison drops the leading 60, leaving 1091 origins 399..5849, identical to
+# the L=400 arm's full set.
+fs_hz: 10.0
+lookback: 100
+horizons: [10, 20, 30, 50, 100, 150]
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: ideal
+revin: false
+condition_on_sea_state: false

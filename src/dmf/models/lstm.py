@@ -75,7 +75,7 @@ class LSTMForecaster(BaseForecaster):
         self._head_width = max_horizon * n_target_channels * self.n_output_params
         self.head = nn.Linear(hidden_size, self._head_width)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Encode the lookback and project the final hidden state to the horizon.
 
         Args:

@@ -58,7 +58,9 @@ period and a skill-vs-horizon reading attributes a property of persistence to th
 Simulated results only; no real deck data enters any artifact this module reads.
 """
 
-from collections.abc import Sequence
+import re
+import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -88,13 +90,43 @@ __all__ = [
     "VERDICT_FAIL",
     "VERDICT_PASS",
     "VERDICT_UNVERIFIED",
+    "DEGRADATION_COLUMNS",
+    "GATE5_COLUMNS",
+    "GATE5_DOF",
+    "GATE5_HORIZON_SAMPLES",
+    "GATE5_PICP_BAND",
+    "GATE5_REGIME",
+    "GATE6_COLUMNS",
+    "GATE6_CRITERIA",
+    "GATE6_MARKER_SPEC",
+    "GATE6_READING",
+    "GATE6_REQUIRED_TABLES",
+    "GATE6_RESULTS_MD",
+    "GATE6_TABLE_COLUMNS",
+    "Gate6Evidence",
     "GateReading",
+    "RenderedTable",
     "build_gate4_markdown",
+    "build_gate5_markdown",
+    "build_gate6_markdown",
+    "coverage_degradation",
     "gate4_notes",
     "gate4_readout",
+    "gate5_notes",
+    "gate5_readout",
+    "gate5_reading_passes",
+    "gate6_notes",
+    "gate6_readout",
+    "gate6_reading_passes",
+    "gate6_table_audit",
+    "parse_rendered_tables",
     "read_gate4_inputs",
+    "read_gate5_inputs",
+    "read_gate6_inputs",
     "reading_passes",
     "write_gate4_report",
+    "write_gate5_report",
+    "write_gate6_report",
 ]
 
 #: Regime both readings are taken on. ``id`` is what Gate 4 names; the out-of-distribution
@@ -1422,5 +1454,940 @@ def write_gate5_report(
     markdown_path.write_text(
         build_gate5_markdown(readout, degradation=degradation, results_dir=results_dir),
         encoding="utf-8",
+    )
+    return readout, csv_path, markdown_path
+
+
+# ======================================================================================
+# Gate 6 -- traceability and reproducibility.
+#
+# Same shape as the Gate 4 and Gate 5 read-outs above and for the same reason: the verdict
+# a reader sees and the verdict the gate was read at are one object, computed by repository
+# code rather than by a script that cannot be re-run.
+#
+# What differs is the kind of criterion. Gates 3-5 are numeric -- a skill margin, a coverage
+# band -- and each turns on a cell chosen before the sweep ran. Gate 6 is a **process**
+# criterion, so `docs/protocol.md` P6-D1 registered no threshold and no cell, and instead
+# wrote it out as seven artifact predicates. This section implements exactly those seven,
+# in P6-D1's order and numbering, and adds none: a criterion invented after the artifacts
+# exist is the thing pre-registration is for.
+#
+# **The seven predicates need a machine-readable document, and this is where the contract
+# is stated.** Predicates 3 and 4 -- every rendered table names an existing CSV, and the
+# row count it states matches that CSV's -- are the operative ones, because they make "every
+# number traceable to a CSV" a structural property of the renderer rather than a claim
+# about it. A prose sentence naming a file is not checkable; a marker is. `results.md` must
+# therefore precede every rendered table with
+#
+#     <!-- dmf-table id=<slug> section=<6.1|6.2|6.3|...> source=<path/to.csv>
+#          csv_rows=<int> rows=<int> [select="<filter>"] -->
+#
+# as the last non-blank line before the table's header row. See :data:`GATE6_MARKER_SPEC`
+# for the field semantics and :func:`parse_rendered_tables` for the parser.
+#
+# **Predicate 4 is not literally checkable, and that is recorded rather than worked around.**
+# Most rendered tables are a filtered view of a larger CSV -- one regime, one horizon band --
+# so "the row count stated equals the row count of the named CSV" is false for them by
+# construction, and a gate that enforced it literally would fail every honest document. It
+# is therefore read as three sub-checks: the stated row count matches the rows actually
+# rendered (the document is self-consistent), the stated CSV row count matches the file (the
+# provenance is real), and for a table declaring no `select` the two coincide (P6-D1's
+# literal reading, where it applies). All three must hold; which tables are filtered is
+# reported.
+# ======================================================================================
+
+#: The document Gate 6 is read on.
+GATE6_RESULTS_MD = "results.md"
+
+#: The one reading. Gates 4 and 5 ship two readings each because their criterion could
+#: honestly be read at more than one cell; Gate 6 has no cell, so there is one key and it
+#: covers all seven predicates.
+GATE6_READING = "gate"
+
+#: Human-readable statement of the marker contract, rendered into ``gate6.md`` so that the
+#: document the renderer's author reads and the string the parser accepts are one object.
+GATE6_MARKER_SPEC = (
+    "<!-- dmf-table id=<slug> section=<6.1|6.2|6.3> source=<path/to.csv> "
+    'csv_rows=<int> rows=<int> [select="<filter>"] -->'
+)
+
+#: Marker keys that must be present on every table marker.
+GATE6_MARKER_REQUIRED: tuple[str, ...] = ("id", "source", "csv_rows", "rows")
+
+#: The tables ``docs/IMPLEMENTATION_PLAN.md`` sections 6.1, 6.2 and 6.3 require, as
+#: ``(section, id)``. Predicate 5 is a set containment against this tuple, so this constant
+#: **is** the required-table list and a renderer's ``id`` slugs must match it exactly.
+#:
+#: Taken from the plan and from nothing else. The interval quiescence rule (P6-D5), the
+#: interval controls (Phase 6 carry-forward item 6) and the reproducibility control (P6-D13)
+#: are all Phase 6 obligations and none of them is in this tuple, because P6-D1 was written
+#: before them and adding a predicate to a pre-registered gate after the fact is the failure
+#: pre-registration exists to prevent. :func:`gate6_notes` names them instead, so the reader
+#: sees what the gate does not cover.
+GATE6_REQUIRED_TABLES: tuple[tuple[str, str], ...] = (
+    ("6.1", "core_metrics"),
+    ("6.2", "quiescence_detection"),
+    ("6.2", "quiescence_lead_time"),
+    ("6.2", "quiescence_base_rate"),
+    ("6.3", "ablation_observation_mode"),
+    ("6.3", "ablation_channels"),
+    ("6.3", "ablation_ss_conditioning"),
+    ("6.3", "ablation_lookback"),
+    ("6.3", "ablation_normalization"),
+)
+
+#: The seven predicates, verbatim in substance from ``docs/protocol.md`` P6-D1 and in its
+#: numbering. Stored as data so that the rendered document, the CSV and the pass rule all
+#: read one list; a criterion that appeared in the prose and not in the frame would be a
+#: criterion nobody evaluated.
+GATE6_CRITERIA: tuple[tuple[str, str], ...] = (
+    (
+        "1",
+        "`make eval` exits 0 on a checkout holding `artifacts/corpus/` and "
+        "`artifacts/checkpoints/`.",
+    ),
+    ("2", "`results/results.md` exists and is regenerated by that command, not hand-edited."),
+    (
+        "3",
+        "Every table rendered in `results.md` names the CSV it was read from, and that file "
+        "exists.",
+    ),
+    (
+        "4",
+        "The row count `results.md` states for each table equals the row count of the named CSV.",
+    ),
+    ("5", "Every 6.1, 6.2 and 6.3 table required by the plan is present."),
+    ("6", "Every F1 row carries its base rate in the same row."),
+    (
+        "7",
+        "Every coverage row carries an interval width in the same row, and no coverage row "
+        "pools the 1-5 s and 10-15 s bands.",
+    ),
+)
+
+#: Schema of ``gate6.csv``: one row per predicate.
+GATE6_COLUMNS: tuple[str, ...] = (
+    "reading",
+    "criterion",
+    "statement",
+    "verdict",
+    "n_checked",
+    "n_failed",
+    "detail",
+)
+
+#: Schema of ``gate6_tables.csv``: one row per table rendered in ``results.md``. This is the
+#: evidence predicates 3, 4, 6 and 7 are computed from, written out so that a failure can be
+#: read at the table that caused it rather than at the summary.
+GATE6_TABLE_COLUMNS: tuple[str, ...] = (
+    "table_id",
+    "section",
+    "source",
+    "source_exists",
+    "csv_rows_stated",
+    "csv_rows_actual",
+    "rows_stated",
+    "rows_rendered",
+    "filtered",
+    "has_f1",
+    "has_base_rate",
+    "has_picp",
+    "has_width",
+    "has_horizon",
+    "line",
+    "problems",
+)
+
+#: The marker itself.
+_MARKER_RE = re.compile(r"^<!--\s*dmf-table\s+(?P<attrs>.*?)\s*-->\s*$")
+
+#: ``key=value`` pairs inside a marker; values may be bare or double-quoted.
+_ATTR_RE = re.compile(r'(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?:"(?P<quoted>[^"]*)"|(?P<bare>\S+))')
+
+#: Column-name patterns predicates 6 and 7 turn on. Matched against the rendered header
+#: cells, not against a CSV, because the predicates are about what a **row of the document**
+#: states -- a base rate that exists in a CSV but not beside the F1 a reader is looking at is
+#: exactly the trap `CLAUDE.md` names.
+_F1_COLUMN_RE = re.compile(r"(?:^|_)f1(?:_|$)", re.IGNORECASE)
+_BASE_RATE_COLUMN_RE = re.compile(r"base[_ ]?rate", re.IGNORECASE)
+_PICP_COLUMN_RE = re.compile(r"picp|coverage", re.IGNORECASE)
+_WIDTH_COLUMN_RE = re.compile(r"width", re.IGNORECASE)
+_HORIZON_COLUMN_RE = re.compile(r"^horizon(_s|_samples)?$", re.IGNORECASE)
+_POOLED_COLUMN_RE = re.compile(r"pooled|all_horizons|horizon_band", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class RenderedTable:
+    """One Markdown table found in ``results.md``, with whatever marker preceded it.
+
+    Attributes:
+        table_id: The marker's ``id``, or empty for a table with no marker -- an **orphan**,
+            which fails predicate 3 by definition: a table nobody can trace is the case the
+            predicate exists to catch.
+        section: The marker's ``section``, or the section
+            :data:`GATE6_REQUIRED_TABLES` assigns to this ``id``, or empty.
+        source: The marker's ``source``, a path relative to the results directory.
+        csv_rows_stated: Row count the marker claims the source CSV has, or None.
+        rows_stated: Row count the marker claims this table renders, or None.
+        select: The marker's ``select`` filter description; empty means the table is
+            claimed to be the whole CSV, which is the only case P6-D1's predicate 4 can be
+            read literally on.
+        columns: Header cells of the rendered table, in order.
+        rows_rendered: Body rows actually present under the header.
+        line: 1-based line number of the table's header row, for a message that points at
+            the document.
+        marker_error: Why the marker was unusable, empty if it was fine.
+    """
+
+    table_id: str
+    section: str
+    source: str
+    csv_rows_stated: int | None
+    rows_stated: int | None
+    select: str
+    columns: tuple[str, ...]
+    rows_rendered: int
+    line: int
+    marker_error: str = ""
+
+    @property
+    def filtered(self) -> bool:
+        """Whether the marker declares this table a filtered view of its CSV.
+
+        Returns:
+            True if a ``select`` was declared.
+        """
+        return bool(self.select)
+
+
+@dataclass(frozen=True)
+class Gate6Evidence:
+    """Everything the seven predicates are evaluated from, gathered by one IO pass.
+
+    Separated from :func:`gate6_readout` so that the read-out is a pure function of
+    evidence, exactly as :func:`gate4_readout` is a pure function of ``baselines.csv``. A
+    gate that reads the filesystem inside its own verdict logic cannot be exercised on a
+    fixture, and one that cannot be exercised on a fixture is one nobody has watched fail.
+
+    Attributes:
+        results_dir: The directory ``results.md`` and its CSVs were read from.
+        results_md_exists: Whether ``results.md`` is there at all.
+        tables: Every Markdown table found in it, in document order.
+        csv_row_counts: Row count of each CSV a marker named, keyed by the marker's
+            ``source`` string. Absent keys are files that do not exist.
+        eval_exit_code: Exit status of ``make eval``, or None if this invocation was not
+            told. **None is UNVERIFIED, never a pass**: predicate 1 is about a command
+            having been run, and no artifact can testify to that on its own.
+        corpus_present: Whether ``artifacts/corpus/`` exists -- predicate 1's precondition.
+        checkpoints_present: Whether ``artifacts/checkpoints/`` exists -- likewise.
+        rerender_matches: Whether re-running the renderer over the same CSVs reproduces
+            ``results.md`` byte for byte, or None if that could not be attempted.
+        rerender_error: Why it could not be attempted, or how it differed.
+    """
+
+    results_dir: Path
+    results_md_exists: bool
+    tables: tuple[RenderedTable, ...]
+    csv_row_counts: Mapping[str, int]
+    eval_exit_code: int | None = None
+    corpus_present: bool = False
+    checkpoints_present: bool = False
+    rerender_matches: bool | None = None
+    rerender_error: str = ""
+
+
+def parse_rendered_tables(text: str) -> tuple[RenderedTable, ...]:
+    """Find every Markdown table in a document and the marker that should precede it.
+
+    A table is a run of consecutive lines beginning with ``|`` whose second line is a
+    separator row. Its marker is the **last non-blank line before it**, which is a strict
+    rule on purpose: a marker several paragraphs up could be read as belonging to either of
+    two tables, and predicate 3 is worth nothing if the association is ambiguous.
+
+    Args:
+        text: The contents of ``results.md``.
+
+    Returns:
+        One :class:`RenderedTable` per table found, in document order. A table with no
+        marker is returned with an empty ``table_id`` and a ``marker_error`` saying so,
+        rather than skipped -- an untraceable table must appear in the audit, not vanish
+        from it.
+    """
+    lines = text.splitlines()
+    sections = {table_id: section for section, table_id in GATE6_REQUIRED_TABLES}
+    tables: list[RenderedTable] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith("|"):
+            index += 1
+            continue
+        start = index
+        block: list[str] = []
+        while index < len(lines) and lines[index].lstrip().startswith("|"):
+            block.append(lines[index].strip())
+            index += 1
+        if len(block) < 2 or set(block[1].replace("|", "").replace(" ", "")) - set("-:") != set():
+            continue  # not a table: a stray pipe line, or a separator that is not one
+        columns = tuple(cell.strip() for cell in block[0].strip("|").split("|"))
+        rows_rendered = len(block) - 2
+        marker_line = start - 1
+        while marker_line >= 0 and not lines[marker_line].strip():
+            marker_line -= 1
+        match = _MARKER_RE.match(lines[marker_line].strip()) if marker_line >= 0 else None
+        if match is None:
+            tables.append(
+                RenderedTable(
+                    table_id="",
+                    section="",
+                    source="",
+                    csv_rows_stated=None,
+                    rows_stated=None,
+                    select="",
+                    columns=columns,
+                    rows_rendered=rows_rendered,
+                    line=start + 1,
+                    marker_error=(
+                        f"no `{GATE6_MARKER_SPEC.split()[1]}` marker on the last non-blank "
+                        f"line before this table"
+                    ),
+                )
+            )
+            continue
+        attrs = {
+            found.group("key"): (
+                found.group("quoted") if found.group("quoted") is not None else found.group("bare")
+            )
+            for found in _ATTR_RE.finditer(match.group("attrs"))
+        }
+        missing = [key for key in GATE6_MARKER_REQUIRED if key not in attrs]
+        table_id = attrs.get("id", "")
+        tables.append(
+            RenderedTable(
+                table_id=table_id,
+                section=attrs.get("section", sections.get(table_id, "")),
+                source=attrs.get("source", ""),
+                csv_rows_stated=_as_int(attrs.get("csv_rows")),
+                rows_stated=_as_int(attrs.get("rows")),
+                select=attrs.get("select", ""),
+                columns=columns,
+                rows_rendered=rows_rendered,
+                line=start + 1,
+                marker_error=(
+                    "" if not missing else f"marker is missing required key(s) {missing}"
+                ),
+            )
+        )
+    return tuple(tables)
+
+
+def _as_int(value: str | None) -> int | None:
+    """Parse a marker value as an integer, returning None rather than raising.
+
+    Args:
+        value: The raw marker value, or None if the key was absent.
+
+    Returns:
+        The integer, or None if it was absent or unparseable. A malformed count is reported
+        by predicate 4 as a failure, which is more useful than a traceback out of the parser.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _table_problems(table: RenderedTable, counts: Mapping[str, int]) -> dict[str, list[str]]:
+    """Evaluate one table against the predicates that are about tables.
+
+    Args:
+        table: The rendered table.
+        counts: Row count of each CSV a marker named, keyed by the ``source`` string.
+
+    Returns:
+        Predicate id -> the problems that predicate found with this table. An empty list
+        means the table satisfies it; a table is only counted against a predicate it is
+        actually subject to (predicate 6 says nothing about a table with no F1 column).
+    """
+    problems: dict[str, list[str]] = {key: [] for key, _ in GATE6_CRITERIA}
+    if table.marker_error:
+        problems["3"].append(table.marker_error)
+    elif not table.source:
+        problems["3"].append("marker declares no `source`")
+    elif table.source not in counts:
+        problems["3"].append(f"named CSV `{table.source}` does not exist")
+
+    if table.rows_stated is None or table.csv_rows_stated is None:
+        problems["4"].append("marker does not state both `rows` and `csv_rows` as integers")
+    else:
+        if table.rows_stated != table.rows_rendered:
+            problems["4"].append(
+                f"marker states rows={table.rows_stated} but {table.rows_rendered} body "
+                f"row(s) are rendered"
+            )
+        actual = counts.get(table.source)
+        if actual is None:
+            problems["4"].append(f"cannot count rows of `{table.source}`")
+        elif table.csv_rows_stated != actual:
+            problems["4"].append(
+                f"marker states csv_rows={table.csv_rows_stated} but `{table.source}` "
+                f"holds {actual}"
+            )
+        elif not table.filtered and table.rows_stated != actual:
+            problems["4"].append(
+                f"marker declares no `select`, so P6-D1 predicate 4 is read literally here: "
+                f"rows={table.rows_stated} must equal the CSV's {actual}"
+            )
+
+    columns = table.columns
+    has_f1 = any(_F1_COLUMN_RE.search(name) for name in columns)
+    has_base_rate = any(_BASE_RATE_COLUMN_RE.search(name) for name in columns)
+    if has_f1 and not has_base_rate:
+        problems["6"].append(
+            "carries an F1 column and no base-rate column; F1 against an unstated base rate "
+            "is not interpretable (CLAUDE.md known traps)"
+        )
+    has_picp = any(_PICP_COLUMN_RE.search(name) for name in columns)
+    has_width = any(_WIDTH_COLUMN_RE.search(name) for name in columns)
+    has_horizon = any(_HORIZON_COLUMN_RE.match(name) for name in columns)
+    if has_picp:
+        if not has_width:
+            problems["7"].append(
+                "carries a coverage column and no width column; a maximally wide interval "
+                "has perfect coverage, so coverage alone states nothing"
+            )
+        if not has_horizon:
+            problems["7"].append(
+                "carries a coverage column and no per-row `horizon_s`/`horizon_samples` "
+                "column, so its rows pool lead times. P5-D15 measured the deep heads "
+                "calibrated 12 of 12 at 10-15 s and over-covering in 18-23 of 24 cells at "
+                "1-5 s: one pooled number averages two opposite behaviours"
+            )
+        pooled = [name for name in columns if _POOLED_COLUMN_RE.search(name)]
+        if pooled:
+            problems["7"].append(f"coverage table carries pooled column(s) {pooled}")
+    return problems
+
+
+def gate6_table_audit(evidence: Gate6Evidence) -> pd.DataFrame:
+    """Tabulate every rendered table and what the predicates found wrong with it.
+
+    Written to ``gate6_tables.csv``. This is where a Gate 6 failure is actually read: the
+    read-out says which predicate failed and how many tables tripped it, and this frame says
+    which ones.
+
+    Args:
+        evidence: The gathered evidence.
+
+    Returns:
+        One row per table, columns :data:`GATE6_TABLE_COLUMNS`. Empty if the document
+        rendered no tables at all -- which the read-out reports as a failure of predicate 3,
+        not as an empty pass.
+    """
+    rows: list[dict[str, object]] = []
+    for table in evidence.tables:
+        problems = _table_problems(table, evidence.csv_row_counts)
+        flat = [f"[{key}] {text}" for key, items in problems.items() for text in items]
+        rows.append(
+            {
+                "table_id": table.table_id,
+                "section": table.section,
+                "source": table.source,
+                "source_exists": table.source in evidence.csv_row_counts,
+                "csv_rows_stated": table.csv_rows_stated,
+                "csv_rows_actual": evidence.csv_row_counts.get(table.source),
+                "rows_stated": table.rows_stated,
+                "rows_rendered": table.rows_rendered,
+                "filtered": table.filtered,
+                "has_f1": any(_F1_COLUMN_RE.search(name) for name in table.columns),
+                "has_base_rate": any(_BASE_RATE_COLUMN_RE.search(name) for name in table.columns),
+                "has_picp": any(_PICP_COLUMN_RE.search(name) for name in table.columns),
+                "has_width": any(_WIDTH_COLUMN_RE.search(name) for name in table.columns),
+                "has_horizon": any(_HORIZON_COLUMN_RE.match(name) for name in table.columns),
+                "line": table.line,
+                "problems": "; ".join(flat),
+            }
+        )
+    return pd.DataFrame(rows, columns=list(GATE6_TABLE_COLUMNS))
+
+
+def _criterion_1(evidence: Gate6Evidence) -> tuple[str, int, int, str]:
+    """Evaluate P6-D1 predicate 1: ``make eval`` exits 0 on a checkout with the artifacts."""
+    missing = [
+        name
+        for name, present in (
+            ("artifacts/corpus/", evidence.corpus_present),
+            ("artifacts/checkpoints/", evidence.checkpoints_present),
+        )
+        if not present
+    ]
+    if missing:
+        return (
+            VERDICT_UNVERIFIED,
+            1,
+            0,
+            f"the predicate's precondition is not met on this checkout: {missing} absent. "
+            f"Not a failure of `make eval` and not a pass",
+        )
+    if evidence.eval_exit_code is None:
+        return (
+            VERDICT_UNVERIFIED,
+            1,
+            0,
+            "no `make eval` exit status was supplied. No artifact testifies that a command "
+            "was run, so this is an unmeasured predicate, not a passed one; run the gate "
+            "after `make eval` in the same make invocation (`make gate6-full`) or pass "
+            "--eval-exit-code",
+        )
+    if evidence.eval_exit_code == 0:
+        return VERDICT_PASS, 1, 0, "`make eval` exited 0"
+    return VERDICT_FAIL, 1, 1, f"`make eval` exited {evidence.eval_exit_code}"
+
+
+def _criterion_2(evidence: Gate6Evidence) -> tuple[str, int, int, str]:
+    """Evaluate P6-D1 predicate 2: ``results.md`` exists and is generated, not hand-edited."""
+    if not evidence.results_md_exists:
+        return VERDICT_FAIL, 1, 1, f"{GATE6_RESULTS_MD} is not in {evidence.results_dir}"
+    if evidence.rerender_matches is None:
+        return (
+            VERDICT_UNVERIFIED,
+            1,
+            0,
+            f"the document exists but could not be re-rendered, so "
+            f"'not hand-edited' is unmeasured: {evidence.rerender_error}",
+        )
+    if evidence.rerender_matches:
+        return (
+            VERDICT_PASS,
+            1,
+            0,
+            "re-running the renderer over the committed CSVs reproduces the document byte "
+            "for byte, so every line in it came from a CSV",
+        )
+    return (
+        VERDICT_FAIL,
+        1,
+        1,
+        f"re-rendering does not reproduce the committed document: {evidence.rerender_error}",
+    )
+
+
+def _criterion_5(evidence: Gate6Evidence) -> tuple[str, int, int, str]:
+    """Evaluate P6-D1 predicate 5: every table the plan requires is present."""
+    present = {table.table_id for table in evidence.tables}
+    missing = [
+        f"{section} `{table_id}`"
+        for section, table_id in GATE6_REQUIRED_TABLES
+        if table_id not in present
+    ]
+    total = len(GATE6_REQUIRED_TABLES)
+    if missing:
+        return (
+            VERDICT_FAIL,
+            total,
+            len(missing),
+            f"{len(missing)} of {total} required table(s) absent: {', '.join(missing)}",
+        )
+    return VERDICT_PASS, total, 0, f"all {total} required tables are present"
+
+
+def gate6_readout(evidence: Gate6Evidence) -> pd.DataFrame:
+    """Compute the Gate 6 verdict, one row per pre-registered predicate.
+
+    Pure: everything it reads is in ``evidence``, so the whole gate can be exercised on a
+    synthetic document. :func:`read_gate6_inputs` is the only part that touches disk.
+
+    Args:
+        evidence: The gathered evidence, from :func:`read_gate6_inputs` or built directly.
+
+    Returns:
+        Seven rows in P6-D1's order, columns :data:`GATE6_COLUMNS`. A predicate that could
+        not be evaluated is :data:`VERDICT_UNVERIFIED`, which is not a pass -- the Gate 4
+        and Gate 5 rule, for the same reason: an unmeasured gate is neither passed nor
+        failed, and filling the gap either way is a decision the reader should make.
+    """
+    per_table = [_table_problems(table, evidence.csv_row_counts) for table in evidence.tables]
+    n_tables = len(evidence.tables)
+
+    def table_predicate(key: str, subject: str) -> tuple[str, int, int, str]:
+        failures = [
+            (table, problems[key])
+            for table, problems in zip(evidence.tables, per_table, strict=True)
+            if problems[key]
+        ]
+        if key == "3" and n_tables == 0:
+            return (
+                VERDICT_FAIL,
+                0,
+                0,
+                f"{GATE6_RESULTS_MD} renders no tables at all; an empty document is not a "
+                f"traceable one",
+            )
+        if not failures:
+            return VERDICT_PASS, n_tables, 0, f"{n_tables} table(s) checked, {subject}"
+        named = "; ".join(
+            f"`{table.table_id or '(unmarked)'}` at line {table.line}: {items[0]}"
+            for table, items in failures[:6]
+        )
+        more = "" if len(failures) <= 6 else f", and {len(failures) - 6} more"
+        return VERDICT_FAIL, n_tables, len(failures), f"{named}{more}"
+
+    outcomes: dict[str, tuple[str, int, int, str]] = {
+        "1": _criterion_1(evidence),
+        "2": _criterion_2(evidence),
+        "3": table_predicate("3", "each names a CSV that exists"),
+        "4": table_predicate("4", "each states a row count matching its source"),
+        "5": _criterion_5(evidence),
+        "6": table_predicate("6", "no F1 column stands without its base rate"),
+        "7": table_predicate("7", "no coverage column stands without a width and a lead time"),
+    }
+    rows = []
+    for key, statement in GATE6_CRITERIA:
+        verdict, checked, failed, detail = outcomes[key]
+        rows.append(
+            {
+                "reading": GATE6_READING,
+                "criterion": key,
+                "statement": statement,
+                "verdict": verdict,
+                "n_checked": checked,
+                "n_failed": failed,
+                "detail": detail,
+            }
+        )
+    return pd.DataFrame(rows, columns=list(GATE6_COLUMNS))
+
+
+def gate6_reading_passes(readout: pd.DataFrame, key: str = GATE6_READING) -> bool:
+    """Report whether every predicate of one reading passes.
+
+    Args:
+        readout: The frame :func:`gate6_readout` returned.
+        key: :data:`GATE6_READING` for the gate as a whole, or a single criterion id
+            (``"1"`` .. ``"7"``) to ask about one predicate. Naming one predicate reports
+            it; it does not narrow the gate, which :func:`write_gate6_report` and
+            ``scripts/gate6.py`` always take over all seven.
+
+    Returns:
+        True only if the selected rows exist and every one is :data:`VERDICT_PASS`. An
+        :data:`VERDICT_UNVERIFIED` row is not a pass.
+
+    Raises:
+        ValueError: If ``key`` names neither the reading nor a criterion in ``readout``.
+    """
+    rows = readout if key == GATE6_READING else readout[readout["criterion"] == key]
+    if rows.empty:
+        raise ValueError(
+            f"{key!r} names neither the reading {GATE6_READING!r} nor a criterion in the "
+            f"read-out, which carries {sorted(set(readout['criterion']))}"
+        )
+    return bool((rows["verdict"] == VERDICT_PASS).all())
+
+
+def gate6_notes(readout: pd.DataFrame, audit: pd.DataFrame | None = None) -> tuple[str, ...]:
+    """Return the caveats that must travel with any Gate 6 verdict.
+
+    Args:
+        readout: The frame from :func:`gate6_readout`.
+        audit: The frame from :func:`gate6_table_audit`, if it was computed.
+
+    Returns:
+        Caveat lines, rendered as a bullet list by :func:`build_gate6_markdown`.
+    """
+    notes = [
+        "Simulated results only. Nothing this gate checks is evidence about real deck "
+        "motion; it is evidence that the numbers in `results.md` came from the CSVs beside "
+        "it.",
+        "**This is a reproducibility and traceability gate and nothing else** "
+        "(`docs/protocol.md` P6-D1). It does not test that any Phase 6 number is correct, "
+        "that the quiescence detector is well specified, or that an ablation contrast is "
+        "fair. Those are P6-D2 through P6-D6 and the integrity controls, and a PASS here "
+        "must not be read as covering them.",
+        "**Predicate 4 is read as three sub-checks, not literally.** Most rendered tables "
+        "are a filtered view of a larger CSV, so 'the stated row count equals the CSV's' is "
+        "false for them by construction. The gate requires instead that the stated row "
+        "count match the rows rendered, that the stated CSV row count match the file, and "
+        "that the two coincide wherever a table declares no `select`. The `filtered` column "
+        "of `gate6_tables.csv` says which tables the literal reading applied to.",
+        "**The required-table list is the plan's and nothing more.** The interval quiescence "
+        "rule (P6-D5), the two interval controls (Phase 6 carry-forward item 6) and the "
+        "`results/e02/` reproducibility control (P6-D13) are all Phase 6 obligations that "
+        "this gate does **not** require a table for, because P6-D1 was registered before "
+        "they existed and adding predicates to a pre-registered gate after the artifacts "
+        "exist defeats the point of registering it. Their absence would be invisible here.",
+    ]
+    unverified = readout[readout["verdict"] == VERDICT_UNVERIFIED]
+    if not unverified.empty:
+        named = ", ".join(f"criterion {row.criterion}" for row in unverified.itertuples())
+        notes.append(
+            f"**{len(unverified)} predicate(s) are UNVERIFIED, which is not a pass**: "
+            f"{named}. An unmeasured predicate is an unmeasured gate."
+        )
+    if audit is not None and not audit.empty:
+        orphans = audit[audit["table_id"] == ""]
+        if not orphans.empty:
+            lines = ", ".join(str(line) for line in orphans["line"].tolist()[:8])
+            notes.append(
+                f"**{len(orphans)} table(s) carry no provenance marker** (document line(s) "
+                f"{lines}). A table nobody can trace to a CSV is exactly what predicate 3 "
+                f"exists to catch, and it is counted as a failure rather than skipped."
+            )
+        filtered = int(audit["filtered"].sum())
+        if filtered:
+            notes.append(
+                f"{filtered} of {len(audit)} rendered table(s) declare a `select` filter, so "
+                f"P6-D1's literal predicate 4 does not apply to them and the two weaker "
+                f"sub-checks carried the verdict there."
+            )
+    return tuple(notes)
+
+
+def build_gate6_markdown(
+    readout: pd.DataFrame,
+    *,
+    audit: pd.DataFrame | None = None,
+    results_dir: Path | None = None,
+) -> str:
+    """Render the Gate 6 read-out as Markdown.
+
+    Args:
+        readout: The frame from :func:`gate6_readout`.
+        audit: The frame from :func:`gate6_table_audit`, rendered as its own section when
+            given.
+        results_dir: Directory the document and CSVs were read from, for the provenance
+            line.
+
+    Returns:
+        The rendered Markdown document.
+
+    Raises:
+        ValueError: If ``readout`` is empty -- an empty gate document reads as "nothing
+            failed".
+    """
+    if readout.empty:
+        raise ValueError("refusing to render an empty Gate 6 read-out")
+    where = "beside this document" if results_dir is None else f"`{_display_dir(results_dir)}`"
+    passed = int((readout["verdict"] == VERDICT_PASS).sum())
+    total = len(readout)
+    headline = "PASS" if passed == total else "NOT PASSED"
+    parts: list[str] = [
+        "# Gate 6 read-out",
+        "",
+        "Simulated results only. Gate 6: **`results/results.md` regenerated end-to-end by "
+        "`make eval`, containing every table above, every number traceable to a CSV in "
+        "`results/`** (`docs/IMPLEMENTATION_PLAN.md` Phase 6). Unlike Gates 3-5 it is a "
+        "process criterion with no threshold and no cell, so `docs/protocol.md` P6-D1 "
+        "registered it as seven artifact predicates before this machinery existed. Those "
+        "seven, in that numbering, are what is evaluated below.",
+        "",
+        f"Read over {GATE6_RESULTS_MD} and the CSVs in {where}.",
+        "",
+        "## Outcome",
+        "",
+        f"**{headline}**: {passed} of {total} pre-registered predicates satisfied.",
+        "",
+        to_markdown(readout[["criterion", "statement", "verdict", "n_failed", "detail"]]),
+        "",
+        "## The provenance contract",
+        "",
+        "Predicates 3 and 4 are checkable only if the document says, per table, where its "
+        "numbers came from. The renderer must emit, as the last non-blank line before every "
+        "Markdown table:",
+        "",
+        "```",
+        GATE6_MARKER_SPEC,
+        "```",
+        "",
+        "`source` is a path relative to the results directory; `csv_rows` is that file's row "
+        "count; `rows` is the number of body rows the table renders; `select` is a "
+        "human-readable description of the filter applied, and its **absence is a claim** "
+        "that the table is the whole CSV, which is the case P6-D1's predicate 4 is read "
+        "literally on.",
+        "",
+    ]
+    if audit is not None and not audit.empty:
+        parts += [
+            "## Per-table audit",
+            "",
+            "The evidence predicates 3, 4, 6 and 7 are computed from. A failure is read "
+            "here, at the table that caused it, rather than at the summary above.",
+            "",
+            to_markdown(
+                audit[
+                    [
+                        "table_id",
+                        "section",
+                        "source",
+                        "source_exists",
+                        "csv_rows_stated",
+                        "csv_rows_actual",
+                        "rows_stated",
+                        "rows_rendered",
+                        "filtered",
+                        "problems",
+                    ]
+                ]
+            ),
+            "",
+        ]
+    notes = gate6_notes(readout, audit)
+    parts += ["## Notes", "", *[f"- {note}" for note in notes], ""]
+    return "\n".join(parts)
+
+
+def read_gate6_inputs(
+    results_dir: Path,
+    *,
+    eval_exit_code: int | None = None,
+    rerender: bool = True,
+    repo_root: Path | None = None,
+) -> Gate6Evidence:
+    """Gather everything the seven predicates need, in one IO pass.
+
+    The only function in this section that touches disk. It reads ``results.md``, parses its
+    tables, counts the rows of every CSV a marker names, and -- unless asked not to --
+    re-renders the document from those same CSVs into a temporary directory so that
+    predicate 2 is a measurement rather than an assumption.
+
+    **Re-rendering is cheap and does not touch the GPU**: it reads committed CSVs and writes
+    Markdown. It also never writes into ``results_dir``.
+
+    Args:
+        results_dir: Directory holding ``results.md`` and the CSVs it cites.
+        eval_exit_code: Exit status of ``make eval``, if the caller ran it. None leaves
+            predicate 1 UNVERIFIED, which is not a pass.
+        rerender: Whether to attempt the regeneration check for predicate 2.
+        repo_root: Where ``artifacts/corpus/`` and ``artifacts/checkpoints/`` are looked
+            for. Defaults to the current working directory.
+
+    Returns:
+        The evidence, ready for :func:`gate6_readout`.
+
+    Raises:
+        FileNotFoundError: If ``results_dir`` does not exist. A missing *document* is a
+            predicate 2 failure and is reported as one; a missing *directory* is a caller
+            error, because it means the gate was pointed somewhere else entirely.
+    """
+    if not results_dir.exists():
+        raise FileNotFoundError(
+            f"{results_dir} does not exist; Gate 6 is read over a directory of committed "
+            f"artifacts, and pointing it at a missing one would report every predicate as "
+            f"failed for the wrong reason"
+        )
+    document = results_dir / GATE6_RESULTS_MD
+    text = document.read_text(encoding="utf-8") if document.exists() else ""
+    tables = parse_rendered_tables(text)
+    counts: dict[str, int] = {}
+    for table in tables:
+        if not table.source or table.source in counts:
+            continue
+        path = results_dir / table.source
+        if path.exists():
+            counts[table.source] = int(len(pd.read_csv(path)))
+    root = Path.cwd() if repo_root is None else repo_root
+    matches: bool | None = None
+    error = ""
+    if not document.exists():
+        error = f"{GATE6_RESULTS_MD} is not there to compare against"
+    elif not rerender:
+        error = "the regeneration check was disabled by the caller (--no-rerender)"
+    else:
+        matches, error = _rerender_matches(results_dir, text)
+    return Gate6Evidence(
+        results_dir=results_dir,
+        results_md_exists=document.exists(),
+        tables=tables,
+        csv_row_counts=counts,
+        eval_exit_code=eval_exit_code,
+        corpus_present=(root / "artifacts" / "corpus").exists(),
+        checkpoints_present=(root / "artifacts" / "checkpoints").exists(),
+        rerender_matches=matches,
+        rerender_error=error,
+    )
+
+
+def _rerender_matches(results_dir: Path, committed: str) -> tuple[bool | None, str]:
+    """Re-render ``results.md`` from the committed CSVs and compare it byte for byte.
+
+    This is what makes "not hand-edited" checkable. It also imposes a requirement on the
+    renderer that is worth stating: ``results.md`` must be a **deterministic function of the
+    CSVs**. A timestamp, a hostname or a wall-clock figure in the document would make this
+    check fail on a document nobody had touched.
+
+    Args:
+        results_dir: Directory of committed CSVs.
+        committed: The committed document's text.
+
+    Returns:
+        ``(matches, detail)``. ``matches`` is None when the comparison could not be made at
+        all, which the read-out reports as UNVERIFIED rather than as either verdict.
+    """
+    from dmf.eval.report import build_results_report
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / GATE6_RESULTS_MD
+        try:
+            build_results_report(results_dir, out)
+        except NotImplementedError:
+            return None, (
+                "dmf.eval.report.build_results_report is not implemented yet, so the "
+                "document cannot be regenerated from its CSVs"
+            )
+        except Exception as exc:  # noqa: BLE001 - a renderer crash is a finding, not a stack trace
+            return False, f"the renderer raised {type(exc).__name__}: {exc}"
+        rendered = out.read_text(encoding="utf-8")
+    if rendered == committed:
+        return True, ""
+    committed_lines = committed.splitlines()
+    rendered_lines = rendered.splitlines()
+    for index, (left, right) in enumerate(zip(committed_lines, rendered_lines, strict=False), 1):
+        if left != right:
+            return False, (
+                f"first difference at line {index}: committed {left!r}, regenerated {right!r}"
+            )
+    return False, (
+        f"the documents agree on their first {min(len(committed_lines), len(rendered_lines))} "
+        f"line(s) but differ in length: committed {len(committed_lines)}, regenerated "
+        f"{len(rendered_lines)}"
+    )
+
+
+def write_gate6_report(
+    results_dir: Path,
+    out_dir: Path | None = None,
+    *,
+    eval_exit_code: int | None = None,
+    rerender: bool = True,
+    repo_root: Path | None = None,
+) -> tuple[pd.DataFrame, Path, Path]:
+    """Gather the evidence, compute the read-out and the table audit, and write both.
+
+    Args:
+        results_dir: Directory holding ``results.md`` and its CSVs.
+        out_dir: Where to write ``gate6.csv``, ``gate6_tables.csv`` and ``gate6.md``.
+            Defaults to ``results_dir``.
+        eval_exit_code: Exit status of ``make eval``, if the caller ran it.
+        rerender: Whether to attempt the regeneration check for predicate 2.
+        repo_root: Where the ``artifacts/`` preconditions are looked for.
+
+    Returns:
+        ``(readout, csv_path, markdown_path)``.
+
+    Raises:
+        FileNotFoundError: If ``results_dir`` does not exist.
+    """
+    destination = results_dir if out_dir is None else out_dir
+    evidence = read_gate6_inputs(
+        results_dir, eval_exit_code=eval_exit_code, rerender=rerender, repo_root=repo_root
+    )
+    readout = gate6_readout(evidence)
+    audit = gate6_table_audit(evidence)
+    csv_path = write_table(readout, destination / "gate6.csv")
+    if not audit.empty:
+        write_table(audit, destination / "gate6_tables.csv")
+    markdown_path = destination / "gate6.md"
+    markdown_path.write_text(
+        build_gate6_markdown(readout, audit=audit, results_dir=results_dir), encoding="utf-8"
     )
     return readout, csv_path, markdown_path

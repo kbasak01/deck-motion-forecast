@@ -231,7 +231,7 @@ class ARForecaster(BaseForecaster):
         )
         self.set_coefficients(weight, bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _predict(self, x: Tensor) -> Tensor:
         """Apply the fitted coefficient matrices.
 
         The **full** ``(B, L, C_in)`` window is accepted whatever ``n_input_used`` is; the

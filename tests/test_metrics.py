@@ -78,7 +78,14 @@ from dmf.data.dataset import DeckMotionDataset, resolve_columns
 from dmf.data.normalize import is_train_partition
 from dmf.data.splits import Regime, build_split
 from dmf.data.windows import window_spec_from_config
-from dmf.eval.controls import persistence_pipeline_sanity, shuffle_control, untrained_control
+from dmf.eval.controls import (
+    CONTROL_COLUMNS,
+    dataset_floored_dofs,
+    floored_dofs,
+    persistence_pipeline_sanity,
+    shuffle_control,
+    untrained_control,
+)
 from dmf.eval.gate import (
     GATE4_COLUMNS,
     GATE4_DEEP_MODELS,
@@ -206,6 +213,29 @@ class _Oracle(nn.Module):
         self.max_horizon = max_horizon
         self.n_targets = n_targets
         self.register_buffer("answer", answer)
+
+    def forward(self, x: Tensor) -> Tensor:
+        del x
+        return self.answer
+
+
+class _ChannelOracle(nn.Module):
+    """Cheats on the named target channels and emits the window mean on the rest.
+
+    Lets a control be aimed at one channel: the cheating channels blow past any tolerance
+    while every other cell sits exactly on the null, so what the control does or does not
+    raise about is unambiguous.
+    """
+
+    def __init__(
+        self, max_horizon: int, n_targets: int, answer: Tensor, cheat_channels: Sequence[int]
+    ) -> None:
+        super().__init__()
+        self.max_horizon = max_horizon
+        self.n_targets = n_targets
+        mask = torch.zeros(n_targets, dtype=answer.dtype)
+        mask[list(cheat_channels)] = 1.0
+        self.register_buffer("answer", answer * mask)
 
     def forward(self, x: Tensor) -> Tensor:
         del x
@@ -1151,6 +1181,290 @@ def test_shuffle_control_catches_a_subject_that_still_knows_the_future(
         )
 
 
+# ---------------------------------------------------------------------------------------
+# The shuffle control's residual-floor scope (docs/protocol.md P6-D11, correcting P3-D18).
+#
+# The narrowing is derived from the P1-D2 floor -- roll clamped at 180 deg, pitch at 90 deg
+# -- applied to the headings of the partition actually being scored. The tests below check
+# the derivation on the real regimes, check that a floored cell over tolerance is REPORTED
+# rather than raised on, and check that the narrowing did not disarm the control on the
+# channels that carry signal.
+# ---------------------------------------------------------------------------------------
+
+#: Both corpus spellings of the six target channels, so the derivation is checked in the
+#: `imu` observation mode too -- that mode's rows are labelled `pitch_imu`, and a set built
+#: from the `ideal` spellings alone would silently assert on them.
+_IDEAL_DOFS: tuple[str, ...] = ("roll", "pitch", "heave", "roll_rate", "pitch_rate", "heave_rate")
+_IMU_DOFS: tuple[str, ...] = tuple(f"{name}_imu" for name in _IDEAL_DOFS)
+
+
+def _key(
+    heading_deg: float, vessel: str = "frigate", seed: int = 0
+) -> tuple[str, float, float, str, int]:
+    """Build one realization key at a chosen heading, for the synthetic floor cases."""
+    return ("SS5", float(heading_deg), 12.0, vessel, seed)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("regime", ["id", "unseen_seastate", "unseen_heading", "unseen_vessel"])
+def test_residual_floor_set_on_the_real_regimes(
+    real_manifest: pd.DataFrame, regime: Regime
+) -> None:
+    """The floored set on the production corpus is pitch under `unseen_heading`, and nothing else.
+
+    P6-D11 narrowed the shuffle control's assertion to the cells whose test-set signal is
+    not on its P1-D2 floor. The narrowing is only defensible if it is small and derived: on
+    this corpus exactly two of the twenty-four (regime, DOF) cells are excluded, and the
+    three other regimes -- including `unseen_vessel`, whose hull is a different YAML -- lose
+    nothing at all.
+    """
+    split = build_split(real_manifest, regime)
+    expected = {"pitch", "pitch_rate"} if regime == "unseen_heading" else set()
+    assert set(floored_dofs(_IDEAL_DOFS, split.test_keys)) == expected
+    assert set(floored_dofs(_IMU_DOFS, split.test_keys)) == {f"{n}_imu" for n in expected}
+
+
+@pytest.mark.slow
+def test_no_real_regime_floors_a_channel_in_training(real_manifest: pd.DataFrame) -> None:
+    """No regime trains exclusively on floored data, which is why the mismatch exists at all.
+
+    The P6-D11 mechanism is a train/test amplitude mismatch: the shuffled model carries a
+    fitted pitch amplitude from headings where pitch is real and imposes it on a test set
+    where it is not. That story requires the training side to be unfloored everywhere, so
+    it is asserted rather than assumed.
+    """
+    for regime in ("id", "unseen_seastate", "unseen_heading", "unseen_vessel"):
+        split = build_split(real_manifest, regime)
+        assert floored_dofs(_IDEAL_DOFS, split.train_keys) == frozenset()
+
+
+def test_residual_floor_set_names_roll_in_head_seas() -> None:
+    """The rule is the floor's definition, not a hard-coded `(unseen_heading, pitch)` pair.
+
+    No regime holds out 180 deg, so roll is never floored on this corpus -- but if one did,
+    the same derivation would name roll and its rate. Checking that is what distinguishes a
+    derived rule from a list of the cells that happened to fail.
+    """
+    head_seas = [_key(180.0, seed=i) for i in range(3)]
+    assert set(floored_dofs(_IDEAL_DOFS, head_seas)) == {"roll", "roll_rate"}
+    beam_seas = [_key(90.0, seed=i) for i in range(3)]
+    assert set(floored_dofs(_IDEAL_DOFS, beam_seas)) == {"pitch", "pitch_rate"}
+    # Heave has no heading factor to be clamped by, at any heading.
+    assert "heave" not in floored_dofs(_IDEAL_DOFS, head_seas + beam_seas)
+
+
+def test_one_unfloored_heading_in_the_partition_restores_the_assertion() -> None:
+    """A channel is floored only if it is floored at *every* realization scored.
+
+    One 45 deg realization in an otherwise beam-seas partition puts real pitch signal in the
+    test set, and the control must go back to asserting on it. The permissive reading -- any
+    floored heading present -- would let a mostly-unfloored partition switch the control off.
+    """
+    mixed = [_key(90.0, seed=0), _key(90.0, seed=1), _key(45.0, seed=2)]
+    assert floored_dofs(_IDEAL_DOFS, mixed) == frozenset()
+
+
+def test_residual_floor_set_rejects_an_empty_partition() -> None:
+    """An empty partition floors everything vacuously; that must raise, not disarm."""
+    with pytest.raises(ValueError, match="empty partition"):
+        floored_dofs(_IDEAL_DOFS, [])
+
+
+def test_dataset_floored_dofs_reads_the_partition_being_scored(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """The set follows the dataset's own realizations, not the regime's name."""
+    beam = _dataset(small_corpus, small_manifest, small_data_cfg, "unseen_heading", "test")
+    assert set(dataset_floored_dofs(beam)) == {"pitch", "pitch_rate"}
+    for regime in ("id", "unseen_seastate", "unseen_vessel"):
+        other = _dataset(small_corpus, small_manifest, small_data_cfg, regime, "test")
+        assert dataset_floored_dofs(other) == frozenset()
+    # The training side of the held-out-heading regime is 135/45 deg and is not floored,
+    # which is the asymmetry the whole phenomenon rests on.
+    train = _dataset(small_corpus, small_manifest, small_data_cfg, "unseen_heading", "train")
+    assert dataset_floored_dofs(train) == frozenset()
+
+
+def test_shuffle_control_reports_but_does_not_raise_on_a_floored_cell(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """A floored cell far over tolerance is written, flagged, and not asserted on.
+
+    The subject here is handed the exact answer on pitch and pitch_rate -- an excess of
+    ~1.0, fifty times the tolerance. Under P6-D11 the control still computes and writes
+    those rows, marks them `asserted=False`, and passes on the strength of the four
+    channels that carry signal. The row must be *visible*: an excluded cell that vanished
+    from the CSV would be a dropped result (CLAUDE.md non-negotiable 6).
+    """
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "unseen_heading", "test")
+    horizon, targets = dataset.window_spec.max_horizon, len(dataset.target_columns)
+    pitch = [i for i, name in enumerate(dataset.target_columns) if name.startswith("pitch")]
+    assert pitch, dataset.target_columns
+    # The exclusion is announced even though the control passes: a narrowing nobody sees is
+    # indistinguishable from a control that was never run.
+    with pytest.warns(RuntimeWarning, match="residual floor"):
+        result = shuffle_control(
+            dataset,
+            shuffled_model=_ChannelOracle(horizon, targets, _oracle_answer(dataset), pitch),
+            window_mean_model=_WindowMean(horizon, targets),
+            persistence_model=_Persistence(horizon, targets),
+            regime="unseen_heading",
+            horizons=SMALL_REPORTED_HORIZONS,
+            fs_hz=FS_HZ,
+            strict=True,
+            batch_size=len(dataset),
+        )
+    assert result.passed
+    assert result.excluded_dofs == ("pitch", "pitch_rate")
+    assert "P6-D11" in result.exclusion_reason
+    # Every cell is still in the table, and the excluded ones still carry their own verdict.
+    assert len(result.rows) == targets * len(SMALL_REPORTED_HORIZONS)
+    reported_only = result.reported_only_rows
+    assert set(reported_only["dof"]) == {"pitch", "pitch_rate"}
+    assert not reported_only["passed"].any()
+    assert result.worst_excess_reported_only is not None
+    assert result.worst_excess_reported_only > 10.0 * result.tol
+    # ... and the headline statistic is the asserted one, uncontaminated by them.
+    assert result.worst_excess == pytest.approx(0.0, abs=1e-9)
+    assert set(result.asserted_rows["dof"]) == set(dataset.target_columns) - {
+        "pitch",
+        "pitch_rate",
+    }
+
+
+def test_shuffle_control_still_raises_on_an_unfloored_cell_in_the_same_regime(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """The converse: the narrowing must not disarm the control.
+
+    Same regime, same partition, same tolerance as the test above -- only the cheating
+    channel moves, from floored pitch to unfloored roll. It raises, and the message names
+    both the cell that failed and the exclusion that was applied, so a reader of a passing
+    run cannot miss that cells were excluded.
+    """
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "unseen_heading", "test")
+    horizon, targets = dataset.window_spec.max_horizon, len(dataset.target_columns)
+    roll = [i for i, name in enumerate(dataset.target_columns) if name.startswith("roll")]
+    with pytest.warns(RuntimeWarning), pytest.raises(AssertionError, match="shuffle") as excinfo:
+        shuffle_control(
+            dataset,
+            shuffled_model=_ChannelOracle(horizon, targets, _oracle_answer(dataset), roll),
+            window_mean_model=_WindowMean(horizon, targets),
+            persistence_model=_Persistence(horizon, targets),
+            regime="unseen_heading",
+            horizons=SMALL_REPORTED_HORIZONS,
+            fs_hz=FS_HZ,
+            batch_size=len(dataset),
+        )
+    message = str(excinfo.value)
+    assert "roll" in message
+    assert "pitch" in message and "P6-D11" in message
+
+
+def test_shuffle_control_asserts_on_every_cell_where_nothing_is_floored(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """On `id` the narrowing is a no-op: every row is asserted on."""
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "id", "test")
+    horizon, targets = dataset.window_spec.max_horizon, len(dataset.target_columns)
+    result = shuffle_control(
+        dataset,
+        shuffled_model=_WindowMean(horizon, targets),
+        window_mean_model=_WindowMean(horizon, targets),
+        persistence_model=_Persistence(horizon, targets),
+        regime="id",
+        horizons=SMALL_REPORTED_HORIZONS,
+        fs_hz=FS_HZ,
+        batch_size=256,
+    )
+    assert result.excluded_dofs == ()
+    assert result.exclusion_reason == ""
+    assert bool(result.rows["asserted"].all())
+    assert result.reported_only_rows.empty
+    assert result.worst_excess_reported_only is None
+
+
+def test_a_control_row_says_whether_a_failure_would_have_stopped_the_run(
+    small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
+) -> None:
+    """`asserted` and `enforced` are different questions and are not collapsed.
+
+    `asserted` says whether the row decided its control's verdict; `enforced` says whether
+    that verdict raises. The untrained control is the case that makes the distinction
+    load-bearing: every one of its rows is asserted on, and the sweep driver runs it with
+    ``strict=False`` (P3-D9), so its verdict is computed, written, read -- and stops nothing.
+    Before the column existed that was a paragraph, and a reader filtering the CSV for
+    ``passed == False`` never sees a paragraph.
+    """
+    dataset = _dataset(small_corpus, small_manifest, small_data_cfg, "id", "test")
+    horizon, targets = dataset.window_spec.max_horizon, len(dataset.target_columns)
+    enforced = shuffle_control(
+        dataset,
+        shuffled_model=_WindowMean(horizon, targets),
+        window_mean_model=_WindowMean(horizon, targets),
+        persistence_model=_Persistence(horizon, targets),
+        regime="id",
+        horizons=SMALL_REPORTED_HORIZONS,
+        fs_hz=FS_HZ,
+        batch_size=256,
+    )
+    assert enforced.enforced
+    assert bool(enforced.rows["enforced"].all())
+
+    reported = untrained_control(
+        dataset,
+        # A model that beats persistence: the control fails, and with strict=False it
+        # reports rather than raises -- exactly the shipped configuration.
+        untrained_model=_Oracle(horizon, targets, _oracle_answer(dataset)),
+        persistence_model=_Persistence(horizon, targets),
+        regime="id",
+        horizons=SMALL_REPORTED_HORIZONS,
+        fs_hz=FS_HZ,
+        batch_size=len(dataset),
+        strict=False,
+    )
+    assert not reported.passed
+    assert not reported.enforced
+    assert not bool(reported.rows["enforced"].any())
+    # Asserted and unenforced at once: every cell counted toward a verdict that raised
+    # nothing. Collapsing the two columns would lose exactly this row.
+    assert bool(reported.rows["asserted"].all())
+    assert list(CONTROL_COLUMNS).index("asserted") < list(CONTROL_COLUMNS).index("enforced")
+
+
+def test_committed_gate4_control_record_is_unchanged_by_the_narrowing() -> None:
+    """The P6-D11 change cannot retroactively alter the Gate 4 record.
+
+    Every shuffle row in `results/e02/baselines_controls.csv` was produced at L=200 and
+    passed, so narrowing the assertion cannot flip that file's outcome in either direction.
+    Asserted here against the committed file rather than argued: the two rows the narrowing
+    would now exclude are present and passing, and the verdict computed under the new scope
+    is identical to the verdict computed under the old one.
+    """
+    committed = Path(__file__).resolve().parents[1] / "results" / "e02" / "baselines_controls.csv"
+    if not committed.exists():  # pragma: no cover -- present in the repo
+        pytest.skip(f"no committed control record at {committed}")
+    rows = pd.read_csv(committed)
+    shuffle = rows[rows["control"] == "shuffle"]
+    assert not shuffle.empty
+    assert bool(shuffle["passed"].all()), shuffle[~shuffle["passed"]]
+    would_exclude = shuffle[
+        (shuffle["regime"] == "unseen_heading") & shuffle["dof"].str.startswith("pitch")
+    ]
+    assert not would_exclude.empty
+    assert bool(would_exclude["passed"].all())
+    # Old verdict (all rows) and new verdict (asserted rows only) agree, because all passed.
+    old = bool(shuffle["passed"].all())
+    new = bool(shuffle.drop(would_exclude.index)["passed"].all())
+    assert old == new is True
+    # The file predates both flag columns; nothing but those is added to it. `enforced`
+    # joined `asserted` in Phase 6, for a different question -- whether a failure would have
+    # stopped the run, rather than whether this row decided the verdict -- and neither can
+    # change a number in a committed record. `dmf.eval.assemble` backfills them when it
+    # reads this file, which is why the committed file is left exactly as it was.
+    assert set(rows.columns) == set(CONTROL_COLUMNS) - {"asserted", "enforced"}
+
+
 def test_untrained_control_catches_a_model_that_beats_persistence(
     small_corpus: Path, small_manifest: pd.DataFrame, small_data_cfg: DataConfig
 ) -> None:
@@ -1681,6 +1995,39 @@ def test_baselines_markdown_names_every_artifact_it_was_built_from() -> None:
     )
     for name, what in BASELINES_ARTIFACTS:
         assert f"`results/imu/{name}` ({what})" in rendered
+
+
+def test_baselines_markdown_separates_asserted_from_reported_only_controls() -> None:
+    """A cell the control declined to assert on is rendered, not folded into the verdict.
+
+    Both halves matter. If the excluded row entered the summary, a run that P6-D11 says is
+    clean would read as failed; if it were dropped, a 5% excess would be invisible in the
+    document. It appears in its own table with its own number.
+    """
+    table = _gate_table("ideal")
+    controls = pd.DataFrame(
+        {
+            "control": ["shuffle", "shuffle"],
+            "regime": ["unseen_heading", "unseen_heading"],
+            "subject_model": ["shuffled", "shuffled"],
+            "null_model": ["window_mean", "window_mean"],
+            "dof": ["roll", "pitch"],
+            "excess": [0.001, 0.0552],
+            "tol": [0.02, 0.02],
+            "asserted": [True, False],
+            "passed": [True, False],
+        }
+    )
+    rendered = build_baselines_markdown(
+        table, controls=controls, with_contrasts=False, results_dir=Path("results/e04")
+    )
+    assert "Cells reported but not asserted on" in rendered
+    assert "P6-D11" in rendered
+    assert "0.0552" in rendered
+    # The verdict line is the asserted one: the excluded row does not make the control fail.
+    summary, _, reported_only = rendered.partition("### Cells reported but not asserted on")
+    assert "0.0552" not in summary
+    assert "0.0552" in reported_only
 
 
 def test_baselines_markdown_does_not_cite_a_controls_file_that_was_not_written() -> None:

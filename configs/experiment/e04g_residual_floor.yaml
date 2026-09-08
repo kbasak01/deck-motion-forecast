@@ -1,0 +1,39 @@
+# Phase 6 -- the probabilistic FLOOR that Phase 5 never had (docs/protocol.md P6-D6).
+#
+# `results/e03/probabilistic.csv` holds six learned heads and no trivial comparator, so
+# "102 of 216 cells in band" has no reference and CLAUDE.md non-negotiable 4 has no analogue
+# on the coverage axis. `residual_interval` supplies it: a `dlinear_ols` point forecast plus
+# per-(dof, horizon) empirical residual quantiles taken from the VALIDATION split.
+#
+# Why it is the right floor and not a straw man: it is UNCONDITIONAL -- the interval width at
+# a given cell is identical for every window. On `id` that makes it near-perfectly calibrated
+# by construction, with no learning at all. A head beats it only by making its interval
+# conditional: narrow where the deck is predictable, wide where it is not. A head that matches
+# it on coverage AND on width has learned nothing about its own uncertainty however good its
+# PICP looks alone.
+#
+# Every model here is closed-form or trivial, so this config costs minutes and carries no
+# seed variance (P3-D10). The three seeds are required by `load_experiment` and ignored.
+#
+# `persistence` first: it is the skill denominator and `evaluate_models` requires it.
+name: e04g_residual_floor
+data: ../data/default.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/dlinear_ols.yaml
+  - ../model/residual_interval.yaml
+
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [id, unseen_seastate, unseen_heading, unseen_vessel]

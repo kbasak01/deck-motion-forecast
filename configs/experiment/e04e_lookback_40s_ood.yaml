@@ -1,0 +1,48 @@
+# Phase 6.3 ablation arm e -- lookback -- 40 s instead of 20 s (closed-form vehicles, OOD regimes).
+#
+# The binding arm of the lookback ablation: its 1091 origins are the set the other two are
+# truncated to. Uses `tcn_l400`, not `tcn`: the receptive field must be >= lookback
+# (`CLAUDE.md` Known traps) and the L=200 dilation ladder reaches only 253. The extra
+# dilation stage changes the parameter count, which is reported beside the rows rather than
+# presented as a matched comparison (P6-D4 item 2).
+#
+# The `train` block is byte-identical to `configs/experiment/e02_deep.yaml`: epochs 60,
+# batch 1024, lr 2e-3, patience 15, bf16. One budget, one schedule, one stopping rule, so the
+# arms differ in the DATA definition and in nothing else. Changing it would make this a
+# comparison of two training regimes wearing an ablation's name.
+#
+# The reference arm is NOT re-run. `results/e02/` already fitted `tcn` (3 seeds) and
+# `dlinear_ols` on every regime under this exact train block and `configs/data/default.yaml`;
+# its committed rows are read, never regenerated (docs/IMPLEMENTATION_PLAN.md Phase 6
+# carry-forward item 7). The one exception is the lookback ablation, where the reference is
+# re-SCORED from e02's checkpoints on the window-matched origin set (P6-D4 item 1) -- a
+# forward pass, not a refit.
+#
+# `persistence` must be first: it is the skill-score denominator and
+# `dmf.eval.runner.evaluate_models` requires it.
+#
+# The closed-form half of arm e. `tcn` is absent deliberately: it is budgeted for `id` and
+# `unseen_seastate` only, and the deterministic vehicles here cost minutes, so this file is
+# what makes the linear reading of every ablation four-regime instead of two.
+name: e04e_lookback_40s_ood
+data: ../data/lookback_40s.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p20.yaml
+  - ../model/dlinear_ols.yaml
+
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [unseen_heading, unseen_vessel]

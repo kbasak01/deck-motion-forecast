@@ -1,0 +1,24 @@
+# Phase 6.3 ablation arm: channels -- attitude only, no rates
+#
+# Differs from `configs/data/default.yaml` in `target_dofs` and `input_channels` and nothing else, so the contrast
+# isolates one variable. Read `docs/protocol.md` P6-D4 for what is and is not matched across
+# arms before comparing any two of these tables.
+#
+# "Attitude" is the three position DOFs, matching `configs/model/ar_attitude_only.yaml`'s
+# `n_input_used: 3` -- the first three channels of the canonical order. The reference arm
+# forecasts all six; this arm forecasts three, so the contrast is read on roll/pitch/heave only
+# and the rate rows do not exist here rather than being imputed (P6-D4 item 3).
+#
+# Consequence worth stating: the quiescence metric CANNOT be evaluated on this arm.
+# `dmf.eval.quiescence.detect_quiescent_mask` thresholds |heave_rate|, which this task
+# definition does not forecast -- the exact deficiency P3-D4 revised the task to remove.
+# This arm is an accuracy ablation only.
+fs_hz: 10.0
+lookback: 200
+horizons: [10, 20, 30, 50, 100, 150]
+target_dofs: [roll, pitch, heave]
+input_channels: [roll, pitch, heave]
+stride: 5
+observation_mode: ideal
+revin: false
+condition_on_sea_state: false

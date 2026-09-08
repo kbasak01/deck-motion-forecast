@@ -1,0 +1,23 @@
+# Phase 6.3 ablation arm: normalization -- RevIN instead of plain de-meaning
+#
+# Differs from `configs/data/default.yaml` in `revin` and nothing else, so the contrast
+# isolates one variable. Read `docs/protocol.md` P6-D4 for what is and is not matched across
+# arms before comparing any two of these tables.
+#
+# `dmf.data.normalize.RevIN` existed unwired from Phase 0 until Phase 6. `affine: true` adds
+# `2 * C_in` learnable parameters, so this arm is not exactly parameter-matched either; the
+# delta is 12 parameters against 60 300 (dlinear_ols) and 196 804 (tcn), i.e. negligible but
+# reported rather than rounded away.
+#
+# `condition_on_sea_state` MUST stay false here. RevIN normalises the whole (B, L, C_in)
+# window, and a sea-state indicator is constant along time, so its per-window std is 0 and
+# the feature is silently zeroed. `load_data` refuses the combination (P6-D8 defect 3).
+fs_hz: 10.0
+lookback: 200
+horizons: [10, 20, 30, 50, 100, 150]
+target_dofs: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
+stride: 5
+observation_mode: ideal
+revin: true
+condition_on_sea_state: false

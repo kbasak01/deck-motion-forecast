@@ -51,3 +51,11 @@ input_channels: [roll, pitch, heave, roll_rate, pitch_rate, heave_rate]
 stride: 5
 observation_mode: ideal            # or `imu`; never mix an imu input with an ideal target (P1-D6)
 revin: false
+
+# Sea-state conditioning (Phase 6.3 ablation, off here; `ss_conditioned.yaml` turns it on).
+# When true, dmf.data.dataset.DeckMotionDataset appends a one-hot sea-state indicator --
+# one column per sea state in the corpus manifest, sorted label order -- AFTER every motion
+# channel. Appended, never interleaved, so `target_dofs` stays a prefix of the motion inputs
+# and the P2-D4 persistence guard still holds. The indicator is not de-meaned and not scaled
+# by NormStats: it is constant within a window, so per-window de-meaning would zero it out.
+condition_on_sea_state: false

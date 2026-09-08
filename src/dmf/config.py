@@ -36,6 +36,34 @@ ObservationMode = Literal["ideal", "imu"]
 #: ``tests/test_models.py`` asserts the two lists agree.
 _REGIME_NAMES: tuple[str, ...] = ("id", "unseen_seastate", "unseen_heading", "unseen_vessel")
 
+#: Refusal message for the one illegal combination of data-config flags. Stated once and
+#: raised from both :meth:`DataConfig.__post_init__` and :func:`load_data`, so neither a
+#: YAML file nor a ``dataclasses.replace`` can construct it (``docs/protocol.md`` P6-D8).
+_REVIN_CONDITIONING_CONFLICT: str = (
+    "'revin' and 'condition_on_sea_state' cannot both be true. RevIN normalises the whole "
+    "(B, L, C_in) window inside the model's forward pass, and the sea-state indicator is "
+    "constant along the time axis, so its per-window standard deviation is 0 and "
+    "(x - mean) / (0 + eps) is exactly zero: the indicator is silently zeroed and nothing "
+    "raises. The arm would report 'sea-state conditioning has no effect' while never having "
+    "shown the model the sea state. Refused here because the failure is silent and the two "
+    "flags are one typo apart."
+)
+
+
+def _check_revin_conditioning(revin: bool, condition_on_sea_state: bool, where: str) -> None:
+    """Refuse the one flag combination that would silently destroy a feature.
+
+    Args:
+        revin: Value of ``DataConfig.revin``.
+        condition_on_sea_state: Value of ``DataConfig.condition_on_sea_state``.
+        where: Prefix for the error message, e.g. a config path, or ``""``.
+
+    Raises:
+        ValueError: If both flags are set.
+    """
+    if revin and condition_on_sea_state:
+        raise ValueError(f"{where}{_REVIN_CONDITIONING_CONFLICT}")
+
 
 @dataclass(frozen=True)
 class SeaState:
@@ -131,6 +159,15 @@ class DataConfig:
         stride: Step between consecutive window start indices, samples.
         observation_mode: Observation model applied before windowing.
         revin: If True, apply RevIN instead of plain per-window de-meaning.
+        condition_on_sea_state: If True, :class:`dmf.data.dataset.DeckMotionDataset`
+            appends a one-hot sea-state indicator to every input window, one column per
+            sea state present in the corpus manifest, in sorted label order. The columns
+            are **appended after all motion channels**, never interleaved, so that
+            ``target_dofs`` stays a prefix of the motion inputs and the P2-D4 guard in
+            :class:`dmf.models.persistence.Persistence` continues to hold. They are
+            dimensionless indicators and are neither de-meaned nor scaled. This is the
+            Phase 6.3 sea-state-conditioning ablation and is an **upper bound**: at
+            deployment the sea state is estimated online, not known.
     """
 
     fs_hz: float
@@ -141,6 +178,19 @@ class DataConfig:
     stride: int
     observation_mode: ObservationMode
     revin: bool
+    condition_on_sea_state: bool = False
+
+    def __post_init__(self) -> None:
+        """Refuse ``revin`` and ``condition_on_sea_state`` together.
+
+        Checked on the dataclass and not only in :func:`load_data` so that a
+        ``dataclasses.replace`` -- which is how every test and every ablation driver builds
+        a variant config -- cannot construct the combination either.
+
+        Raises:
+            ValueError: If both flags are set. See :data:`_REVIN_CONDITIONING_CONFLICT`.
+        """
+        _check_revin_conditioning(self.revin, self.condition_on_sea_state, "")
 
 
 @dataclass(frozen=True)
@@ -353,6 +403,15 @@ def load_data(path: Path) -> DataConfig:
     input channels, so any other ordering would make every baseline silently forecast the
     wrong channel. It is checked here rather than discovered later as a channel-order bug.
 
+    ``condition_on_sea_state`` does not weaken that guard, and this is the reason the
+    indicator is appended rather than prepended or interleaved. ``input_channels`` lists
+    **motion** channels only -- the one-hot columns are not corpus columns and cannot be
+    named here, since :func:`dmf.data.dataset.resolve_columns` would reject them -- and
+    :class:`dmf.data.dataset.DeckMotionDataset` places the indicator strictly after every
+    motion channel. The model therefore sees ``C_in = len(input_channels) + n_sea_states``
+    with the motion channels occupying positions ``0 .. len(input_channels) - 1``, so the
+    first ``C_out`` input channels are still exactly ``target_dofs``.
+
     Args:
         path: Path to a file under ``configs/data/``.
 
@@ -363,8 +422,10 @@ def load_data(path: Path) -> DataConfig:
         FileNotFoundError: If ``path`` does not exist.
         ValueError: If a required key is missing, if ``fs_hz``, ``lookback`` or ``stride``
             is not positive, if ``horizons`` is empty or not strictly ascending positive
-            integers, if ``observation_mode`` is not ``"ideal"`` or ``"imu"``, or if
-            ``target_dofs`` is not a prefix of ``input_channels``.
+            integers, if ``observation_mode`` is not ``"ideal"`` or ``"imu"``, if
+            ``target_dofs`` is not a prefix of ``input_channels``, or if ``revin`` and
+            ``condition_on_sea_state`` are both true (P6-D8: RevIN zeroes a time-constant
+            indicator silently, so the combination is refused rather than commented on).
     """
     raw = load_yaml(path)
     missing = {
@@ -376,6 +437,7 @@ def load_data(path: Path) -> DataConfig:
         "stride",
         "observation_mode",
         "revin",
+        "condition_on_sea_state",
     } - set(raw)
     if missing:
         raise ValueError(f"{path}: missing required keys {sorted(missing)}")
@@ -410,6 +472,10 @@ def load_data(path: Path) -> DataConfig:
             f"got target_dofs={list(target_dofs)}, input_channels={list(input_channels)}"
         )
 
+    revin = bool(raw["revin"])
+    condition_on_sea_state = bool(raw["condition_on_sea_state"])
+    _check_revin_conditioning(revin, condition_on_sea_state, f"{path}: ")
+
     observation_mode: ObservationMode = "imu" if mode == "imu" else "ideal"
     return DataConfig(
         fs_hz=fs_hz,
@@ -419,7 +485,8 @@ def load_data(path: Path) -> DataConfig:
         input_channels=input_channels,
         stride=stride,
         observation_mode=observation_mode,
-        revin=bool(raw["revin"]),
+        revin=revin,
+        condition_on_sea_state=condition_on_sea_state,
     )
 
 

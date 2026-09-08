@@ -3445,6 +3445,11 @@ def test_run_experiment_writes_a_joinable_probabilistic_artifact(
     # comparators are point forecasts (P5-D10).
     controls = pd.read_csv(results / "baselines_controls.csv")
     assert "untrained" in set(controls["control"]), sorted(set(controls["control"]))
+    # The P6-D11 scope column reaches the artifact, and on these two regimes -- neither of
+    # which holds out a heading -- nothing is on its P1-D2 residual floor, so the shuffle
+    # control still asserts on every cell it scored.
+    assert "asserted" in controls.columns
+    assert bool(controls["asserted"].all()), controls[~controls["asserted"]]
 
     for name in ("baselines.csv", "probabilistic.csv", "probabilistic_by_seed.csv"):
         assert (results / name).exists(), name
@@ -3591,3 +3596,511 @@ def test_the_gate5_readout_is_repo_code_reading_committed_artifacts(
     assert isinstance(gate5_reading_passes(readout, "A"), bool)
     with pytest.raises(ValueError, match="not in the read-out"):
         gate5_reading_passes(readout, "Z")
+
+
+# ---------------------------------------------------------------------------
+# RevIN wiring (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+def _revin_pair(**kwargs: object) -> tuple[BaseForecaster, BaseForecaster]:
+    """Return two identically initialised TCNs, one with RevIN and one without.
+
+    Both are built after the same :func:`dmf.train.set_seed` call, so their weights are
+    equal element for element and the only difference between them is the seam under test.
+    """
+    cfg = ModelConfig(
+        name="tcn",
+        head="point",
+        quantiles=(),
+        params={"dilations": [1, 2, 4, 8, 16, 32], "dropout": 0.0},
+        label="tcn",
+        **kwargs,  # type: ignore[arg-type]
+    )
+    spec = window_spec_from_config(PRODUCTION_CFG)
+    set_seed(0)
+    plain = build_model(cfg, spec, N_IN, N_OUT)
+    set_seed(0)
+    revin = build_model(cfg, spec, N_IN, N_OUT, revin=True)
+    plain.eval()
+    revin.eval()
+    return plain, revin
+
+
+def test_no_registered_model_defines_its_own_forward() -> None:
+    """RevIN lives in ``BaseForecaster.forward``; a model that overrides it opts out silently.
+
+    ``forward`` is the template method that applies the RevIN seam and calls ``_predict``.
+    A model defining its own ``forward`` would still build, still train and still score --
+    it would simply ignore its arm's ``revin: true`` and report the result as a RevIN row.
+    Nothing else in the project can detect that, so it is asserted here.
+    """
+    import dmf.models  # noqa: F401
+
+    offenders = [
+        f"{cls.__module__}.{cls.__qualname__}"
+        for cls in set(MODEL_REGISTRY.values())
+        if "forward" in vars(cls)
+    ]
+    assert offenders == [], f"{offenders} override forward; override _predict instead"
+    assert "forward" in vars(BaseForecaster) and "_predict" in vars(BaseForecaster)
+
+
+def test_revin_is_off_unless_the_arm_asks_for_it() -> None:
+    """``DataConfig.revin`` was dead code until Phase 6; the default must stay a no-op."""
+    plain, revin = _revin_pair()
+    assert plain.revin is None
+    assert revin.revin is not None
+    x = torch.randn(4, PRODUCTION_SPEC.lookback, N_IN)
+    assert torch.equal(plain.forward(x), plain(x))
+    torch.testing.assert_close(plain.forward(x), plain._predict(x))
+
+
+def test_revin_adds_two_parameters_per_input_channel() -> None:
+    """``affine=True`` is 2 * C_in numbers, and the budget column has to show them."""
+    plain, revin = _revin_pair()
+    assert revin.n_fitted_parameters - plain.n_fitted_parameters == 2 * N_IN
+    assert revin.revin is not None
+    assert sum(p.numel() for p in revin.revin.parameters()) == 2 * N_IN
+
+
+def test_revin_reaches_the_forward_the_eval_path_actually_calls() -> None:
+    """``dmf.eval.runner`` calls ``model.forward(x)``, not ``model(x)``.
+
+    A hook-based wiring fires on ``__call__`` only, so it would normalise during training
+    and skip normalisation during scoring -- a discrepancy that appears in no column of any
+    table. This asserts the two entry points agree *and* that the seam is on both.
+    """
+    plain, revin = _revin_pair()
+    x = torch.randn(4, PRODUCTION_SPEC.lookback, N_IN) * 3.0
+    assert torch.equal(revin.forward(x), revin(x))
+    assert not torch.allclose(revin.forward(x), plain.forward(x))
+
+
+def test_revin_inverse_agrees_with_the_layer_where_the_layer_applies() -> None:
+    """The hand-rolled inverse must be the layer's, not a second implementation of it.
+
+    :meth:`dmf.data.normalize.RevIN.inverse` accepts ``(B, H, C_in)`` only, so the base
+    class inverts against the layer's cached statistics itself to cover ``C_out < C_in`` and
+    the rank-4 heads. On the one geometry the layer does accept, the two must agree bitwise
+    -- otherwise the forward and inverse transforms have drifted apart, which shows up only
+    as a slightly worse number.
+    """
+    _, revin = _revin_pair()
+    assert revin.revin is not None
+    assert revin.n_target_channels == revin.n_input_channels
+    x = torch.randn(3, PRODUCTION_SPEC.lookback, N_IN) * 2.5 + 1.0
+    y = revin._predict(revin.revin(x))
+    assert torch.equal(revin._revin_inverse(y), revin.revin.inverse(y))
+
+
+def test_revin_makes_the_forecast_equivariant_to_window_amplitude() -> None:
+    """What RevIN adds here, stated as a property rather than as a docstring claim.
+
+    The dataset already de-means every window and divides by one train-split constant per
+    channel, so per-window *amplitude* survives into the model input. RevIN removes it and
+    restores it, which makes the forecast exactly homogeneous of degree one in the window's
+    scale -- ``f(a x) = a f(x)`` -- and the plain model is not.
+    """
+    plain, revin = _revin_pair()
+    x = torch.randn(4, PRODUCTION_SPEC.lookback, N_IN) * 5.0
+    torch.testing.assert_close(revin.forward(3.0 * x), 3.0 * revin.forward(x), rtol=2e-4, atol=2e-4)
+    assert not torch.allclose(plain.forward(3.0 * x), 3.0 * plain.forward(x), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("head", ["quantile", "gaussian"])
+def test_revin_inverts_the_rank_four_heads_on_the_right_axis(head: str) -> None:
+    """A fan is scaled level by level; a Gaussian's spread is scaled, not shifted.
+
+    The quantile branch must scale every level by the same window scale -- doing anything
+    else would reorder the fan -- and the Gaussian branch must put the scale in the
+    log-variance (``+2 log s``) and the offset nowhere near it, the same split
+    :meth:`dmf.models.heads.PredictiveDistribution.affine` makes.
+    """
+    quantiles = QUANTILE_FAN_9 if head == "quantile" else ()
+    cfg = ModelConfig(
+        name="tcn",
+        head=head,  # type: ignore[arg-type]
+        quantiles=quantiles,
+        params={"dilations": [1, 2, 4, 8, 16, 32], "dropout": 0.0},
+        label=f"tcn_{head}",
+    )
+    set_seed(0)
+    model = build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT, revin=True)
+    model.eval()
+    x = torch.randn(3, PRODUCTION_SPEC.lookback, N_IN) * 4.0
+    out, scaled = model.forward(x), model.forward(2.0 * x)
+    assert out.shape == model.output_shape(3)
+    if head == "quantile":
+        torch.testing.assert_close(scaled, 2.0 * out, rtol=2e-4, atol=2e-4)
+    else:
+        torch.testing.assert_close(scaled[..., 0], 2.0 * out[..., 0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(
+            scaled[..., 1], out[..., 1] + 2.0 * float(np.log(2.0)), rtol=2e-4, atol=2e-3
+        )
+
+
+@pytest.mark.parametrize("stem", ["persistence", "window_mean", "dlinear_ols", "ar_p20"])
+def test_revin_is_refused_on_the_rows_it_would_silently_break(stem: str) -> None:
+    """Not every row can carry RevIN, and the two reasons are different failures.
+
+    A ``closed_form`` row's coefficients are solved from moments accumulated over the
+    *dataset's* windows, so a RevIN forward pass would evaluate them in a space they were
+    never solved in. A ``none`` row is mathematically unchanged by RevIN but not bitwise
+    unchanged, and ``dmf.eval.controls`` asserts persistence is bitwise the inline
+    expression every skill denominator is defined by (P2-D9).
+
+    ``build_model`` therefore leaves them alone rather than raising -- an arm keeps its
+    persistence denominator -- and the explicit call raises, so the policy cannot be got
+    wrong quietly. The consequence, which belongs in any RevIN table: on a ``revin: true``
+    arm these rows *are* the reference arm's rows.
+    """
+    cfg = load_model(CONFIG_ROOT / "model" / f"{stem}.yaml")
+    model = build_model(cfg, PRODUCTION_SPEC, N_IN, N_OUT, revin=True)
+    assert model.revin is None
+    with pytest.raises(ValueError, match="SGD-fitted models only"):
+        model.enable_revin()
+
+
+def test_revin_cannot_be_enabled_twice() -> None:
+    _, revin = _revin_pair()
+    with pytest.raises(ValueError, match="already has RevIN"):
+        revin.enable_revin()
+
+
+# ---------------------------------------------------------------------------
+# The 40 s lookback TCN
+# ---------------------------------------------------------------------------
+
+
+def test_tcn_l400_receptive_field_covers_the_forty_second_lookback() -> None:
+    """CLAUDE.md: assert the receptive-field arithmetic, do not comment it.
+
+    The lookback ablation's 40 s arm is ``L = 400``. The shipped ``tcn`` stack reaches 253
+    samples, so reusing it there would leave the oldest 14.7 s of every window invisible --
+    which never appears in a loss curve and would be published as "a longer lookback does
+    not help". ``tcn_l400`` extends the dilations to 509.
+
+    The arm is **not** parameter-matched and is not claimed to be (P6-D4): the extra
+    residual block is +24 832 parameters, 12.6 % above the ``tcn`` row, while the head is
+    identical because it reads the last encoded step only.
+    """
+    from dmf.models.tcn import receptive_field
+
+    short = load_model(CONFIG_ROOT / "model" / "tcn.yaml")
+    long = load_model(CONFIG_ROOT / "model" / "tcn_l400.yaml")
+    l400 = 400
+    spec_200 = replace(PRODUCTION_SPEC, lookback=200)
+    spec_400 = replace(PRODUCTION_SPEC, lookback=l400)
+
+    assert receptive_field(int(short.params["kernel_size"]), short.params["dilations"]) == 253
+    assert receptive_field(int(long.params["kernel_size"]), long.params["dilations"]) == 509
+    assert receptive_field(int(long.params["kernel_size"]), long.params["dilations"]) >= l400
+    assert receptive_field(int(short.params["kernel_size"]), short.params["dilations"]) < l400
+
+    # The constructor is the guard, and it must actually fire on the config that fails.
+    with pytest.raises(ValueError, match="receptive field"):
+        build_model(short, spec_400, N_IN, N_OUT)
+
+    built = build_model(long, spec_400, N_IN, N_OUT)
+    reference = build_model(short, spec_200, N_IN, N_OUT)
+    assert built.receptive_field >= spec_400.lookback  # type: ignore[attr-defined]
+    assert built.n_fitted_parameters == 221_636
+    assert reference.n_fitted_parameters == 196_804
+    # Same head width at both lookbacks: the head reads the last encoded step, so all of
+    # the difference is the extra residual block.
+    assert built.head.out_features == reference.head.out_features  # type: ignore[attr-defined]
+    assert long.label != short.label, "two rows in one table need two labels"
+    assert {k: v for k, v in long.params.items() if k != "dilations"} == {
+        k: v for k, v in short.params.items() if k != "dilations"
+    }
+
+
+# ---------------------------------------------------------------------------
+# The empirical residual interval (Phase 6 probabilistic baseline / interval null)
+# ---------------------------------------------------------------------------
+
+
+def _residual_interval_fit(corpus: Path, cfg: DataConfig, kernel: int = 5):  # type: ignore[no-untyped-def]
+    """Fit the residual-interval baseline on the small corpus, from one moments pass."""
+    from dmf.train.closed_form import fit_residual_interval
+
+    train = _small_dataset(corpus, cfg, "id", "train")
+    val = _small_dataset(corpus, cfg, "id", "val")
+    moments = accumulate_training_moments(
+        train, max_order=4, batch_size=512, num_workers=0, decompose_kernel=kernel
+    )
+    model, report = fit_residual_interval(
+        moments,
+        val,
+        kernel_size=kernel,
+        ridge=1e-6,
+        lookback=cfg.lookback,
+        n_input_channels=len(train.input_columns),
+        n_target_channels=len(train.target_columns),
+        num_workers=0,
+    )
+    return model, report, moments, train, val
+
+
+def test_residual_interval_refuses_to_forecast_before_it_is_fitted() -> None:
+    """A zero-valued fan is a well-formed zero-width interval, i.e. perfect sharpness."""
+    model = build_model(
+        load_model(CONFIG_ROOT / "model" / "residual_interval.yaml"), PRODUCTION_SPEC, N_IN, N_OUT
+    )
+    assert model.output_shape(2) == (2, PRODUCTION_SPEC.max_horizon, N_OUT, len(QUANTILE_FAN_9))
+    with pytest.raises(RuntimeError, match="no residual quantiles"):
+        model.forward(torch.zeros(2, PRODUCTION_SPEC.lookback, N_IN))
+
+
+def test_residual_interval_counts_the_quantiles_it_holds_in_a_buffer() -> None:
+    """The naive parameter count misses ``H * C_out * Q``, in the flattering direction."""
+    model = build_model(
+        load_model(CONFIG_ROOT / "model" / "residual_interval.yaml"), PRODUCTION_SPEC, N_IN, N_OUT
+    )
+    fan = PRODUCTION_SPEC.max_horizon * N_OUT * len(QUANTILE_FAN_9)
+    assert sum(p.numel() for p in model.parameters()) == 60_300
+    assert model.n_fitted_parameters == 60_300 + fan == 68_400
+
+
+@pytest.mark.parametrize("bad", ["shape", "descending", "nonfinite"])
+def test_residual_interval_rejects_a_fan_it_could_not_have_produced(bad: str) -> None:
+    """Non-decreasing is enforced on installation, which is why this row cannot cross.
+
+    ``docs/protocol.md`` P5-D16 measures crossing on the raw fan for exactly this reason;
+    an empirical quantile vector is ascending by construction, so a descending one means
+    the axes or the levels are transposed -- a silent, shape-preserving error.
+    """
+    from dmf.models.residual_interval import EmpiricalResidualInterval
+
+    model = EmpiricalResidualInterval(20, 4, 3, 2, kernel_size=3, n_quantiles=3)
+    fan = np.tile(np.array([-1.0, 0.0, 1.0]), (4, 2, 1))
+    if bad == "shape":
+        fan = fan[:, :, :2]
+    elif bad == "descending":
+        fan = fan[:, :, ::-1].copy()
+    else:
+        fan[0, 0, 0] = np.nan
+    with pytest.raises(ValueError):
+        model.set_residual_quantiles(fan)
+
+
+@pytest.mark.parametrize("partition", ["train", "test"])
+def test_residual_quantiles_are_fitted_on_validation_and_nothing_else(
+    small_corpus: Path, small_data_cfg: DataConfig, partition: str
+) -> None:
+    """Train residuals understate the error; test residuals are the leak itself."""
+    from dmf.train.closed_form import fit_residual_interval
+
+    train = _small_dataset(small_corpus, small_data_cfg, "id", "train")
+    wrong = _small_dataset(small_corpus, small_data_cfg, "id", partition)
+    moments = accumulate_training_moments(
+        train, max_order=4, batch_size=512, num_workers=0, decompose_kernel=5
+    )
+    with pytest.raises(ValueError, match="validation partition"):
+        fit_residual_interval(
+            moments,
+            wrong,
+            kernel_size=5,
+            ridge=1e-6,
+            lookback=small_data_cfg.lookback,
+            n_input_channels=len(train.input_columns),
+            n_target_channels=len(train.target_columns),
+            num_workers=0,
+        )
+
+
+def test_residual_interval_is_the_dlinear_ols_row_plus_a_fan(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """The point half must be the committed ``dlinear_ols`` forecast, bitwise.
+
+    If it drifts, the interval stops being *that row's* interval and the baseline stops
+    answering the question it exists for (P5-D5: every probabilistic row carries a point
+    forecast, and which one it is is recorded).
+    """
+    model, report, moments, train, _ = _residual_interval_fit(small_corpus, small_data_cfg)
+    reference, ref_report = fit_dlinear_ols(
+        moments,
+        kernel_size=5,
+        ridge=1e-6,
+        lookback=small_data_cfg.lookback,
+        n_input_channels=len(train.input_columns),
+        n_target_channels=len(train.target_columns),
+    )
+    x = torch.randn(4, small_data_cfg.lookback, len(train.input_columns))
+    assert torch.equal(model.point_model.forward(x), reference.forward(x))
+    assert report.point.n_fitted_parameters == ref_report.n_fitted_parameters
+    assert report.fitted_on == "id/val"
+    assert report.n_windows_used <= report.n_windows_total
+    assert report.window_stride >= 1
+
+
+def test_residual_interval_fan_is_ascending_and_needs_no_post_hoc_sort(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """The raw fan is already ordered, so the P5-D16 sort is a measured no-op here.
+
+    That is the contrast the row is for: ``dlinear_quantile``'s raw fan is inverted on a
+    median 6 % of elements and on 96.6 % in its worst cell, and every published width for
+    it depends on the sort. This one cannot cross at all.
+    """
+    model, _, _, _, val = _residual_interval_fit(small_corpus, small_data_cfg)
+    x, _, _ = next(iter(make_dataloader(val, batch_size=64, shuffle=False, num_workers=0, seed=0)))
+    raw = model.forward(x)
+    assert raw.shape == model.output_shape(x.shape[0])
+    assert torch.equal(sort_quantiles(raw), raw), "the raw fan is already non-decreasing"
+    fan = model.residual_quantiles.numpy()
+    assert np.all(np.diff(fan, axis=-1) >= 0.0)
+
+
+def test_residual_interval_covers_its_own_validation_split_at_the_nominal_rate(
+    small_corpus: Path, small_data_cfg: DataConfig
+) -> None:
+    """The unconditional interval is calibrated *in-sample* by construction -- check it is.
+
+    Empirical quantiles of the validation residuals must reproduce the nominal 90 percent
+    coverage on the split they were taken from. This is the sanity check that the axes are
+    the right way round: a transposed ``(H, C)`` pair would still be ascending, still be
+    the right shape, and would land nowhere near 0.9. It says nothing about test coverage,
+    which is the number the results table reports.
+    """
+    model, _, _, _, val = _residual_interval_fit(small_corpus, small_data_cfg)
+    stats = val.norm_stats.subset(val.target_columns)
+    inside = 0
+    total = 0
+    with torch.no_grad():
+        for x, y, window_mean in make_dataloader(
+            val, batch_size=512, shuffle=False, num_workers=0, seed=0
+        ):
+            fan = model.forward(x)
+            target = normalize_target(y, stats, window_mean)
+            inside += int(((target >= fan[..., 0]) & (target <= fan[..., -1])).sum())
+            total += int(target.numel())
+    assert 0.86 <= inside / total <= 0.94, inside / total
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resolution and load_or_fit (Phase 6: `make eval` without retraining)
+# ---------------------------------------------------------------------------
+
+
+def _dlinear_cfg(label: str = "dlinear") -> ModelConfig:
+    """Return the shipped DLinear config under a chosen results-table label."""
+    return replace(load_model(CONFIG_ROOT / "model" / "dlinear.yaml"), label=label)
+
+
+def test_resolve_checkpoint_knows_both_naming_conventions(tmp_path: Path) -> None:
+    """``fit`` has written checkpoints under two different stems, and both are committed.
+
+    ``label=cfg.label`` only reached the ``fit`` call site in Phase 5, so
+    ``artifacts/checkpoints/deep/`` holds ``lstmforecaster_seed0.pt`` -- the lowercased
+    class name -- while ``artifacts/checkpoints/probabilistic/`` holds every file under its
+    label. A resolver that knew one convention would find nothing for half the deep rows,
+    and a caller that fell back to training or to random init on a miss would score an
+    untrained model as a trained one.
+    """
+    from dmf.train.experiment import resolve_checkpoint
+
+    lstm = replace(load_model(CONFIG_ROOT / "model" / "lstm.yaml"), label="lstm")
+    by_class = tmp_path / "lstmforecaster_seed1.pt"
+    by_class.touch()
+    assert resolve_checkpoint(tmp_path, lstm, 1) == by_class
+
+    by_label = tmp_path / "lstm_seed2.pt"
+    by_label.touch()
+    assert resolve_checkpoint(tmp_path, lstm, 2) == by_label
+
+
+def test_resolve_checkpoint_refuses_an_ambiguous_pair(tmp_path: Path) -> None:
+    """Two files for one triple were written by two runs; picking one is a guess."""
+    from dmf.train.experiment import resolve_checkpoint
+
+    lstm = replace(load_model(CONFIG_ROOT / "model" / "lstm.yaml"), label="lstm")
+    (tmp_path / "lstm_seed0.pt").touch()
+    (tmp_path / "lstmforecaster_seed0.pt").touch()
+    with pytest.raises(ValueError, match="ambiguous"):
+        resolve_checkpoint(tmp_path, lstm, 0)
+
+
+def test_resolve_checkpoint_raises_rather_than_falling_back(tmp_path: Path) -> None:
+    """A missing checkpoint must be loud: silence here is an untrained model in the table."""
+    from dmf.train.experiment import resolve_checkpoint
+
+    with pytest.raises(FileNotFoundError, match="no checkpoint"):
+        resolve_checkpoint(tmp_path, _dlinear_cfg(), 0)
+
+
+def test_load_or_fit_loads_committed_weights_and_refits_the_closed_form_rows(
+    small_corpus: Path, small_data_cfg: DataConfig, tmp_path: Path
+) -> None:
+    """``make eval`` must reproduce a table from ``artifacts/`` without retraining anything.
+
+    The SGD row is restored from disk, weight for weight, and carries ``fit_time_s = nan``
+    rather than 0.0 -- the training time belongs to the run that wrote the checkpoint and
+    is committed in that run's ``baselines_by_seed.csv``; a zero in a cost column would
+    read as a free model.
+    """
+    from dmf.config import ExperimentConfig
+    from dmf.train.closed_form import TrainingMoments
+    from dmf.train.experiment import load_or_fit
+
+    train = _small_dataset(small_corpus, small_data_cfg, "id", "train")
+    val = _small_dataset(small_corpus, small_data_cfg, "id", "val")
+    spec = window_spec_from_config(small_data_cfg)
+    n_in, n_out = len(train.input_columns), len(train.target_columns)
+    cfg = _dlinear_cfg()
+    experiment = ExperimentConfig(
+        name="load_or_fit_smoke",
+        data=small_data_cfg,
+        models=(cfg,),
+        train=_train_cfg(epochs=1),
+        seeds=(0, 1, 2),
+        regimes=("id",),
+    )
+
+    checkpoints = tmp_path / "ckpt"
+    checkpoints.mkdir()
+    saved = []
+    for seed in experiment.seeds:
+        set_seed(seed + 100)
+        model = build_model(cfg, spec, n_in, n_out)
+        torch.save(model.state_dict(), checkpoints / f"dlinear_seed{seed}.pt")
+        saved.append(model)
+
+    holder: dict[str, TrainingMoments] = {}
+    records = load_or_fit(
+        cfg,
+        spec=spec,
+        train=train,
+        val=val,
+        experiment=experiment,
+        moments_holder=holder,
+        device="cpu",
+        checkpoint_dir=checkpoints,
+    )
+    assert [r.seed for r in records] == list(experiment.seeds)
+    assert holder == {}, "loading weights must not trigger a moments pass"
+    for record, reference in zip(records, saved, strict=True):
+        assert not record.deterministic
+        assert np.isnan(record.fit_time_s)
+        assert record.best_epoch is None and record.epochs_run is None
+        for a, b in zip(record.model.parameters(), reference.parameters(), strict=True):
+            assert torch.equal(a, b)
+
+    # A closed-form row is refitted instead, from the shared moments cache.
+    interval_cfg = load_model(CONFIG_ROOT / "model" / "residual_interval.yaml")
+    interval_cfg = replace(interval_cfg, params={"kernel_size": 5, "ridge": 1e-6})
+    closed = load_or_fit(
+        interval_cfg,
+        spec=spec,
+        train=train,
+        val=val,
+        experiment=replace(experiment, models=(interval_cfg,)),
+        moments_holder=holder,
+        device="cpu",
+        checkpoint_dir=checkpoints,
+    )
+    assert len(closed) == 1 and closed[0].deterministic
+    assert closed[0].model.head_kind == "quantile"
+    assert "moments" in holder

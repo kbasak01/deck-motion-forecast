@@ -1,0 +1,11 @@
+{
+  "id": {
+    "fitted": true,
+    "error": null
+  },
+  "unseen_seastate": {
+    "fitted": false,
+    "error_type": "ValueError",
+    "error": "lag features [9, 19, 29, 39, 49, 59, 69, 79, 89, 99, 109, 119, 129, 139, 149, 159, 169, 179, 189, 199] have zero variance on the training split; the normal equations are singular"
+  }
+}

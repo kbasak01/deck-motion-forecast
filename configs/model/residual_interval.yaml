@@ -1,0 +1,35 @@
+# The unconditional interval: `dlinear_ols`'s point forecast plus its own empirical
+# residual quantiles, taken on the VALIDATION split.
+#
+# This is the probabilistic baseline results/e03/probabilistic.csv does not have. That
+# table holds six learned heads and nothing trivial, so its coverage numbers have no floor
+# to be read against -- the same gap CLAUDE.md non-negotiable 4 closes for point accuracy by
+# requiring persistence beside every RMSE. This row is that reference for PICP, width,
+# Winkler and CRPS, and it is also the null for the interval controls: its width does not
+# depend on the input, so a learned head that cannot beat it has learned nothing
+# *conditional* about its own uncertainty.
+#
+# `kernel_size` and `ridge` are the `dlinear_ols` row's, and must stay so: the point half of
+# this row is that row, so a divergence would make the interval an interval around a
+# different forecast (docs/protocol.md P5-D5 -- every probabilistic row carries a point
+# forecast, and which one it is is recorded).
+#
+# The nine levels are dmf.models.heads.QUANTILE_FAN_9, as for every other quantile row, so
+# 0.05/0.5/0.95 are read off the fan rather than interpolated.
+#
+# Parameter count at the P3 geometry (L=200, H=150, C_in=C_out=6): 60 300 in the point model
+# -- the same count the `dlinear` and `dlinear_ols` rows carry -- plus H*C_out*Q = 8100
+# empirical quantiles = 68 400. For scale, `dlinear_quantile` spends 542 700 to answer the
+# same question with a conditional width. Those 8100 numbers are
+# buffer-held, so the naive `sum(p.numel())` count misses them; the class overrides
+# n_fitted_parameters to report them, in the direction that does NOT flatter this baseline.
+#
+# FIT_KIND is closed_form: no epochs, no seed, no RNG, so the row is deterministic and
+# exempt from the three-seed rule for the same reason ar20 and dlinear_ols are.
+name: residual_interval
+label: residual_interval
+head: quantile
+quantiles: [0.05, 0.1625, 0.275, 0.3875, 0.5, 0.6125, 0.725, 0.8375, 0.95]
+params:
+  kernel_size: 25
+  ridge: 1.0e-6

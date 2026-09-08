@@ -1,0 +1,47 @@
+# Phase 6.3 ablation arm b -- channels -- attitude only, no rates (closed-form vehicles, OOD regimes).
+#
+# Three targets instead of six. The contrast is read on roll/pitch/heave only; the rate rows do
+# not exist in this arm and are not imputed (P6-D4 item 3). Note that the quiescence metric
+# cannot be evaluated here at all -- it thresholds |heave_rate|, which this arm does not
+# forecast. That is the deficiency P3-D4 revised the task to remove, reproduced deliberately.
+#
+# The `train` block is byte-identical to `configs/experiment/e02_deep.yaml`: epochs 60,
+# batch 1024, lr 2e-3, patience 15, bf16. One budget, one schedule, one stopping rule, so the
+# arms differ in the DATA definition and in nothing else. Changing it would make this a
+# comparison of two training regimes wearing an ablation's name.
+#
+# The reference arm is NOT re-run. `results/e02/` already fitted `tcn` (3 seeds) and
+# `dlinear_ols` on every regime under this exact train block and `configs/data/default.yaml`;
+# its committed rows are read, never regenerated (docs/IMPLEMENTATION_PLAN.md Phase 6
+# carry-forward item 7). The one exception is the lookback ablation, where the reference is
+# re-SCORED from e02's checkpoints on the window-matched origin set (P6-D4 item 1) -- a
+# forward pass, not a refit.
+#
+# `persistence` must be first: it is the skill-score denominator and
+# `dmf.eval.runner.evaluate_models` requires it.
+#
+# The closed-form half of arm b. `tcn` is absent deliberately: it is budgeted for `id` and
+# `unseen_seastate` only, and the deterministic vehicles here cost minutes, so this file is
+# what makes the linear reading of every ablation four-regime instead of two.
+name: e04b_channels_ood
+data: ../data/attitude_only.yaml
+models:
+  - ../model/persistence.yaml
+  - ../model/window_mean.yaml
+  - ../model/damped_persistence.yaml
+  - ../model/ar_p20.yaml
+  - ../model/dlinear_ols.yaml
+
+train:
+  epochs: 60
+  batch_size: 1024
+  lr: 2.0e-3
+  weight_decay: 1.0e-4
+  warmup_frac: 0.05
+  grad_clip: 1.0
+  patience: 15
+  amp_dtype: bf16
+  num_workers: 16
+
+seeds: [0, 1, 2]
+regimes: [unseen_heading, unseen_vessel]

@@ -31,6 +31,27 @@ Layout:
   realization-level bootstrap free.
 - :mod:`dmf.eval.controls` -- the integrity controls, each a whole-pipeline experiment with
   an outcome known in advance.
+- :mod:`dmf.eval.quiescence` / :mod:`dmf.eval.quiescence_runner` -- the operational metric
+  and the detector geometry it is measured under (``docs/protocol.md`` P6-D2, P6-D5, P6-D7).
+- :mod:`dmf.eval.phase` / :mod:`dmf.eval.phase_runner` -- the phase-lag estimator and the
+  stride-1 sub-sample it is measured on (P6-D3), joined onto the accuracy table by
+  ``(model, regime, dof, horizon_samples)``.
+- :mod:`dmf.eval.scoring` -- the driver that scores an experiment from its committed
+  checkpoints, so ``make eval`` re-derives every table without retraining anything.
+- :mod:`dmf.eval.ablations` -- the ablation arm registry and the matching rules P6-D4 fixes,
+  as enforcement rather than as documentation.
+- :mod:`dmf.eval.matched` -- the matched-origin re-scoring of the lookback arms. The
+  contrast is paired on the forecast origin ``s + L - 1`` and never on the window start
+  (P6-D4 item 1), which no single training run can impose because the intersection is a
+  property of three arms; this is where it is imposed, at scoring time, on the test
+  partition only.
+- :mod:`dmf.eval.control_runner` -- the driver for the controls that are not part of a
+  scoring pass: the two interval controls and the persistence pipeline-sanity control.
+  Both artifacts had no producer until it existed (P6-D15).
+- :mod:`dmf.eval.assemble` -- the cross-arm tables: contrasts, controls, the probabilistic
+  floor and the reproducibility control, joined from committed CSVs with no corpus, no
+  checkpoints and no GPU. Deliberately not part of the scoring driver: a table that is a
+  *join* should not sit in the call path of a function that can start a sweep.
 - :mod:`dmf.eval.report` -- table aggregation and rendering, including the seed policy.
 - :mod:`dmf.eval.gate` -- the Gate 4 read-out: the gate criterion computed from the
   committed tables rather than by an ad-hoc script, in both the readings that ship (the
