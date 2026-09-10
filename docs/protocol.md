@@ -3997,3 +3997,621 @@ by re-running the 8-hour pass. So:
 That trade was made deliberately rather than spending another 8 h 45 m to restore a strictly fresh
 predicate 1, and it is recorded here rather than left for a reader to reconstruct from timestamps —
 which is precisely how the *previous* predicate-1 defect was found (third adversarial audit).
+
+---
+
+## Phase 7 — ONNX export and latency benchmark
+
+### P7-D1 — Both GPU execution providers were silently falling back to CPU, and `get_available_providers()` says otherwise. RECORDED 2026-09-09
+
+**The reading that was nearly published.** `onnxruntime.get_available_providers()` returns
+`['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']` on this machine and
+`ort.get_device()` returns `'GPU'`. `pyproject.toml`'s dependency comment asserted, on that basis,
+that "onnxruntime-gpu exposes the TensorRT, CUDA and CPU execution providers". During Phase 7
+exploration one agent read exactly those two calls and reported that all four execution-provider
+configurations the plan asks for were available.
+
+**They were not.** `get_available_providers()` reports what the ORT build was *compiled* with, not
+what can be *loaded*. Constructing a real `InferenceSession` on a trivial opset-18 graph, and then
+reading `session.get_providers()` back, measured:
+
+| Requested | Realized | Cause |
+|---|---|---|
+| `CPUExecutionProvider` | `['CPUExecutionProvider']` | — |
+| `CUDAExecutionProvider` | `['CPUExecutionProvider']` | `libcublasLt.so.13` not found |
+| `TensorrtExecutionProvider` | `['CPUExecutionProvider']` | `libnvinfer.so.10` not found |
+
+**The failure mode is the dangerous one: ORT does not raise.** It emits a message on stderr and
+returns a working session that computes correct answers on the CPU. A harness that requests CUDA,
+does not read the realized provider back, and records the elapsed time produces a row labelled
+"CUDA" containing CPU timings — with no exception, no wrong number, and nothing for a reader to
+notice. `src/dmf/deploy/bench.py`'s Phase-0 docstring pre-registered this exact defect; the stub
+nonetheless shipped a `BenchResult` with no field to record the realized provider in, so honouring
+the docstring required adding one.
+
+**Root cause, and why it is not a WSL2 or driver problem.** CUDA works from torch on this machine
+(`torch.cuda.is_available()` True, RTX A4000, capability 8.6 read from the device). The libraries
+ORT needs are present *inside the venv* — `nvidia/cu13/lib/libcublasLt.so.13`,
+`nvidia/cudnn/lib/libcudnn.so.9`. torch preloads its own; ORT does not, and the dynamic loader has
+no path to them. It is a loader-path defect, not a hardware or driver one.
+
+**Resolution, chosen so that `make bench` works from a clean shell.** Setting `LD_LIBRARY_PATH`
+fixes it but is a property of the invoking shell rather than of the code, and this project has
+already paid for that class of mistake once — `make eval` and `make lint` both exited 127 on a
+clean shell, which is what commit 70130a1 exists to fix. Measured alternative:
+
+- `import torch` alone preloads libcublas/libcublasLt/libcudnn, and **CUDA EP then loads**. TensorRT
+  still falls back, because torch has no reason to preload `libnvinfer`.
+- `import torch, tensorrt` preloads both, and with **no `LD_LIBRARY_PATH` set at all** the three
+  providers realize as `['CPUExecutionProvider']`, `['CUDAExecutionProvider', 'CPUExecutionProvider']`
+  and `['TensorrtExecutionProvider', 'CPUExecutionProvider']`, each running a real inference.
+
+`dmf.deploy.providers.preload_gpu_libraries()` therefore performs both imports before any session is
+constructed, and every ORT benchmark asserts the requested provider appears in
+`session.get_providers()`, raising if it does not. **No latency row in this phase is recorded
+against a requested provider; every row is recorded against a realized one.**
+
+### P7-D2 — TensorRT is pinned to the 10.x series, and the default release would not have loaded
+
+TensorRT was installed rather than recorded as unavailable, decided with the user. The pin is
+`tensorrt-cu13==10.16.1.11`, and both halves of that string are load-bearing:
+
+- **`10.x`, not the default.** onnxruntime-gpu 1.29.0 links `libnvinfer.so.10`. The current default
+  `tensorrt` release is **11.2.1.2**, which ships `libnvinfer.so.11`. An unpinned
+  `pip install tensorrt` resolves to it, installs cleanly, and then never loads — reproducing P7-D1's
+  silent CPU fallback while appearing to have fixed it.
+- **`cu13`, not `cu12`.** torch is 2.13.0+cu130 and the driver reports CUDA 13.2. The `tensorrt-cu12`
+  line tops out at 10.9.0.34 and would mix CUDA major versions inside one process.
+
+The installed package carries `libnvinfer_builder_resource_sm86.so.10.16.1`; the A4000 is compute
+capability 8.6, so the builder resource for this device is present rather than falling back to PTX
+JIT.
+
+**What this costs, stated because it is a real change to the reference environment.** Phases 1-6 were
+measured without TensorRT installed. The package adds no import to any non-deploy module and does not
+alter numerics, but the pinned dependency set is no longer byte-identical to the one those phases ran
+under. The pin is recorded in `pyproject.toml` alongside the corrected comment, so a fresh
+environment reproduces Phase 7 rather than the pre-Phase-7 state.
+
+### P7-D3 — THRESHOLD CHANGE: the FP32 parity criterion becomes scale-relative. RECORDED 2026-09-09
+
+**This is a gate threshold change under `CLAUDE.md` §Gates, adopted by the user explicitly.** It is
+recorded here in the form that section requires: the original criterion, the measurement that
+motivated the change, the new criterion, and what is still reported so the original stays auditable.
+
+**The original criterion.** `docs/IMPLEMENTATION_PLAN.md` §Phase 7 and `CLAUDE.md` both state it as
+`max_abs_err < 1e-4` in FP32 over 1000 random windows, absolute, for every exported model.
+
+**The measurement.** Measured on the `id`/seed-0 checkpoints, ORT CPU EP against
+`wrap_for_export(model)`, worst of five 1000-window draws (`dmf.deploy.parity.PARITY_SEEDS`):
+
+| Model | max_abs_err (worst draw) | best draw | mean_abs_err | \|y\|max | Absolute 1e-4 |
+|---|---|---|---|---|---|
+| `tcn` | 7.248e-05 | 6.104e-05 | 2.950e-06 | 125.80 | PASS |
+| `lstm` | 9.447e-06 | 6.4e-06 | 4.009e-07 | 5.32 | PASS |
+| `tcn_quantile` | 9.918e-05 | 6.1e-05 | 3.179e-06 | 242.47 | PASS |
+| `lstm_quantile` | **2.038e-04** | 1.42e-04 | 2.628e-06 | 9.79 | **FAIL** |
+
+`lstm_quantile`'s failure is **not an export defect**, and that was measured rather than assumed. On
+the pinned draw, against the same model in double precision: PyTorch's own FP32 output is **1.059e-04**
+from the FP64 result and the ONNX graph is **1.146e-04**. Both FP32 runtimes are further from the exact
+answer than the tolerance is, so no export could have passed it — the absolute form of the test asks
+single precision for something it does not have on a 200-step LSTM recurrence projected through a
+1 044 900-parameter quantile head onto outputs of order 10.
+
+**And the absolute verdict was seed-dependent, which is what settled it.** An independently written
+comparison over five draws:
+
+| seed | onnx-vs-torch | torch-vs-fp64 | onnx-vs-fp64 | ratio onnx/torch |
+|---|---|---|---|---|
+| 0 | 9.727e-05 | 7.020e-05 | 9.978e-05 | 1.42 |
+| 1 | 9.632e-05 | 1.004e-04 | 1.283e-04 | 1.28 |
+| 20260909 (pinned) | 1.809e-04 | 1.094e-04 | 2.165e-04 | 1.98 |
+| 42 | 8.535e-05 | 1.082e-04 | 1.453e-04 | 1.34 |
+| 7 | 2.024e-04 | 1.340e-04 | 2.155e-04 | 1.61 |
+
+Three of five draws pass the unscaled 1e-4 and two fail it. `max_abs_err` is a maximum over ~9 million
+elements — a tail statistic — and it moves by about 2x between draws. Keeping the absolute criterion
+would have made a *published gate verdict* a property of the window seed.
+
+**The new criterion, adopted by the user:**
+
+    max_abs_err < tolerance * max(1, |y|_max),  tolerance = 1e-4, unchanged
+
+with two properties that keep it from being a general loosening:
+
+- **The scale is floored at 1**, so a model whose outputs are below unit scale is still held to the
+  plan's absolute 1e-4. The change can only ever relax the test for genuinely large outputs.
+- **The scale is read off the PyTorch reference**, never off the graph under test, so a graph that
+  produced a large number cannot widen the tolerance it is judged by.
+
+**What it decides, stated plainly because it is smaller than the change looks.** Three of the four
+models pass the absolute 1e-4 as well; the change decides exactly **one row of four**, `lstm_quantile`,
+which passes at 4.8x margin. It is also *much* looser than 1e-4 for `tcn` (1.26e-02) and
+`tcn_quantile` (2.42e-02), because random N(0,1) inputs — deliberately out of distribution, so the
+check covers the input space rather than the corpus's region of it — drive those graphs to
+`|y| ~ 126` and `242`. Nothing turns on that here, since both pass the unscaled test anyway, but a
+future model that failed only under the scaled criterion would need this looked at again.
+
+**What is still reported.** `ParityResult` carries `max_abs_err` unscaled, `output_abs_max`, `scale`,
+`scaled_tolerance`, `passed` (the criterion in force) **and `passed_absolute` (the plan's original
+criterion)**. `results/parity.csv` and `results/parity.json` carry all of them, per draw. Nothing was
+deleted; the superseded test is a column.
+
+**Also changed: the verdict is now the worst of five draws, not one.** A single draw made the number a
+sample of one, which is what the seed table above demonstrates. `tests/test_onnx_parity.py` asserts the
+scaled criterion on the worst draw for all four models, and the `xfail` that the previous version of
+this entry justified is **removed**: all four models now export, parity-check and benchmark.
+
+### P7-D3a — the FP64 attribution test was a latent flake at 2.0 and is now 3.0
+
+`test_no_export_defect_hides_in_the_lstm_quantile_parity_gap` asserts the ONNX graph is within a factor
+of PyTorch's own distance from FP64. It shipped at **2.0**, and the pinned draw sits at **1.98** — a one
+percent margin, i.e. green by luck. The five draws above span 1.28 to 1.98, so the factor is now **3.0**:
+above the measured spread, and still far below what a genuine export defect would produce, which moves
+the ONNX error by the size of the defect rather than by a rounding factor. The five draws are cited in
+the test module as `LSTM_QUANTILE_DRAWS` so the number is traceable to a measurement.
+
+That test also matters *more* under the new criterion than under the old one: the scaled threshold gives
+`lstm_quantile` a 4.8x margin, so a real defect of a few times 1e-4 would now pass the parity check and
+fail only there.
+
+
+### P7-D4 — What the exported graph contains that `forward` does not, and which exporter produced it. RECORDED 2026-09-09
+
+Three export decisions, each with a silent failure mode behind it:
+
+1. **The quantile sort is in the graph.** `BaseForecaster.forward` does not sort; the sort lives
+   downstream in `PredictiveDistribution.__post_init__`, which an ONNX consumer does not have. A
+   naively traced quantile graph therefore ships **crossing quantiles** — the trap `CLAUDE.md` names
+   — so `dmf.deploy.export_onnx.wrap_for_export` appends `sort_quantiles`, **for a `quantile` head
+   only**. Never for `point` (rank 3; it would raise) and never for `gaussian`, whose trailing axis is
+   `(mean, log_var)` and whose sorting is silent, shape-preserving and catastrophic (P5-D1). Parity
+   for a quantile graph is therefore run against `sort_quantiles(model.forward(x))`, so the sort is
+   part of what is verified rather than a difference the tolerance absorbs.
+2. **The declared output dims of the quantile graphs had to be repaired.** `torch.sort` exports as
+   `TopK`, whose `K` is a graph *input* rather than an attribute, so ONNX shape inference abandons
+   every trailing axis: the graphs came out declaring
+   `(batch, TopKoutput_dim_1, TopKoutput_dim_2, TopKoutput_dim_3)`. `H`, `C_out` and `Q` are fixed
+   properties of the trained model, and a consumer sizing a buffer from the graph could not have. The
+   export re-declares them from `BaseForecaster.output_shape`, which is safe only because it is checked
+   twice downstream — ORT validates the declaration against what the graph computes, and `check_parity`
+   asserts every produced array against `output_shape` before comparing values.
+3. **The TorchScript exporter is pinned (`dynamo=False`).** torch 2.13 deprecates it in favour of the
+   `torch.export`-based exporter, which is the default — but that path requires `onnxscript`, which is
+   **not** in this project's pinned dependency set, and adding a dependency inside an export helper is
+   not a change to make silently. Pinning the flag also keeps the exporter from changing under the
+   benchmark on the next torch upgrade, which for a latency study matters more than the deprecation.
+   Adding `onnxscript` and re-measuring is a legitimate follow-up; it is a dependency decision, not an
+   implementation detail.
+
+The batch axis is the **only** dynamic one; sequence and channel axes are fixed deliberately, and the
+graphs were checked to agree with PyTorch at batch 1, 32 and 64 (the LSTM export emits a warning about
+batch-dependent results, which this check is the answer to).
+
+### P7-D5 — Benchmark conventions: host-to-host, one pinned thread, one process per configuration. RECORDED 2026-09-09
+
+Recorded before any number is published, because each of these changes the numbers and none of them
+is recoverable from a latency table that does not state it.
+
+- **Host to host.** One iteration is measured from "the window is a NumPy array in host memory" to
+  "the forecast is a NumPy array in host memory", for every backend, including the device transfers on
+  the CUDA paths. That is what a flight controller experiences. Timing device-resident tensors instead
+  would flatter CUDA against a CPU provider that has no transfer to hide, and CPU-versus-CUDA at batch
+  1 is precisely the comparison this phase exists to make.
+- **`intra_op_num_threads` and `torch.set_num_threads` are pinned to 1 by default and the value that
+  took effect is recorded on every row.** ORT CPU latency moves by more than the effect being measured
+  when the thread count changes, and the default is core-count dependent, so an unpinned number is not
+  reproducible on another machine. 1 is also the deployment-honest setting: the target shares a CPU
+  with the rest of the autopilot. The machine has 18 cores / 36 threads, so the CPU rows are **not** the fastest CPU
+  numbers obtainable, and any comparison against them must say so.
+- **One subprocess per configuration.** `ru_maxrss` is a high-water mark that is never reset, so in a
+  single process the first row would be honest and every later row would inherit the largest footprint
+  so far; `torch.compile` state and the CUDA context do not go away either. `dmf.deploy.child` is the
+  entry point.
+- **Un-synchronised CUDA timing is unreachable by configuration.** `benchmark_torch` refuses
+  `device="cuda"` with `synchronize=False`, and the refusal is checked *before* the CUDA-availability
+  probe so it raises for the right reason on a CPU-only machine; `BenchJob.bench_config` — the only
+  construction site in the benchmark path — hard-codes `synchronize=True`.
+
+The sweep these conventions produced is P7-D6. No number from the harness smoke test (5 warmup / 20
+timed, run only to prove every backend loads) is a result, and none is reported as one.
+
+### P7-D6 — The sweep: what it measured, and the two ways the headline needed qualifying. RECORDED 2026-09-09
+
+> **MEASUREMENTS SUPERSEDED BY P7-D9 AND P7-D12; ONE RANKING CLAIM IN THIS ENTRY IS WRONG.**
+> Every latency number below was taken with TF32 on, so its GPU rows time a computation that fails
+> this project's parity bar (P7-D9), and the corrected sweep reversed the headline on the
+> convolutional models (P7-D12). Beyond that supersession, the p99 claim in this entry — "ORT CPU
+> has the best tail of any ORT provider on all four models, and the best of the whole field on
+> three of four" — is **false on the current artifacts**, which give 2 of 4 and 1 of 4. It is an
+> ORT-CPU-inclusive ranking rather than a GPU number, so P7-D9's blanket supersession did not reach
+> it; it is retracted here. The *mechanisms* this entry identifies — launch-bound scaling, the
+> recurrent-versus-convolutional split — survive and are why P7-D12 reads the way it does.
+
+
+56 configurations — 4 models x 5 backends x 2 batch sizes, plus the 16 PyTorch-on-CUDA rows added
+after the first pass — at 200 warmup / 2000 timed iterations each, one intra-op thread, every
+configuration in its own subprocess, whole sweep run twice. A throwaway pass preceded it to warm
+clocks and page cache. Artifacts: `results/latency.{csv,json}`, `results/latency_stability.csv`,
+`results/latency_threads.csv`, `results/latency.md`, `results/latency_pareto.png`.
+
+**The expected result held.** Within ONNX Runtime, the CPU provider beats the CUDA provider at batch
+1 on every model: 1.47x (`tcn`), 1.15x (`tcn_quantile`), 4.97x (`lstm`), 4.19x (`lstm_quantile`). The
+mechanism is in the file rather than asserted: ORT CUDA on `tcn` is 1.045 ms at batch 1 and 1.056 ms
+at batch 32 — **32x the work for 1 percent more wall time**, the signature of a launch-bound
+workload, and incidentally positive evidence the GPU timings are synchronised rather than measuring
+launches.
+
+**Qualification 1 — the GPU result is architecture-dependent.** TensorRT beats ORT CPU on median for
+the two convolutional graphs (0.501 vs 0.711 ms on `tcn`) and loses badly on the two recurrent ones
+(4.480 vs 1.649 ms on `lstm`). A 200-step recurrence is a chain of small dependent kernels; a dilated
+convolution stack is not. Reporting "CPU beats GPU" flatly would have been wrong.
+
+**Qualification 2 — and this one was nearly missed.** The first sweep ran the PyTorch backends on
+**CPU only**, because `--torch-device` defaults to cpu; every GPU number in the study was therefore an
+ONNX Runtime number, in a study whose headline is CPU-versus-GPU. The 16 missing configurations were
+run and folded in (hence the `--append` path in `dmf.deploy.pipeline`), and they change the reading:
+**eager PyTorch on CUDA runs `lstm_quantile` at 1.378 ms against ORT CUDA's 8.619 ms, and beats ORT
+CPU's 2.055 ms on both p50 and p99.** cuDNN's fused LSTM kernel is one launch for the whole
+recurrence; ORT's CUDA LSTM on this build is not. So a large part of the batch-1 GPU penalty on the
+recurrent models is **a property of ONNX Runtime's CUDA provider, not of the hardware**. The
+convolutional graphs run the other way: eager PyTorch on CUDA is the slowest GPU option for `tcn`
+(3.644 ms), which is the per-op launch cost ORT's graph execution removes.
+
+`lstm_quantile` is also the most accurate model at the gate cell (skill 0.8826 vs `tcn`'s 0.8346), so
+the single place where the accuracy-optimal model and the CPU argument disagree is a real one and is
+stated in both `results/latency.md` and the README.
+
+**On p99**, the statistic a control loop is designed against, ORT CPU has the best tail of any ORT
+provider on all four models, and the best of the whole field on three of four. TensorRT buys a better
+median and pays for it in the tail (`tcn` p99 1.083 vs ORT CPU 0.938 ms).
+
+**At batch 32 the GPU wins overwhelmingly** — TensorRT 35 167 windows/s on `tcn` against ORT CPU's
+1 341. It does not change the deployment conclusion and is not buried: a landing aircraft forecasts
+one deck, so batch 1 is the mission and batch 32 is a throughput datapoint.
+
+**Thread sensitivity, both directions.** At 4 intra-op threads `tcn` on ORT CPU reaches 0.479 ms p50
+/ 0.647 ms p99 and beats TensorRT on **both**; `lstm` degrades monotonically, 1.742 to 2.285 ms from
+1 to 18 threads, because a 200-step recurrence does not parallelise. The shipped tables pin 1 thread,
+which is the deployment-honest setting and *not* the fastest one.
+
+**Every configuration clears a 10 Hz cycle by an order of magnitude** — the slowest batch-1 median in
+the sweep is 8.619 ms against a 100 ms budget — so the deployment question is which resource the
+forecaster spends, not whether it fits.
+
+### P7-D7 — PARTIAL FAILURE of the sub-10-percent stability checkbox: 10 of 56 configurations. RECORDED 2026-09-09
+
+> **SUPERSEDED BY P7-D13. Every row named in this entry is from the pre-TF32 sweep and none of them
+> is a current failure.** The corrected sweep passes p50 52 of 52 and fails p99 9 of 52; this
+> entry's headline row, `lstm/ort-trt/cuda` at batch 32 with +76.5 percent, now drifts -6.8. Two
+> claims in its closing paragraph are separately retracted: the `lstm` PyTorch-CUDA median did not
+> move 15.3 percent (it moved -0.26), and the sentence about the `lstm_quantile` PyTorch-CUDA row
+> being stable describes a configuration that per-provider parity has since **refused**, so no such
+> row exists (P7-D10). Cite `results/latency_stability.csv` or P7-D13, not this entry.
+
+
+`docs/IMPLEMENTATION_PLAN.md` §5.4 and the inference-benchmarking methodology both require p50 to
+agree within 10 percent across a re-run of the whole sweep. **It does not.** Reported here rather than
+re-run until it agreed, because re-running until the numbers match is how a benchmark becomes a search
+for the answer you wanted.
+
+| model | backend | device | batch | run 1 | run 2 | drift |
+|---|---|---|---|---|---|---|
+| `lstm` | ort-trt | cuda | 32 | 8.38 | 14.79 | **+76.5%** |
+| `lstm` | torch-compile | cuda | 1 | 2.34 | 1.39 | -40.5% |
+| `lstm` | torch-compile | cuda | 32 | 2.87 | 1.82 | -36.5% |
+| `tcn` | torch-compile | cuda | 1 | 1.73 | 2.26 | +30.7% |
+| `tcn_quantile` | torch-compile | cpu | 32 | 38.69 | 30.29 | -21.7% |
+| `tcn` | ort-trt | cuda | 32 | 0.94 | 0.78 | -17.4% |
+| `lstm` | torch-eager | cuda | 1 | 1.61 | 1.37 | -15.3% |
+| `tcn` | torch-eager | cuda | 32 | 3.87 | 4.37 | +12.8% |
+| `tcn` | torch-eager | cpu | 32 | 34.87 | 39.10 | +12.1% |
+| `lstm` | torch-compile | cpu | 1 | 2.30 | 2.57 | +12.0% |
+
+**Where it is and is not.** Every batch-1 **ONNX Runtime** configuration is stable — worst absolute
+drift 8.1 percent (ort-cpu), 3.9 (ort-cuda), 7.8 (ort-trt) — and those are the rows the
+CPU-versus-CUDA comparison rests on. The failures concentrate in batch 32, in `torch.compile`, and in
+TensorRT engine-build variance (the engine is rebuilt per subprocess; no engine cache is configured).
+
+**One published claim is weakened by this and is written accordingly.** The `lstm` PyTorch-on-CUDA
+median drifted 15.3 percent, which is larger than its separation from ORT CPU (1.615 vs 1.649 ms), so
+that pair is described as *comparable* rather than ordered. The `lstm_quantile` PyTorch-CUDA row,
+which is where PyTorch on CUDA actually beats ORT CPU, is stable and the claim there stands.
+
+**Not fixed, and the honest options.** A TensorRT engine cache would remove most of the TRT variance
+and a longer warmup might settle `torch.compile`; neither was done, because changing the harness after
+seeing which configurations disagreed is selecting a methodology on its results. Recorded as a partial
+failure of the checkbox.
+
+### P7-D8 — Gate 7's "no generic speedup multipliers" clause is checked mechanically. RECORDED 2026-09-09
+
+The clause is the kind normally satisfied by a human reading charitably. `dmf.deploy.gate` checks it
+instead: **every `Nx` claim in the README's latency section must be reproducible as a ratio of two
+measured p50 values, and every `… ms` figure must appear in a committed latency table**, plus six
+methodology tokens must be present (warmup, timed, p99, synchronisation, thread count, simulated).
+
+It earned its keep on first run: it failed the README for quoting `0.479 ms` and `0.647 ms`, which are
+real measurements from `latency_threads.csv` that the checker was only reading `latency.csv` for. The
+checker was widened to pool every committed latency table — the criterion is that a quoted number is
+measured and committed, and those are both. `scripts/gate7.py` and `make gate7` follow the gate4/5/6
+precedent and write `results/gate7.{csv,md}`.
+
+### P7-D9 — BLOCKING DEFECT, now fixed: every GPU row was measured with TF32 on, and parity had only ever been checked on the CPU provider. RECORDED 2026-09-09
+
+**What was wrong.** `dmf.deploy.parity` hard-coded `providers=["CPUExecutionProvider"]`, so the only
+arithmetic ever verified was the CPU one. `dmf.deploy.bench` built sessions from bare provider strings
+with no provider options, so ORT's CUDA EP ran with its default `use_tf32=1`, and
+`torch.backends.cudnn.allow_tf32` was left at its default True. On an Ampere card that means
+**every GPU row in the sweep was timed on TF32 arithmetic** — a 10-bit mantissa against FP32's 23 —
+while every CPU row ran full FP32. A CPU-versus-GPU headline was therefore comparing two different
+computations, and the word `tf32` appeared nowhere in the source, the artifacts or the document.
+
+**Measured, CPU EP as the FP32 reference, at this project's own scaled tolerance:**
+
+| graph | \|y\|max | scaled tol | CUDA, TF32 default | CUDA, `use_tf32=0` | verdict as shipped |
+|---|---|---|---|---|---|
+| `tcn` | 90.80 | 9.080e-03 | 4.921e-02 | 3.052e-05 | **FAIL** |
+| `tcn_quantile` | 139.46 | 1.395e-02 | 7.362e-02 | 4.196e-05 | **FAIL** |
+| `lstm` | 4.73 | 4.731e-04 | 2.986e-03 | 3.397e-06 | **FAIL** |
+| `lstm_quantile` | 9.10 | 9.098e-04 | 5.086e-02 | 7.772e-05 | **FAIL** |
+
+Three orders of magnitude, and all four fail the bar the CPU rows clear by two orders. **Every GPU
+latency number in the previous sweep is superseded**, not adjusted: they timed a computation this
+project does not accept.
+
+**The fix, decided by the user: TF32 off, re-measure.** Three switches, because no one of them
+covers the field, all routed through `dmf.deploy.providers.disable_tf32()` and
+`dmf.deploy.providers.tf32_environment()`:
+
+1. `NVIDIA_TF32_OVERRIDE=0` in every benchmark child's environment. **This is the only lever that
+   reaches TensorRT.** ORT 1.29's TRT EP has no TF32 provider option — `trt_tf32_enable` is rejected
+   as invalid, and the shipped `libonnxruntime_providers_tensorrt.so` contains no `tf32` symbol —
+   while TensorRT's builder sets `BuilderFlag::kTF32` by default. With the variable set, TensorRT
+   itself logs `Environment variable NVIDIA_TF32_OVERRIDE=0 but BuilderFlag::kTF32 is set. Disabling
+   TF32.`, which is the confirmation that it took effect.
+   Note the trap this sits next to: passing the *invalid* option instead makes ORT log an error and
+   **fall back to CPU while still returning a working session** — P7-D1 again, one line away.
+2. `use_tf32=0` on the ORT CUDA provider, through `dmf.deploy.providers.PROVIDER_OPTIONS`, the single
+   construction site every session in this package goes through.
+3. `torch.backends.cuda.matmul.allow_tf32 = False`, `torch.backends.cudnn.allow_tf32 = False` and
+   `torch.set_float32_matmul_precision("highest")` for the PyTorch backends.
+
+**Parity now runs once per execution provider that is benchmarked**, CPU, CUDA and TensorRT, plus a
+PyTorch-CPU-versus-CUDA check (`check_torch_device_parity`) for the four PyTorch CUDA rows, whose
+cuDNN kernels no ONNX parity row touches. `results/parity.csv` carries one row per (model, provider);
+`dmf.deploy.pipeline._is_blocked` refuses to time any configuration whose provider has no passing
+parity row, and Gate 7 clause 1 requires all of them rather than the CPU one. `latency.csv` carries a
+`tf32` column so every row states its arithmetic.
+
+**Direction of the correction, stated in advance of reading it:** TF32 makes the GPU *faster*, so
+turning it off can only slow the GPU rows. The headline result — ORT CPU beats ORT CUDA at batch 1 —
+was therefore **conservative** under the defect and can only strengthen. The claims that could move
+are the ones where a GPU configuration won: TensorRT's median advantage on the convolutional graphs,
+and PyTorch-on-CUDA's advantage on `lstm_quantile`. Both are re-measured and reported as they now
+stand.
+
+**How it was caught, and the general lesson.** Adversarial review, by reading what the session
+construction did *not* pass rather than what it did. The generalisable form is the one P7-D1 already
+stated once: **on an accelerator, the defaults are not neutral.** A benchmark harness has to state
+its arithmetic in the artifact, which is now what the `tf32` column is for, and a parity check that
+certifies one provider certifies exactly one provider.
+
+### P7-D10 — cuDNN's fused LSTM is what makes PyTorch-CUDA fast on the recurrent models, and it is also why that configuration fails parity. RECORDED 2026-09-09
+
+**This entry retracts the second of P7-D6's two qualifications.** P7-D6 recorded that eager PyTorch
+on CUDA beats the ORT CPU provider on `lstm_quantile` at batch 1 on both p50 and p99, and concluded
+that "a large part of the batch-1 GPU penalty on the recurrent models is a property of ONNX Runtime's
+CUDA provider, not of the hardware". The first half of that sentence still stands. **The conclusion
+drawn from it does not, because the configuration it was measured on does not compute the right
+answer.**
+
+**What the per-provider parity check found.** P7-D9 added `check_parity` on every provider that gets
+benchmarked, rather than on the CPU provider alone. With TF32 off throughout, every ORT provider
+passes on every model. One configuration does not:
+
+| model | provider | max_abs_err | scaled tolerance | margin | verdict |
+|---|---|---|---|---|---|
+| `lstm_quantile` | `torch:cuda` | 5.296e-03 | 1.023e-03 | **0.19x** | **FAIL** |
+| `lstm` | `torch:cuda` | 2.790e-04 | 5.317e-04 | 1.90x | pass, but only just |
+
+**It is not TF32, and it is not the hardware.** Measured directly, 64 windows, seed 0, against the
+same model in double precision, with `torch.backends.cudnn.allow_tf32` and
+`torch.backends.cuda.matmul.allow_tf32` both False:
+
+| path | `lstm` error vs FP64 | `lstm_quantile` error vs FP64 |
+|---|---|---|
+| CPU FP32 | 2.433e-06 | 4.290e-05 |
+| CUDA, cuDNN fused LSTM | 4.909e-05 | **2.483e-03** |
+| CUDA, `cudnn.enabled = False` | 1.485e-06 | 4.504e-05 |
+
+Disabling cuDNN returns the CUDA result to the CPU's accuracy exactly. **The error is the fused
+recurrent kernel's accumulation order, not the device's arithmetic.** cuDNN's persistent RNN
+evaluates a 200-step recurrence in one launch; that is precisely why it is fast, and precisely why
+it accumulates differently.
+
+**The speed and the error have the same cause, and the trade is not available.** Timed on the same
+machine, batch 1, 100 warmup / 600 timed, synchronized:
+
+| model | cuDNN fused (fails parity) | `cudnn.enabled = False` (passes parity) |
+|---|---|---|
+| `lstm` | 1.166 ms p50 / 1.392 p99 | 32.160 ms p50 / 36.515 p99 |
+| `lstm_quantile` | 1.203 ms p50 / 1.748 p99 | 32.304 ms p50 / 36.087 p99 |
+
+**So the only PyTorch-CUDA configuration of `lstm_quantile` that passes this project's parity
+criterion is 32.3 ms — 27x slower than the one that fails it, and 16x slower than the ORT CPU
+provider's 2.055 ms.** The qualification P7-D6 raised was real as a measurement and wrong as a
+conclusion: PyTorch-CUDA is not quietly beating the CPU on the recurrent models, it is trading
+accuracy the CPU row was never allowed to trade, and when the trade is refused it loses by more than
+an order of magnitude.
+
+**What this does to the phase's headline.** It removes the exception this entry was written about,
+and an earlier version of this paragraph over-read that as *"every GPU configuration that passes the
+parity bar is slower than the ORT CPU provider at batch 1 on both recurrent models."* **That is
+false and is retracted.** `lstm` on eager PyTorch-CUDA passes parity at 1.905x margin and runs 1.300
+ms against the ORT CPU provider's 1.625 — 1.25x faster, in both repeats — as does `lstm` on
+`torch-compile` at 1.374. The refusal is one configuration of one model; generalising it to every
+GPU path turned a measured exclusion into a claim about the hardware, which is the same error in the
+opposite direction to the one this entry corrects. The CPU-versus-GPU finding no longer has
+the one exception that P7-D6 was careful to raise, because that exception was an artifact of an
+unverified computation — which is the same defect class as P7-D1 (a provider that silently fell back)
+and P7-D9 (an arithmetic mode that silently reduced precision), found the same way, by checking what
+the runtime actually did instead of what it was asked to do.
+
+**What is NOT retracted.** The mechanism P7-D6 identified is correct and stays: ORT's CUDA LSTM is
+genuinely slower than cuDNN's fused kernel, and the convolutional graphs genuinely run the other way
+round, with eager PyTorch on CUDA the slowest GPU option because ~150 unfused launches per forward
+pass is exactly what ORT's graph execution removes. Only the inference drawn about the CPU comparison
+is withdrawn.
+
+### P7-D11 — A refused configuration is an outcome of the study, not an error in it, and the exit code now says which. RECORDED 2026-09-09
+
+P7-D10 established that `lstm_quantile` on `torch:cuda` cannot pass the parity bar, because the
+cuDNN fused recurrence that makes it fast is what makes it inaccurate. That is a permanent, recorded
+property of the configuration, not a defect awaiting a fix.
+
+`scripts/benchmark.py` exited 1 on **any** parity failure. With per-provider parity in place that
+made `scripts/run_phase7.sh` abort at stage 1 of 5 under `set -e`, so **no committed command could
+reproduce the phase** — reintroducing exactly the defect S3 was raised to fix, by way of the fix for
+a different one.
+
+The exit code now stands for the invariant the stage ordering exists to protect: **nothing
+unverified was timed.** Concretely, `main` fails when
+
+1. a latency row exists whose `(model, provider)` has no passing parity row —
+   `dmf.deploy.pipeline.unverified_timed_configurations`, which returns the offending rows rather
+   than a boolean so the message can name them; or
+2. the refusals leave nothing to time at all; or
+3. a requested configuration crashed or refused during the latency stage.
+
+A refusal that `run_pipeline` correctly excluded is printed to stderr as `parity FAILED ... REFUSED,
+not benchmarked` and does not by itself fail the run.
+
+**Why this is not a weakening.** The property being enforced is strictly stronger than the one it
+replaces: "every parity check passed" says nothing about whether a failing configuration was
+nevertheless timed, which is the failure that would actually corrupt the table. `scripts/gate7.py`
+re-derives the same invariant independently, from the committed CSVs rather than from the pipeline's
+own in-memory result, so a bug in one does not silence the other. The two checks agreeing is what
+Gate 7 clause 1 now means.
+
+### P7-D12 — The headline changed when the sweep was re-run correctly, and it changed against the expectation. RECORDED 2026-09-10
+
+The phase was framed around an expectation, stated in `docs/IMPLEMENTATION_PLAN.md` §Phase 7 and in
+the task that opened this work: *for a model of this size, ORT CPU will very likely beat CUDA EP at
+batch 1, because kernel launch overhead dominates a few hundred microseconds of compute.* The first
+sweep matched it on every model, and this entry records that **the corrected sweep does not.**
+
+**What changed between the two sweeps.** TF32 was disabled on every GPU path and parity moved to
+per-provider (P7-D9); `lstm_quantile` on PyTorch-CUDA became a refusal rather than a row (P7-D10);
+and the re-run was done on an otherwise idle machine, where the first was not — the test suite was
+running concurrently for part of it. **The difference between the two sweeps is therefore not
+attributable to TF32**, and no such attribution is made here. What is established is narrower and
+sufficient: with TF32 on, every GPU provider fails the parity bar the CPU provider passes, so the
+first sweep's GPU rows were not measuring a computation this project accepts. The numbers below are
+the ones taken under conditions it does.
+
+**Batch 1, p50 / p99 in ms, one intra-op thread, run 1 of 2:**
+
+| model | ORT CPU | ORT CUDA | TensorRT |
+|---|---|---|---|
+| `tcn` | 0.689 / 0.900 | 0.739 / 1.766 | **0.445** / 0.876 |
+| `tcn_quantile` | 0.904 / 1.101 | 0.797 / 1.740 | **0.443 / 0.766** |
+| `lstm` | **1.625 / 1.962** | 8.152 / 13.122 | 4.293 / 9.118 |
+| `lstm_quantile` | **2.008 / 2.408** | 7.969 / 13.012 | 4.241 / 9.979 |
+
+**The expectation holds on the recurrent models and fails on the convolutional ones.** ORT CPU beats
+ORT CUDA by 5.02x on `lstm` and 3.97x on `lstm_quantile`, and beats TensorRT by 2.6x. On the
+convolutional graphs TensorRT beats ORT CPU on median by 1.55x (`tcn`) and 2.04x (`tcn_quantile`),
+and against ORT's CUDA provider the CPU wins `tcn` by only 1.07x and **loses** `tcn_quantile` at
+0.88x. The mechanism is the one the expectation named, applied honestly: a 200-step recurrence is a
+chain of small dependent kernels and cannot fill a GPU, while a dilated convolution stack can.
+
+**Two defects this found in the report generator, both of the same kind.** The sentence
+"the CPU provider beats the CUDA provider at batch 1 on every model measured" was hard-coded prose
+sitting beside computed ratios; after the re-run it printed `0.88x` for `tcn_quantile` in its own
+list — a ratio below 1 being, by its own definition two clauses earlier, the CPU losing — and still
+claimed every model. The p99 superlative had failed the same way earlier in the phase and had been
+fixed by deriving it; this one had not been. Both are now counted from the table
+(`_cpu_vs_cuda_sentence`, `_p99_winner`), and the adversarial review's standing note — that several
+load-bearing comparative sentences are prose next to computed numbers — is the reason to expect more
+of them rather than to consider this closed.
+
+**What survives, and it is a weaker claim than the one the phase set out to make.** Every
+configuration clears a 10 Hz cycle by more than an order of magnitude (slowest batch-1 median 8.152
+ms against 100 ms), so the deployment argument is no longer "the CPU is faster" but "the CPU is
+sufficient everywhere, wins outright on the recurrent models, and costs no contention with the
+perception GPU". On the convolutional models the GPU buys about a factor of two on a budget already
+exceeded a hundredfold. `CLAUDE.md` non-negotiable 6 requires the losing half of this in the README
+body, and it is there rather than here.
+
+### P7-D13 — Stability of the corrected sweep: p50 passes 52 of 52, p99 fails 9 of 52. Supersedes P7-D7. RECORDED 2026-09-10
+
+P7-D7 recorded the stability of the pre-TF32 sweep and is superseded: none of the ten rows it names
+is a current failure. Measured over the corrected sweep, two full passes of all 52 configurations:
+
+| statistic | within 10 percent | failures | worst |
+|---|---|---|---|
+| p50 | **52 of 52** | 0 | — |
+| p99 | 43 of 52 | **9** | `tcn_quantile/torch-eager/cuda` at batch 32, 43.6 percent |
+
+**The checkbox in `docs/IMPLEMENTATION_PLAN.md` §5.4 is written on p50 alone, and on that reading it
+now passes.** It is recorded as a partial failure anyway, because p99 is the statistic this phase
+argues from — `results/latency.md` says so in as many words — and a tail that moves 43 percent
+between identical runs is not evidence of a tail. Reporting "the stability criterion passes" and
+leaving the p99 column unmentioned would be true, and would be the kind of true that P6-D22's
+standard exists to catch.
+
+The nine failures fall as four `torch-compile`, three `torch-eager`, two `ort-trt`; four are at
+batch 1. **Two of them touch published comparisons**, and both are written down rather than left for
+a reader to find:
+
+- `tcn_quantile/ort-trt` at batch 1 drifts 13.5 percent on p99 (0.766 then 0.870 ms). It holds its
+  ordering against ORT CPU in both runs, so the claim stands, but it is quoted with both values.
+- The `tcn` p99 comparison between ORT CPU and TensorRT **reverses** between runs — 0.900 against
+  0.876, then 0.853 against 0.919 — so it is written as a tie. An ordering read off run 1 would have
+  been an artifact of which run was printed first.
+
+**Why p50 stabilised when p99 did not, stated as a hypothesis rather than a result.** The corrected
+sweep ran on an idle machine; the superseded one overlapped a test suite (P7-D12). A median is
+robust to a handful of contended iterations and a 99th percentile is exactly what they land in.
+Nothing here measures that, and no claim in this phase depends on it.
+
+### P7-D14 — What the second adversarial review found, and why it is the same defect five more times. RECORDED 2026-09-10
+
+The first review of this phase found a blocking defect (TF32, P7-D9). The re-review, run against the
+corrected artifacts, found **five more false claims**, all of one kind: **prose asserting a
+membership or a superlative, sitting beside a computed number, that was true of an earlier sweep and
+was never re-derived.** P7-D12 named this pattern and fixed three instances; it did not go looking
+for the rest. That was the mistake, and it is worth recording as a method failure rather than as
+five separate typos.
+
+| claim | published as | measured |
+|---|---|---|
+| "every GPU configuration that passes the parity bar is slower than ORT CPU on both recurrent models" | `latency.md`, README, **and P7-D10** | `lstm/torch-eager/cuda` 1.300 ms and `lstm/torch-compile/cuda` 1.374 pass parity (margin 1.905x) and beat ORT CPU's 1.625 — 1.25x faster, in both runs |
+| `tcn/ort-cpu` p99 is "the best tail of any configuration in the main sweep" | `latency.md` | third: `tcn_quantile/ort-trt` 0.766, `tcn/ort-trt` 0.876, then 0.900 |
+| "the `lstm_quantile` PyTorch-CUDA row ... is stable" | `latency.md` | there is no such row; it is the one P7-D10 refused |
+| "0 of 52 configurations exceeded it on p50 ... the worst being nothing at batch 0 (0.0 percent)" | `latency.md` | the p50 set is empty, and four sentences built on it degenerated, including a bolded universal quantifier over nothing |
+| "the change decides exactly one row of four ... two of five draws" | `latency.md`, README | four rows across two models; five of five draws exceed 1e-4 |
+
+**The one that matters most is the last, and not because of the count.** `lstm/torch:cuda` passes
+the scale-relative criterion and fails the plan's unscaled 1e-4 — and it holds the best batch-1
+median for its model and a seat on the Pareto frontier. So the threshold change adopted in P7-D3
+**selects a frontier member**. That was describable as "one row of four" only while parity ran on
+the CPU provider alone; per-provider parity (P7-D9) widened its reach and nothing went back to
+re-read it. It is now derived from `passed & ~passed_absolute` and stated in both documents.
+
+**Every one of the five is now computed from the tables** (`_gpu_rows_beating_cpu`,
+`_instability_paragraph`, `_threshold_reach`, and the p99 and frontier derivations from P7-D12),
+which is the only fix that survives the next re-run. The general lesson, stated because this phase
+has now paid for it twice: **in a document generated from measurements, a sentence that a human
+wrote and a number that a function computed will drift apart, and the sentence will be the one that
+is wrong.** The remaining hand-written comparatives in `dmf.deploy.report` are the standing risk;
+`tests/test_deploy_report.py` asserts the derived ones against synthetic tables whose answers are
+known by construction, and that is where a new claim belongs.
+
+**Two gate weaknesses the re-review also closed.** Clause 3's millisecond check matched only
+`N.NN ms` in prose, so the README's central results table — 24 latency values, unit in the caption —
+was the one part of the section it never read; editing `8.152` to `5.152` there passed the gate. It
+now reads table cells too, and coverage went from 6 figures to 37. And P7-D7 was still being cited
+by both live documents as the current stability list while describing the superseded sweep; it is
+marked superseded and replaced by P7-D13.
