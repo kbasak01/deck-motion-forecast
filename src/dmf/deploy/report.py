@@ -356,7 +356,67 @@ def _fastest(
     return float(rows[column].iloc[0]) if len(rows) else float("nan")
 
 
-def _closing_paragraph(lq_torch_cuda: float | None, lq_cpu: float) -> str:
+def _gpu_rows_beating_cpu(batch1: pd.DataFrame, parity_frame: pd.DataFrame) -> str:
+    """Say which parity-passing GPU configurations beat the ORT CPU provider, if any.
+
+    Counted rather than asserted. The sentence this replaces read "every GPU configuration
+    that passes the parity bar is slower than the ORT CPU provider at batch 1 on both
+    recurrent models", which was true of the sweep it was written against and false of the
+    one it shipped with: `lstm` on eager PyTorch-CUDA passes parity at 1.905x margin and is
+    1.25x faster than ORT CPU, in both repeats. The refusal of `lstm_quantile` on the same
+    backend (P7-D10) does not generalise to `lstm`, and writing as though it did turned one
+    measured exclusion into a claim about every GPU path.
+
+    Args:
+        batch1: Latency rows at batch 1.
+        parity_frame: The parity table, for each row's verdict.
+
+    Returns:
+        One or two sentences naming the configurations that beat ORT CPU, or saying that
+        none does.
+    """
+    passing = {
+        (str(row.model), str(row.provider)) for row in parity_frame.itertuples() if bool(row.passed)
+    }
+    beats: list[str] = []
+    for model in sorted(set(batch1["model"])):
+        rows = batch1[batch1["model"] == model]
+        cpu = rows[rows["backend"] == "ort-cpu"]
+        if cpu.empty:
+            continue
+        cpu_p50 = float(str(cpu["p50_ms"].iloc[0]))
+        for row in rows.itertuples():
+            if str(row.device) != "cuda":
+                continue
+            provider = (
+                "torch:cuda"
+                if str(row.backend).startswith("torch-")
+                else {
+                    "ort-cuda": "CUDAExecutionProvider",
+                    "ort-trt": "TensorrtExecutionProvider",
+                }.get(str(row.backend), "")
+            )
+            if (model, provider) not in passing:
+                continue
+            if float(str(row.p50_ms)) < cpu_p50:
+                beats.append(
+                    f"`{model}/{row.backend}` at {float(str(row.p50_ms)):.3f} ms against "
+                    f"{cpu_p50:.3f}"
+                )
+    if not beats:
+        return (
+            "**Every GPU configuration that passes the parity bar is slower than the ORT CPU "
+            "provider at batch 1, on every model measured.**"
+        )
+    joined = f"{'; '.join(beats[:-1])}; and {beats[-1]}" if len(beats) > 1 else beats[0]
+    return (
+        f"**It does not, however, leave the CPU ahead of every verified GPU row**: {joined}. "
+        "Those pass parity and are not excluded by anything; the withdrawal above is one "
+        "configuration of one model, not a statement about the GPU."
+    )
+
+
+def _closing_paragraph(lq_torch_cuda: float | None, lq_cpu: float, survivors: str) -> str:
     """State where accuracy and the CPU argument disagree, if they still do.
 
     An earlier draft asserted that `lstm_quantile` -- the most accurate model at the gate
@@ -368,6 +428,8 @@ def _closing_paragraph(lq_torch_cuda: float | None, lq_cpu: float) -> str:
 
     Args:
         lq_torch_cuda: `lstm_quantile` eager-CUDA p50 in ms, or None if it was refused.
+        survivors: Sentence from :func:`_gpu_rows_beating_cpu`, naming the parity-passing
+            GPU rows that still beat ORT CPU.
         lq_cpu: `lstm_quantile` ORT CPU p50, milliseconds.
 
     Returns:
@@ -390,11 +452,9 @@ def _closing_paragraph(lq_torch_cuda: float | None, lq_cpu: float) -> str:
         "accuracy. Per-provider parity withdrew that row: cuDNN's fused LSTM is what made it "
         "fast and is also why it misses this project's tolerance by 5.2x, and the same model "
         "with cuDNN disabled runs at 32.3 ms, sixteen times the CPU provider "
-        "(`docs/protocol.md` P7-D10). **So every GPU configuration that passes the parity bar "
-        "is slower than the ORT CPU provider at batch 1 on both recurrent models.** The "
-        "exception did not survive being checked, which is a reason to hold the remaining "
-        "claim more carefully, not less: it was removed by a control this phase added late, "
-        "and a study that had not added it would have published the opposite."
+        "(`docs/protocol.md` P7-D10). That row was removed by a control this phase added "
+        "late, and a study that had not added it would have published the opposite -- which "
+        "is a reason to hold what remains more carefully, not less. " + survivors
     )
 
 
@@ -482,7 +542,106 @@ def _frontier_sentence(pareto: pd.DataFrame) -> str:
         "designed against, and the CPU configurations are measured while using none of the "
         "GPU that perception needs; a p99 frontier drawn from the same file ranks them "
         "differently. One figure cannot carry both, so the ranking here is the median one "
-        "and the tail argument stays in the text above."
+        "and the tail argument stays in the text above. **The frontier's composition depends "
+        "on a refusal**: `lstm_quantile` on PyTorch-CUDA ran at roughly 1.2 ms with the same "
+        "skill and would have dominated the accurate end; it is absent because it fails "
+        "parity (`docs/protocol.md` P7-D10), not because it was measured and lost."
+    )
+
+
+def _instability_paragraph(frame: pd.DataFrame, batch1: pd.DataFrame) -> str:
+    """Say where the run-to-run instability is, branching on which statistic actually fails.
+
+    The version this replaces was written when p50 carried the failures and was not
+    re-derived when the corrected sweep moved them all to p99. With the p50 set empty it
+    printed "It does not: 0 of 52 configurations exceeded it on p50" -- contradicting its own
+    number -- then "the worst being nothing  at batch 0 (0.0 percent)", the empty-frame
+    fallbacks leaking into published prose, then a bolded universal quantifier over the empty
+    set. Four false sentences from one stale assumption, which is why this is computed.
+
+    Args:
+        frame: The full stability table, both statistics, all batch sizes.
+        batch1: The same table restricted to batch 1.
+
+    Returns:
+        One paragraph.
+    """
+    p50_fail = frame[~frame["within_10pct"]]
+    p99_fail = frame[~frame["p99_within_10pct"]]
+    b1_p99_fail = batch1[~batch1["p99_within_10pct"]]
+
+    def _worst(rows: pd.DataFrame, column: str) -> str:
+        if rows.empty:
+            return "none"
+        index = rows[column].abs().idxmax()
+        return (
+            f"`{rows.at[index, 'model']}/{rows.at[index, 'backend']}/"
+            f"{rows.at[index, 'device']}` at batch "
+            f"{int(str(rows.at[index, 'batch_size']))} "
+            f"({abs(float(str(rows.at[index, column]))):.1f} percent)"
+        )
+
+    if p50_fail.empty:
+        head = (
+            "**The two statistics disagree about whether this sweep is stable, and the one "
+            f"that fails is the one the argument uses.** On p50 every configuration holds: "
+            f"{len(frame)} of {len(frame)} agree within 10 percent across the two runs, so "
+            "the medians quoted above are reproducible. On **p99** that is not true: "
+            f"{len(p99_fail)} of {len(frame)} drift further, {len(b1_p99_fail)} of them at "
+            f"batch 1, the worst being {_worst(p99_fail, 'p99_drift_pct')}. "
+        )
+    else:
+        head = (
+            f"**Instability, stated as a fact and not as an excuse.** {len(p50_fail)} of "
+            f"{len(frame)} configurations drift more than 10 percent on p50, the worst "
+            f"{_worst(p50_fail, 'drift_pct')}; on p99, {len(p99_fail)} of {len(frame)} do, "
+            f"the worst {_worst(p99_fail, 'p99_drift_pct')}. "
+        )
+    by_backend = p99_fail.groupby("backend").size().sort_values(ascending=False)
+    where = ", ".join(f"{count} `{backend}`" for backend, count in by_backend.items())
+    return head + (
+        f"The tail failures fall as {where}. That is why every tail claim above is "
+        "restricted to what holds in **both** runs rather than read off run 1, and why the "
+        "one comparison whose margin is smaller than its comparator's drift is written as a "
+        "tie rather than an ordering."
+    )
+
+
+def _threshold_reach(parity_frame: pd.DataFrame) -> str:
+    """Say which rows the scale-relative criterion decides, and what turns on them.
+
+    Counted, because the asserted version said "the change decides exactly one row of four"
+    and named only `lstm_quantile`. With parity moved to every benchmarked provider (P7-D9)
+    the change decides four rows across two models, and one of them -- `lstm` on torch:cuda
+    -- goes on to hold the best batch-1 median for its model and a seat on the Pareto
+    frontier. A threshold change that selects a frontier member is not a footnote about one
+    row.
+
+    Args:
+        parity_frame: The parity table, carrying `passed` and `passed_absolute`.
+
+    Returns:
+        One or two sentences.
+    """
+    decided = parity_frame[parity_frame["passed"] & ~parity_frame["passed_absolute"]]
+    if decided.empty:
+        return (
+            "**The change decides nothing here**: every row passes the plan's original "
+            "unscaled 1e-4 as well."
+        )
+    names = sorted({f"`{row.model}/{row.provider}`" for row in decided.itertuples()})
+    models = sorted({str(row.model) for row in decided.itertuples()})
+    joined = f"{', '.join(names[:-1])} and {names[-1]}" if len(names) > 1 else names[0]
+    plural = "s" if len(models) > 1 else ""
+    return (
+        f"**The change decides {len(decided)} of the {len(parity_frame)} (model, provider) "
+        f"rows**, across {len(models)} model{plural}: {joined} pass the scale-relative "
+        "criterion and fail the unscaled one. That matters beyond a count, because "
+        "`lstm/torch:cuda` is among them and it holds the best batch-1 median for its model "
+        "and a place on the Pareto frontier below -- under the plan's original criterion it "
+        "would have been refused and the frontier would have a different member. PyTorch's "
+        "own FP32 output misses the unscaled bar against the same model in FP64, which is "
+        "what rules out an export defect and is the measurement the change rests on."
     )
 
 
@@ -660,9 +819,7 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         "read over the worst of five 1000-window draws; the implementation plan's original "
         "unscaled `max_abs_err < 1e-4` is reported beside it as `passed_absolute`. "
         "`docs/protocol.md` P7-D3 records that threshold change and the measurement behind "
-        "it. **The change decides exactly one row of four**: `lstm_quantile`, whose FP32 "
-        "error exceeds 1e-4 on two of five draws -- as does PyTorch's own FP32 output "
-        "against the same model in FP64, which is what rules out an export defect.",
+        "it. " + _threshold_reach(parity.frame),
         "",
     ]
     lines += _block(
@@ -833,7 +990,10 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         "*Second, PyTorch's own CUDA path behaves differently again -- where it could be "
         "verified.* " + _torch_cuda_paragraph(batch1, parity.frame),
         "",
-        "**The fastest configuration per model at batch 1, on median and on p99:**",
+        "**The fastest configuration per model at batch 1, on median and on p99.** Each row "
+        "is a minimum over the configurations that were *timed*, and `lstm_quantile` was "
+        "chosen from one fewer than the others: its PyTorch-CUDA path is refused, so its "
+        "winner is the best of what survived parity rather than the best of the field.",
         "",
         "| model | best p50 | | best p99 | |",
         "|---|---|---|---|---|",
@@ -916,7 +1076,9 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         f"against {trends[gainer]['best']:.3f} ms at "
         f"{int(trends[gainer]['best_threads'])}, where its **tail** "
         f"({trends[gainer]['best_p99']:.3f} ms p99) also beats the best GPU tail for that "
-        f"model in the main sweep. The median half of that comparison is not claimed: the "
+        f"model in the main sweep -- in **both** repeats, which has to be said because that "
+        f"comparator is one of the nine p99 failures and moves 13.5 percent between them "
+        f"(0.766 then 0.870 ms). The median half of that comparison is not claimed: the "
         "two differ by a few percent across two measurement sessions whose shared 1-thread "
         "configuration itself differs by a similar amount, so it is inside the noise.",
         "",
@@ -946,62 +1108,13 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         )[list(_STABILITY_DISPLAY)],
         float_fmt="{:.3f}",
     )
-    b1_drift = drifted[drifted["batch_size"] == 1]
-    _p99_worst = int(stability.frame.reset_index(drop=True)["p99_drift_pct"].abs().idxmax())
-    _worst_row = drifted.reset_index(drop=True)
-    _has_drift = not _worst_row.empty
-    _worst_drift = float(drifted["drift_pct"].abs().max()) if _has_drift else 0.0
-    _worst_index = int(_worst_row["drift_pct"].abs().idxmax()) if _has_drift else 0
-    _worst_batch = int(str(_worst_row.at[_worst_index, "batch_size"])) if _has_drift else 0
-    _lstm_torch_rows = b1_drift.loc[
-        (b1_drift["model"] == "lstm") & (b1_drift["backend"] == "torch-eager"), "drift_pct"
-    ]
-    lstm_torch_drift = abs(float(_lstm_torch_rows.iloc[0])) if len(_lstm_torch_rows) else 0.0
-    worst_by_backend = (
-        stability.frame[stability.frame["batch_size"] == 1]
-        .assign(abs_drift=lambda f: f["drift_pct"].abs())
-        .groupby("backend")["abs_drift"]
-        .max()
-    )
     lines += [
-        "**Where the instability is, stated as a fact and not as an excuse.** On p50, every "
-        "batch-1 **ONNX Runtime** configuration is stable -- worst absolute drift "
-        f"{worst_by_backend.get('ort-cpu', float('nan')):.1f} percent for ort-cpu, "
-        f"{worst_by_backend.get('ort-cuda', float('nan')):.1f} for ort-cuda and "
-        f"{worst_by_backend.get('ort-trt', float('nan')):.1f} for ort-trt -- and those are "
-        "the rows the CPU-versus-CUDA comparison rests on. On **p99** that is no longer "
-        f"true: {int((~stab1['p99_within_10pct']).sum())} of {len(stab1)} batch-1 "
-        "configurations drift more than 10 percent in the tail, which is why the tail claim "
-        "above is restricted to the backends that win it in **both** runs rather than "
-        "asserted from run 1. The p50 failures are concentrated in "
-        "batch 32, in `torch.compile`, and in TensorRT engine-build variance, the worst "
-        f"being {str(_worst_row.at[_worst_index, 'model']) if _has_drift else 'nothing'} "
-        f"{str(_worst_row.at[_worst_index, 'backend']) if _has_drift else ''} at batch "
-        f"{_worst_batch} "
-        f"({_worst_drift:.1f} percent). On p99 the worst is "
-        f"{stability.frame.at[_p99_worst, 'model']} "
-        f"{stability.frame.at[_p99_worst, 'backend']}/"
-        f"{stability.frame.at[_p99_worst, 'device']} at batch "
-        f"{int(str(stability.frame.at[_p99_worst, 'batch_size']))} "
-        f"({abs(float(str(stability.frame.at[_p99_worst, 'p99_drift_pct']))):.1f} percent).",
-        "",
-        f"**But {len(b1_drift)} of the unstable rows are at batch 1, and all of them are "
-        "PyTorch rows** -- worst absolute drift "
-        f"{worst_by_backend.get('torch-compile', float('nan')):.1f} percent for "
-        f"torch-compile and {worst_by_backend.get('torch-eager', float('nan')):.1f} for "
-        "torch-eager. That matters for one specific claim above: the `lstm` "
-        "PyTorch-on-CUDA median moved by "
-        f"{lstm_torch_drift:.1f} "
-        'percent between repeats, so "PyTorch on CUDA ties ORT CPU on `lstm`" is a '
-        "statement about two numbers whose separation is smaller than one of their own "
-        'run-to-run spreads, and should be read as "comparable" rather than as an '
-        "ordering. The `lstm_quantile` PyTorch-CUDA row, which is where PyTorch on CUDA "
-        "actually *beats* ORT CPU, is stable.",
+        _instability_paragraph(stability.frame, stab1),
         "",
         "Section 5.4 of the implementation plan makes sub-10-percent drift a "
         "deployment-validation checkbox. This is recorded as a **partial failure of that "
         "checkbox**, with every failing row named in the table above and in "
-        "`docs/protocol.md` P7-D7.",
+        "`docs/protocol.md` P7-D13.",
         "",
     ]
     if metrics_csv is not None and metrics_csv.is_file():
@@ -1051,9 +1164,10 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         "",
         "On one CPU thread through the ONNX Runtime CPU provider, the convolutional "
         f"forecaster runs at {_fastest(batch1, 'tcn', 'ort-cpu'):.2f} ms p50 and "
-        f"{_fastest(batch1, 'tcn', 'ort-cpu', 'p99_ms'):.2f} ms p99, the best tail of any "
-        "configuration in the main sweep (which pins one thread; the thread sweep reaches a "
-        "better one) -- while the same graph on ORT's CUDA provider is "
+        f"{_fastest(batch1, 'tcn', 'ort-cpu', 'p99_ms'):.2f} ms p99 -- not the best tail in "
+        "the sweep, which belongs to TensorRT on the quantile graph, but within a few "
+        "hundredths of a millisecond of it and reached without a GPU -- while the same graph "
+        "on ORT's CUDA provider is "
         f"{_ratio('tcn', 'ort-cuda', 'ort-cpu'):.1f}x slower at batch 1. That is the case "
         "for putting a deck-motion predictor on the flight controller's CPU rather than "
         "contending for the GPU that perception is using, and it rests on the **shape** of "
@@ -1061,7 +1175,11 @@ def build_latency_report(results_dir: Path, metrics_csv: Path | None = None) -> 
         "not on these absolute numbers, which were measured on a workstation CPU and an RTX "
         "A4000 and will not transfer to an embedded target.",
         "",
-        _closing_paragraph(_lq_torch_cuda, _fastest(batch1, "lstm_quantile", "ort-cpu")),
+        _closing_paragraph(
+            _lq_torch_cuda,
+            _fastest(batch1, "lstm_quantile", "ort-cpu"),
+            _gpu_rows_beating_cpu(batch1, parity.frame),
+        ),
         "",
     ]
     return "\n".join(lines) + "\n"

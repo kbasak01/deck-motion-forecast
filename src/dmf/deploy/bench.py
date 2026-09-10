@@ -139,7 +139,14 @@ class BenchResult:
         intra_op_threads: Thread count that took effect, read back from the runtime rather
             than copied from the request.
         tf32: Whether TF32 was permitted on the GPU paths. **False on every row this
-            harness produces**, and a column rather than a footnote because it changes what
+            project publishes.** For the PyTorch backends it is read back from
+            ``torch.backends.cuda.matmul.allow_tf32``; for the ORT backends it is the literal
+            ``False``, because ONNX Runtime exposes no way to read a provider option back off
+            a session. That asymmetry is worth knowing given P7-D9 was "TF32 was on and
+            nothing raised": for the ORT paths this column records what was *requested*, and
+            the control that actually establishes the arithmetic is the per-provider parity
+            check, which fails by five to fifty times when TF32 is on. It is a column rather
+            than a footnote because it changes what
             is being timed: with TF32 on, the GPU rows compute a 10-bit-mantissa
             approximation that fails this project's parity bar, while the CPU rows compute
             full FP32 (``docs/protocol.md`` P7-D9). It is trivially False on a CPU-only row

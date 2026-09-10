@@ -508,6 +508,82 @@ The sea-state-conditioning ablation is worth highlighting: at deployment you wou
 
 ### Phase 8 — MSS cross-validation (0.5 day, optional)
 
+> **Before you start — carried forward from Gate 7. Read `docs/protocol.md` §Phase 6 and §Phase 7
+> first.**
+>
+> Phases 3–7 measured things that change this section. The text below is the original plan and has
+> **not** been rewritten; these are the deltas.
+>
+> **1. Decide which shift MSS actually tests, and pre-register it before running anything.** The
+> plan treats "evaluate on MSS trajectories" as one experiment. It is two, and they predict opposite
+> rankings. Measured on this corpus, pitch at 10 s, mean over three seeds:
+>
+> | regime | best model | `tcn` | `lstm` | `dlinear` |
+> |---|---|---|---|---|
+> | `unseen_vessel` | `tcn` 0.8298 | 0.8298 | 0.8007 | 0.5019 |
+> | `unseen_seastate` | `dlinear` 0.4775 | 0.2772 | 0.3437 | 0.4775 |
+>
+> A different hull under a **matched** SS5 JONSWAP is a vessel shift, where the deep models hold up
+> and beat the linear one by 0.33 skill. The same hull under an **unmatched** spectrum is also a
+> sea-state shift, where the ordering inverts and `dlinear` beats `tcn` by 0.20. So "the deep model
+> held up on MSS data" and "the deep model collapsed on MSS data" are both available results
+> depending on how carefully the spectrum is matched, and choosing the comparison after seeing the
+> answer is the failure P4-D9 and Gate 4's fairness rule exist to prevent. **Write down which shift
+> you intend, and how closely the spectrum is matched, before the first evaluation run.**
+>
+> **2. A units error will not show up in the skill score.** MSS emits angles in **radians**; this
+> corpus stores **degrees** in Parquet and converts to radians only inside physics code
+> (`CLAUDE.md` §Style, which names this the most common bug class in the domain). Skill is
+> `1 - RMSE_model / RMSE_persistence`, a ratio of two quantities on the same data, so a uniform
+> factor-of-57 error **cancels exactly and leaves skill unchanged**. What it does change is the raw
+> RMSE column and every absolute threshold — the quiescence bands are 3.0°/2.0°/0.8 m·s⁻¹
+> (permissive) and 1.5°/1.0°/0.4 m·s⁻¹ (strict). Assert the unit at the CSV boundary; do not rely on
+> the headline metric to catch it, because it cannot.
+>
+> **3. Normalisation statistics come from the Python training split, not from the MSS record.**
+> Non-negotiable 3 in a new costume. `dmf.data.normalize` holds a per-channel scale in corpus units
+> (degrees, degrees per second, metres); the MSS trajectories are evaluation data and must be scaled
+> by the *training* statistics the model was fitted under. Re-deriving a scale from the MSS record
+> makes every skill score incomparable to the committed tables and is invisible in the output.
+>
+> **4. Persistence must be recomputed on the MSS trajectories themselves.** Non-negotiable 4. A
+> persistence denominator carried over from the Python corpus is a different denominator, so the
+> resulting number is not a skill score. Run `window_mean` and `dlinear_ols` beside it: the linear
+> and trivial rows are what make a deep-model result interpretable, and P4-D14 restriction 2 showed
+> the 1–5 s band — the one the project exists to serve — is where `tcn` merely *ties* `dlinear_ols`.
+>
+> **5. Use the default arm, and do not reach for the ablations.** Lookback stays at 200 samples
+> (20 s): P6-D24 measured the 40 s arm buying +0.02 skill in-distribution and costing 0.15–0.20 out
+> of it, at exactly the decision horizons, and MSS is out of distribution by construction. The
+> sea-state-conditioned arm is excluded outright — P6-D18 established its one-hot is
+> privileged information that a deployed system does not have, and MSS will not supply it either.
+>
+> **6. Statistical comparison needs the corpus's own spread as its yardstick.** "The response
+> spectra overlay closely" is unfalsifiable without knowing how much two realisations of *this*
+> simulator differ from each other. Compute the same statistics across the corpus's own seeds first
+> and quote that band beside the MSS overlay; the bootstrap machinery from Phase 6 already exists.
+> Any model-vs-model statement on MSS data still needs ≥ 3 seeds (non-negotiable 5).
+>
+> **7. Quiescence detection is built, and this carry-forward is discharged.** The Gate 3 and Gate 5
+> blocks both carried "implement `src/dmf/eval/quiescence.py` first" and both went unactioned. Phase
+> 6 built it; there are no `NotImplementedError` bodies left in that module and three committed
+> artifacts under `results/e04/`. It is the operational metric, it is threshold-based, and it is
+> therefore the part of the MSS test most exposed to delta 2 above. Report the base rate next to
+> every F1 (`CLAUDE.md` §Known traps).
+>
+> **8. Phase 7 hands forward a deployable set and one invariant.** The exported graphs are `tcn`,
+> `lstm`, `tcn_quantile` and `lstm_quantile` at regime `id`, seed 0. Nothing in Phase 8 requires
+> re-running the latency sweep. But if Phase 8 changes any exported checkpoint, parity must be
+> re-run **per execution provider** before anything is timed again — P7-D9 found every GPU row
+> measured with TF32 on, failing the parity bar the CPU passed, and P7-D11 made "nothing unverified
+> was timed" the invariant `make gate7` enforces.
+>
+> **9. The timebox in the section below is real.** Phase 7 ran far over its 0.5-day estimate, and
+> the overrun was spent on defects that were worth finding. Phase 8 is marked optional; if Octave
+> fights for more than half a day, `docs/mss_crossvalidation.md` explaining what was attempted is
+> the deliverable, and it is worth more than a rushed cross-validation nobody can reproduce.
+
+
 Timebox this hard. Install GNU Octave, clone `github.com/cybergalactic/MSS`, run an S175 or supply-vessel case under a JONSWAP spectrum matched to your SS5 head-seas cell, export the 6-DOF time series to CSV.
 
 Compare, not point-by-point (the phase realizations differ), but **statistically**:

@@ -4219,6 +4219,17 @@ timed, run only to prove every backend loads) is a result, and none is reported 
 
 ### P7-D6 — The sweep: what it measured, and the two ways the headline needed qualifying. RECORDED 2026-09-09
 
+> **MEASUREMENTS SUPERSEDED BY P7-D9 AND P7-D12; ONE RANKING CLAIM IN THIS ENTRY IS WRONG.**
+> Every latency number below was taken with TF32 on, so its GPU rows time a computation that fails
+> this project's parity bar (P7-D9), and the corrected sweep reversed the headline on the
+> convolutional models (P7-D12). Beyond that supersession, the p99 claim in this entry — "ORT CPU
+> has the best tail of any ORT provider on all four models, and the best of the whole field on
+> three of four" — is **false on the current artifacts**, which give 2 of 4 and 1 of 4. It is an
+> ORT-CPU-inclusive ranking rather than a GPU number, so P7-D9's blanket supersession did not reach
+> it; it is retracted here. The *mechanisms* this entry identifies — launch-bound scaling, the
+> recurrent-versus-convolutional split — survive and are why P7-D12 reads the way it does.
+
+
 56 configurations — 4 models x 5 backends x 2 batch sizes, plus the 16 PyTorch-on-CUDA rows added
 after the first pass — at 200 warmup / 2000 timed iterations each, one intra-op thread, every
 configuration in its own subprocess, whole sweep run twice. A throwaway pass preceded it to warm
@@ -4270,6 +4281,15 @@ the sweep is 8.619 ms against a 100 ms budget — so the deployment question is 
 forecaster spends, not whether it fits.
 
 ### P7-D7 — PARTIAL FAILURE of the sub-10-percent stability checkbox: 10 of 56 configurations. RECORDED 2026-09-09
+
+> **SUPERSEDED BY P7-D13. Every row named in this entry is from the pre-TF32 sweep and none of them
+> is a current failure.** The corrected sweep passes p50 52 of 52 and fails p99 9 of 52; this
+> entry's headline row, `lstm/ort-trt/cuda` at batch 32 with +76.5 percent, now drifts -6.8. Two
+> claims in its closing paragraph are separately retracted: the `lstm` PyTorch-CUDA median did not
+> move 15.3 percent (it moved -0.26), and the sentence about the `lstm_quantile` PyTorch-CUDA row
+> being stable describes a configuration that per-provider parity has since **refused**, so no such
+> row exists (P7-D10). Cite `results/latency_stability.csv` or P7-D13, not this entry.
+
 
 `docs/IMPLEMENTATION_PLAN.md` §5.4 and the inference-benchmarking methodology both require p50 to
 agree within 10 percent across a re-run of the whole sweep. **It does not.** Reported here rather than
@@ -4425,9 +4445,14 @@ conclusion: PyTorch-CUDA is not quietly beating the CPU on the recurrent models,
 accuracy the CPU row was never allowed to trade, and when the trade is refused it loses by more than
 an order of magnitude.
 
-**What this does to the phase's headline.** It strengthens it, and the strengthening is worth stating
-in the form a reader can check: *every GPU configuration that passes the parity bar is slower than
-the ORT CPU provider at batch 1 on both recurrent models.* The CPU-versus-GPU finding no longer has
+**What this does to the phase's headline.** It removes the exception this entry was written about,
+and an earlier version of this paragraph over-read that as *"every GPU configuration that passes the
+parity bar is slower than the ORT CPU provider at batch 1 on both recurrent models."* **That is
+false and is retracted.** `lstm` on eager PyTorch-CUDA passes parity at 1.905x margin and runs 1.300
+ms against the ORT CPU provider's 1.625 — 1.25x faster, in both repeats — as does `lstm` on
+`torch-compile` at 1.374. The refusal is one configuration of one model; generalising it to every
+GPU path turned a measured exclusion into a claim about the hardware, which is the same error in the
+opposite direction to the one this entry corrects. The CPU-versus-GPU finding no longer has
 the one exception that P7-D6 was careful to raise, because that exception was an artifact of an
 unverified computation — which is the same defect class as P7-D1 (a provider that silently fell back)
 and P7-D9 (an arithmetic mode that silently reduced precision), found the same way, by checking what
@@ -4518,3 +4543,75 @@ sufficient everywhere, wins outright on the recurrent models, and costs no conte
 perception GPU". On the convolutional models the GPU buys about a factor of two on a budget already
 exceeded a hundredfold. `CLAUDE.md` non-negotiable 6 requires the losing half of this in the README
 body, and it is there rather than here.
+
+### P7-D13 — Stability of the corrected sweep: p50 passes 52 of 52, p99 fails 9 of 52. Supersedes P7-D7. RECORDED 2026-09-10
+
+P7-D7 recorded the stability of the pre-TF32 sweep and is superseded: none of the ten rows it names
+is a current failure. Measured over the corrected sweep, two full passes of all 52 configurations:
+
+| statistic | within 10 percent | failures | worst |
+|---|---|---|---|
+| p50 | **52 of 52** | 0 | — |
+| p99 | 43 of 52 | **9** | `tcn_quantile/torch-eager/cuda` at batch 32, 43.6 percent |
+
+**The checkbox in `docs/IMPLEMENTATION_PLAN.md` §5.4 is written on p50 alone, and on that reading it
+now passes.** It is recorded as a partial failure anyway, because p99 is the statistic this phase
+argues from — `results/latency.md` says so in as many words — and a tail that moves 43 percent
+between identical runs is not evidence of a tail. Reporting "the stability criterion passes" and
+leaving the p99 column unmentioned would be true, and would be the kind of true that P6-D22's
+standard exists to catch.
+
+The nine failures fall as four `torch-compile`, three `torch-eager`, two `ort-trt`; four are at
+batch 1. **Two of them touch published comparisons**, and both are written down rather than left for
+a reader to find:
+
+- `tcn_quantile/ort-trt` at batch 1 drifts 13.5 percent on p99 (0.766 then 0.870 ms). It holds its
+  ordering against ORT CPU in both runs, so the claim stands, but it is quoted with both values.
+- The `tcn` p99 comparison between ORT CPU and TensorRT **reverses** between runs — 0.900 against
+  0.876, then 0.853 against 0.919 — so it is written as a tie. An ordering read off run 1 would have
+  been an artifact of which run was printed first.
+
+**Why p50 stabilised when p99 did not, stated as a hypothesis rather than a result.** The corrected
+sweep ran on an idle machine; the superseded one overlapped a test suite (P7-D12). A median is
+robust to a handful of contended iterations and a 99th percentile is exactly what they land in.
+Nothing here measures that, and no claim in this phase depends on it.
+
+### P7-D14 — What the second adversarial review found, and why it is the same defect five more times. RECORDED 2026-09-10
+
+The first review of this phase found a blocking defect (TF32, P7-D9). The re-review, run against the
+corrected artifacts, found **five more false claims**, all of one kind: **prose asserting a
+membership or a superlative, sitting beside a computed number, that was true of an earlier sweep and
+was never re-derived.** P7-D12 named this pattern and fixed three instances; it did not go looking
+for the rest. That was the mistake, and it is worth recording as a method failure rather than as
+five separate typos.
+
+| claim | published as | measured |
+|---|---|---|
+| "every GPU configuration that passes the parity bar is slower than ORT CPU on both recurrent models" | `latency.md`, README, **and P7-D10** | `lstm/torch-eager/cuda` 1.300 ms and `lstm/torch-compile/cuda` 1.374 pass parity (margin 1.905x) and beat ORT CPU's 1.625 — 1.25x faster, in both runs |
+| `tcn/ort-cpu` p99 is "the best tail of any configuration in the main sweep" | `latency.md` | third: `tcn_quantile/ort-trt` 0.766, `tcn/ort-trt` 0.876, then 0.900 |
+| "the `lstm_quantile` PyTorch-CUDA row ... is stable" | `latency.md` | there is no such row; it is the one P7-D10 refused |
+| "0 of 52 configurations exceeded it on p50 ... the worst being nothing at batch 0 (0.0 percent)" | `latency.md` | the p50 set is empty, and four sentences built on it degenerated, including a bolded universal quantifier over nothing |
+| "the change decides exactly one row of four ... two of five draws" | `latency.md`, README | four rows across two models; five of five draws exceed 1e-4 |
+
+**The one that matters most is the last, and not because of the count.** `lstm/torch:cuda` passes
+the scale-relative criterion and fails the plan's unscaled 1e-4 — and it holds the best batch-1
+median for its model and a seat on the Pareto frontier. So the threshold change adopted in P7-D3
+**selects a frontier member**. That was describable as "one row of four" only while parity ran on
+the CPU provider alone; per-provider parity (P7-D9) widened its reach and nothing went back to
+re-read it. It is now derived from `passed & ~passed_absolute` and stated in both documents.
+
+**Every one of the five is now computed from the tables** (`_gpu_rows_beating_cpu`,
+`_instability_paragraph`, `_threshold_reach`, and the p99 and frontier derivations from P7-D12),
+which is the only fix that survives the next re-run. The general lesson, stated because this phase
+has now paid for it twice: **in a document generated from measurements, a sentence that a human
+wrote and a number that a function computed will drift apart, and the sentence will be the one that
+is wrong.** The remaining hand-written comparatives in `dmf.deploy.report` are the standing risk;
+`tests/test_deploy_report.py` asserts the derived ones against synthetic tables whose answers are
+known by construction, and that is where a new claim belongs.
+
+**Two gate weaknesses the re-review also closed.** Clause 3's millisecond check matched only
+`N.NN ms` in prose, so the README's central results table — 24 latency values, unit in the caption —
+was the one part of the section it never read; editing `8.152` to `5.152` there passed the gate. It
+now reads table cells too, and coverage went from 6 figures to 37. And P7-D7 was still being cited
+by both live documents as the current stability list while describing the superseded sweep; it is
+marked superseded and replaced by P7-D13.

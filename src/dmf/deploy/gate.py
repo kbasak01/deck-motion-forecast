@@ -102,6 +102,20 @@ _MS_TOL: float = 0.01
 _LATENCY_COLUMN_RE = re.compile(r"(p50|p90|p99|mean)_ms(_run\d+)?")
 
 _MS_RE = re.compile(r"(\d+\.\d+)\s*ms\b")
+
+#: Decimal figures inside a markdown table cell in the README's latency section. The `ms`
+#: pattern above only reaches prose, and the README's central results table writes its unit
+#: in the caption rather than in each of its 24 cells -- so the table carrying every headline
+#: number was the one part of the section the gate did not check, and a figure could be
+#: edited there without failing (the re-review demonstrated it on `8.152` -> `5.152`). Cells
+#: that are plainly not latencies are filtered by magnitude at the call site.
+_TABLE_CELL_RE = re.compile(r"(?m)^\|(.+)\|\s*$")
+_TABLE_NUMBER_RE = re.compile(r"(?<![\w.])(\d+\.\d+)(?![\w.])")
+
+#: Largest value in a table cell still treated as a millisecond figure. Throughput
+#: (windows/s) and skill scores share the table with latencies; a latency in this study is
+#: under 50 ms and a throughput is over 1000, so the gap is wide enough to split on.
+_MS_CELL_MAX: float = 50.0
 _MULTIPLIER_RE = re.compile(r"(\d+(?:\.\d+)?)\s*x\b", re.IGNORECASE)
 
 
@@ -310,6 +324,13 @@ def _readme_verdict(evidence: Gate7Evidence) -> tuple[str, str]:
             if _LATENCY_COLUMN_RE.fullmatch(str(column)):
                 measured.update(float(value) for value in frame[column])
     quoted_ms = [float(match) for match in _MS_RE.findall(section)]
+    # Table cells too, so the section's main results table is checked rather than skipped.
+    for row in _TABLE_CELL_RE.findall(section):
+        for cell in row.split("|"):
+            for number in _TABLE_NUMBER_RE.findall(cell):
+                value = float(number)
+                if value <= _MS_CELL_MAX:
+                    quoted_ms.append(value)
     unmatched_ms = [
         value
         for value in quoted_ms
