@@ -16,9 +16,25 @@ keywords = ["seakeeping", "time-series-forecasting", "jonswap", "gnc", "onnx"]
 # Pinned exactly, per the implementation plan's reproducibility requirement. This set
 # was resolved and verified on the reference machine (Python 3.12.3, Ubuntu/WSL2,
 # RTX A4000, driver 595.61): torch resolved to 2.13.0+cu130 from the default PyPI
-# index with CUDA available, and onnxruntime-gpu exposes the TensorRT, CUDA and CPU
-# execution providers. If a CPU-only torch wheel is resolved elsewhere, reinstall with
+# index with CUDA available. If a CPU-only torch wheel is resolved elsewhere, reinstall
+# with
 #   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+#
+# The previous version of this comment claimed "onnxruntime-gpu exposes the TensorRT,
+# CUDA and CPU execution providers". That is true of `get_available_providers()`, which
+# reports what the build was compiled with, and false of session creation, which is the
+# only thing that matters -- see P7-D1. Both GPU providers need their shared libraries
+# preloaded into the process before `InferenceSession` is constructed:
+#   * CUDA EP needs libcublas/libcublasLt/libcudnn, which `import torch` preloads;
+#   * TensorRT EP needs libnvinfer.so.10, which only `import tensorrt` preloads.
+# `dmf.deploy.providers.preload_gpu_libraries()` does both, so `make bench` works from a
+# clean shell with no LD_LIBRARY_PATH. Without the preload ORT falls back to CPU and
+# still returns a working session, which is how a "TensorRT" row comes to hold CPU
+# timings.
+#
+# tensorrt-cu13 is pinned to the 10.x series deliberately: onnxruntime-gpu 1.29.0 links
+# libnvinfer.so.10, and the current default `tensorrt` release is 11.2.1.2, which ships
+# libnvinfer.so.11 and would install cleanly and then never load.
 dependencies = [
   "numpy==2.5.2",
   "scipy==1.18.1",
@@ -28,6 +44,7 @@ dependencies = [
   "torch==2.13.0",
   "onnx==1.22.0",
   "onnxruntime-gpu==1.29.0",
+  "tensorrt-cu13==10.16.1.11",
   "matplotlib==3.11.1",
   "rich==15.0.0",
   "tqdm==4.70.0",
@@ -83,7 +100,7 @@ show_error_codes = true
 
 # Packages that ship no type information.
 [[tool.mypy.overrides]]
-module = ["pyarrow.*", "matplotlib.*", "onnx.*", "onnxruntime.*", "scipy.*"]
+module = ["pyarrow.*", "matplotlib.*", "onnx.*", "onnxruntime.*", "scipy.*", "tensorrt.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

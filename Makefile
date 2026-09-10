@@ -18,8 +18,10 @@ GATE4_DIR ?= $(or $(RESULTS),results/e02)
 GATE5_DIR ?= $(or $(RESULTS),results/e03)
 # Gate 6 is read over the assembled report, which lives at the top of results/.
 GATE6_DIR ?= $(or $(RESULTS),results)
+# Gate 7 reads the deploy artifacts, which also live at the top of results/.
+GATE7_DIR ?= $(or $(RESULTS),results)
 
-.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full bench test lint format all
+.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report test lint format all
 
 data:   ; $(PY) scripts/generate_corpus.py --config $(SIMCFG) --out artifacts/corpus --workers $(WORKERS)
 train:  ; $(PY) scripts/train.py --config $(CFG)
@@ -32,6 +34,7 @@ rescore: ; $(PY) scripts/rescore_matched.py --all-arms
 gate4:  ; $(PY) scripts/gate4.py --results-dir $(GATE4_DIR) --out-dir $(GATE4_DIR)
 gate5:  ; $(PY) scripts/gate5.py --results-dir $(GATE5_DIR) --out-dir $(GATE5_DIR)
 gate6:  ; $(PY) scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DIR)
+gate7:  ; $(PY) scripts/gate7.py --results-dir $(GATE7_DIR) --out-dir $(GATE7_DIR)
 
 # Gate 6 predicate 1 is "`make eval` exits 0", which no artifact can testify to. This target
 # is the evidence: make stops on a non-zero exit, so the gate step runs only if eval passed,
@@ -40,9 +43,17 @@ gate6:  ; $(PY) scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DI
 gate6-full: eval
 	$(PY) scripts/gate6.py --results-dir $(GATE6_DIR) --out-dir $(GATE6_DIR) --eval-exit-code 0
 
-bench:  ; $(PY) scripts/benchmark.py --export --parity --latency
+# The whole phase, in the order the methodology requires: export, parity on every provider,
+# the sweep twice, the PyTorch-CUDA rows, the thread sweep, then render and gate. `make
+# bench` alone cannot produce the committed artifacts -- it has one --torch-device and no
+# thread axis -- so the script is the reproducing command, not this line.
+bench:  ; ./scripts/run_phase7.sh $(GATE7_DIR)
+# Re-render results/latency.md and the Pareto figure from the committed CSVs. No GPU, no
+# checkpoints, no corpus: it cannot start a measurement, which is what makes "is the
+# document a function of the CSVs?" answerable in a second.
+report: ; $(PY) scripts/benchmark.py --report
 test:   ; $(PYTEST)
 lint:   ; $(RUFF) check src tests && $(RUFF) format --check src tests && $(MYPY) src
 format: ; $(RUFF) format src tests && $(RUFF) check --fix src tests
 
-all: data train eval bench
+all: data train eval bench report gate7

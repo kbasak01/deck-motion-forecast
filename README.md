@@ -9,7 +9,7 @@ full-scale manned or unmanned helicopter needs, not attitudes alone.
 **All results in this repository are from simulated vessel motion. No real deck data is used,
 and no sim-to-real claim is made.**
 
-Status: **Phase 5 complete. Gate 5 passes at its registered cell. The probabilistic heads are calibrated in-distribution at 10-15 s lead and nowhere else: they over-cover across the 1-5 s operational band, and coverage falls far below nominal under every distribution shift tested. The degradation is the finding, and it is reported rather than fixed. No probabilistic baseline was run, so the coverage column has no floor to clear -- the largest gap in the phase.**
+Status: **Phases 1-7 complete; Gate 7 passes. Phase 5 result unchanged: Gate 5 passes at its registered cell. The probabilistic heads are calibrated in-distribution at 10-15 s lead and nowhere else: they over-cover across the 1-5 s operational band, and coverage falls far below nominal under every distribution shift tested. The degradation is the finding, and it is reported rather than fixed. No probabilistic baseline was run, so the coverage column has no floor to clear -- the largest gap in the phase.**
 
 The simulator (`src/dmf/sim/`) and corpus are complete and Gate 1 passes; the realization-level
 split, windowing and train-only normalization are complete and Gate 2 passes (`src/dmf/data/`).
@@ -379,6 +379,102 @@ in the 1-5 s band and nowhere else.
 
 `docs/protocol.md` §Phase 5 is the full decision log: P5-D1 to P5-D8 were written *before* the
 sweep, P5-D13 to P5-D16 record what the sweep falsified.
+
+## Inference latency -- ONNX export and the CPU-versus-GPU question
+
+Four trained graphs (`tcn`, `lstm`, and their nine-quantile twins; regime `id`, seed 0) exported to
+ONNX at opset 18, dynamic batch axis only, then benchmarked across five backends at batch 1 and
+batch 32. Full tables, provenance markers and the environment stamp: **`results/latency.md`**,
+`results/latency.csv`, `results/latency.json`, `results/parity.csv`,
+`results/latency_stability.csv`, `results/latency_threads.csv`, `results/latency_pareto.png`.
+
+**Methodology**, because latency numbers without it are decoration: 200 warmup then 2000 timed
+iterations per configuration; each configuration in its own subprocess; `torch.cuda.synchronize()`
+around every timed GPU region, and the harness *refuses* to time a CUDA run without it; one
+iteration measured host to host (NumPy window in, NumPy forecast out, device transfers included) so
+every backend is the same quantity; CPU threads pinned to 1 and recorded on every row; p50, p90,
+p99, mean, std, throughput and peak memory reported, because a mean without a tail hides the
+iteration that misses the deadline. Parity is checked **before** any timing: 1000 random windows per
+draw, five draws, `max_abs_err < 1e-4 * max(1, |y|max)` -- a scale-relative criterion adopted
+deliberately and recorded as a threshold change in `docs/protocol.md` P7-D3, with the plan's
+original unscaled 1e-4 still reported per model in `parity.csv`.
+
+Parity is checked **on every execution provider that gets benchmarked**, not on the CPU one alone,
+and TF32 is disabled throughout. Both of those are late corrections rather than original design.
+With TF32 at its Ampere default all three GPU providers fail the parity bar that the CPU provider
+passes -- by five to fifty times -- so every GPU row in the first version of this study was timing a
+reduced-precision computation while the CPU rows ran full FP32, and nothing raised
+(`docs/protocol.md` P7-D9). 15 of the 16 (model, provider) pairs pass; the sixteenth,
+`lstm_quantile` on PyTorch-CUDA, is refused and therefore never timed. `lstm_quantile` also fails
+the *unscaled* 1e-4 on every provider including the CPU -- as does PyTorch's own FP32 output against
+the same model in FP64, which is what rules out an export defect and is why the criterion is
+scale-relative.
+
+### What was measured, at batch 1 -- the operational case
+
+**The expected result -- "a model this small should run faster on the CPU" -- holds for the
+recurrent models and does not hold for the convolutional ones.** Reporting only the half that
+matched the expectation would have been the easy version of this section.
+
+| model, batch 1 | ORT CPU | ORT CUDA | TensorRT | best |
+|---|---|---|---|---|
+| `tcn` | 0.689 / 0.900 | 0.739 / 1.766 | **0.445** / 0.876 | TensorRT on median |
+| `tcn_quantile` | 0.904 / 1.101 | 0.797 / 1.740 | **0.443 / 0.766** | TensorRT on both |
+| `lstm` | **1.625 / 1.962** | 8.152 / 13.122 | 4.293 / 9.118 | ORT CPU on tail |
+| `lstm_quantile` | **2.008 / 2.408** | 7.969 / 13.012 | 4.241 / 9.979 | ORT CPU on both |
+
+p50 / p99 in ms, one intra-op thread, run 1 of 2.
+
+1. **On the recurrent models the CPU wins outright and by a wide margin** -- 5.02x over ORT CUDA on
+   `lstm`, 3.97x on `lstm_quantile`, and 2.6x over TensorRT. A 200-step recurrence is a chain of
+   small dependent kernels, so the GPU never gets a batch large enough to amortise a launch.
+2. **On the convolutional models TensorRT wins the median** -- 1.55x over ORT CPU on `tcn`, 2.04x on
+   `tcn_quantile` -- and a dilated convolution stack is exactly the shape a GPU can feed. Against
+   ORT's *CUDA* provider the CPU still wins `tcn` (1.07x) but loses `tcn_quantile` (0.88x).
+3. **The tail is where the CPU recovers, and thread count decides it.** At one thread the `tcn`
+   p99 comparison flips between repeats (ORT CPU 0.900 then 0.853 ms; TensorRT 0.876 then 0.919) --
+   a tie, not a win. Give the CPU a modest budget and it stops being one: at 8 threads `tcn` on ORT
+   CPU reaches 0.465 ms p50 / 0.573 ms p99, matching TensorRT's median and beating its tail. The
+   recurrent models move the other way, degrading monotonically from 1.604 ms at one thread to
+   2.144 ms at eighteen, because a recurrence does not parallelise.
+4. **One configuration was refused rather than timed.** `lstm_quantile` on PyTorch-CUDA fails the
+   parity check, because cuDNN's fused LSTM -- the very thing that makes PyTorch fast on the
+   recurrent models -- accumulates a 200-step recurrence differently enough to miss the tolerance.
+   It is not TF32 and not the hardware: with cuDNN disabled the CUDA result matches the CPU's
+   accuracy exactly and runs more than an order of magnitude slower than ORT CPU
+   (`docs/protocol.md` P7-D10). An earlier draft of this section reported the fast number as a
+   genuine exception to the CPU case; per-provider parity withdrew it.
+
+**At batch 32 the GPU wins overwhelmingly** -- TensorRT reaches 44 123 windows/s on `tcn` against
+ORT CPU's 1 367. It does not change the conclusion and it is not buried: a landing aircraft
+forecasts one deck, so batch 1 is the mission and batch 32 is a throughput datapoint.
+
+**Run-to-run stability is a partial failure of the plan's own checkbox.** 9 of 52 configurations
+drift more than 10 percent between the two sweeps on p50 or p99, listed in
+`results/latency_stability.csv` and `docs/protocol.md` P7-D7. They are concentrated in
+`torch.compile` and in TensorRT engine-build variance; `tcn_quantile` on TensorRT at batch 1 is
+among them (13.5 percent on p99), which is one of the rows carrying claim 2, so that claim is read
+on the median -- stable in both runs -- rather than on the tail.
+
+### What it implies, and what it does not
+
+Every configuration measured clears a 10 Hz control cycle by more than an order of magnitude: the
+slowest batch-1 median in the sweep is 8.152 ms against a 100 ms budget. **So the deployment
+question is not whether the CPU is fast enough -- it is, on every model, at one thread -- but what
+the GPU would buy.** On the recurrent models the answer is nothing. On the convolutional ones it is
+roughly a factor of two on the median, for a model that already fits the budget a hundred times
+over, paid for by contending with the perception stack for the device.
+
+That is the honest case for putting a deck-motion forecaster on the flight controller's CPU, and it
+is weaker than "the CPU is faster" -- which is what the first version of this section said, before
+TF32 was disabled and the sweep re-run. It rests on sufficiency and on not competing for a
+contended resource, not on winning a race.
+
+**The RTX A4000 here is a workstation GPU standing in for an embedded target, and the CPU is an
+18-core / 36-thread i9-10980XE. Absolute numbers do not transfer to a flight controller.** No number
+in this section comes from anywhere but this machine; no speedup multiple is quoted that is not a
+ratio of two rows in `results/latency.csv`, and `make gate7` checks that mechanically. All results
+are from **simulated** vessel motion.
 
 ## Quickstart
 
