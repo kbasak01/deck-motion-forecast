@@ -40,7 +40,8 @@ task, same nominal hull. **Only the generator changes.**
 | Cells | headings 180 and 135 deg x speeds 0, 6, 12 kn x 3 seeds = 18 realizations |
 | Record | 600 s at 10 Hz, 299 jittered components — matched to the corpus exactly |
 | Models | `unseen_vessel` checkpoints, default arm, lookback 200, no ablations |
-| Baselines | `persistence`, `window_mean`, `dlinear_ols` **recomputed on the MSS records** |
+| Controls | sign flip, wave-grid attribution, amplitude rescaling, pipeline parity |
+| Baselines | `persistence`, `window_mean`, `damped_persistence`, `ar10/20/40`, `dlinear_ols` **re-scored on the MSS records** (fitted on the corpus training split, never refitted on MSS) |
 
 Octave was installed and MSS's own `waveMotionRAO.m` was run against our NumPy port. They agree to
 **4.42e-12** relative, with RMS ratios of 1.00000000 — so the port is not merely statistically
@@ -55,116 +56,223 @@ roll is live. Details in P8-D4.
 Per-DOF statistics at SS5, each MSS value quoted against the corpus's **own across-seed spread**,
 because "the spectra overlay closely" is unfalsifiable without that yardstick.
 
-| heading | DOF | corpus | MSS | ratio | z (corpus sd) |
-|---|---|---|---|---|---|
-| 135 deg | heave | 0.480 m | 0.363 m | 0.77 | −4.0 |
-| 135 deg | pitch | 1.113 deg | 0.871 deg | 0.79 | −3.7 |
-| 135 deg | roll | 0.584 deg | 0.576 deg | 1.13 | +3.1 |
-| 180 deg | heave | 0.459 m | 0.202 m | 0.46 | −9.0 |
-| 180 deg | pitch | 1.501 deg | 0.642 deg | 0.44 | −7.5 |
-| 180 deg | roll | 0.038 deg | 0.000 deg | 0.00 | −22.4 |
+| heading | DOF | corpus | MSS | ratio | z (corpus sd) | per-speed ratio |
+|---|---|---|---|---|---|---|
+| 135 deg | heave | 0.480 m | 0.363 m | 0.757 | −4.25 | 0.665 – 0.889 |
+| 135 deg | pitch | 1.113 deg | 0.871 deg | 0.782 | −3.87 | 0.696 – 0.900 |
+| 135 deg | roll | 0.584 deg | 0.576 deg | 0.986 | −0.32 | **0.648 – 1.627** |
+| 180 deg | heave | 0.459 m | 0.202 m | 0.441 | −8.76 | 0.353 – 0.584 |
+| 180 deg | pitch | 1.501 deg | 0.642 deg | 0.428 | −7.44 | 0.342 – 0.561 |
+| 180 deg | roll | 0.038 deg | 0.000 deg | 0.000 | −22.31 | — |
 
-Zero-crossing periods agree far better: ratios 0.85 to 1.04 throughout.
+Ratios are ratios **of means**, and z is computed from those means. An earlier version of this
+table averaged the per-speed ratios and z-scores instead, which is not a valid summary of either
+quantity and printed 1.13 / +3.1 for the roll row where the honest values are 0.986 / −0.32
+(P8-D11). `dmf.mss.compare.marginalize_over_speed` now computes the marginal correctly and prints a
+warning whenever the per-speed spread exceeds 0.5, which is how the next row was found.
 
-So our reduced-order generator is 1.3x hot at bow-quartering and 2.2x hot in head seas, while
-reproducing the motion's *timescales* well. The head-seas roll row is not a disagreement about roll:
-MSS gives exactly zero by port/starboard symmetry, and the corpus value is entirely the P1-D2
-residual floor. That cell was excluded from the headline in advance (P8-D1) because a skill score
-against a zero-variance target is undefined.
+Zero-crossing periods agree much better: ratios 0.856 to 1.045, i.e. within 0.7 to 4.8 corpus
+standard deviations.
+
+**The roll row hides a first-order disagreement.** Corpus roll at 135 deg falls 2.5x with forward
+speed (0.873 → 0.526 → 0.353 deg RMS at 0 / 6 / 12 kn) while MSS's is essentially flat
+(0.566 → 0.588 → 0.574). The per-speed ratio therefore runs 0.648 → 1.117 → **1.627**, at z = +14.9
+in the 12 kn cell. The two generators disagree about the *speed dependence of roll response*, not
+merely its level, and the marginal ratio of 0.986 conceals that completely. The amplitude gap is
+speed-dependent in the other channels too — heave at 180 deg runs 0.353 to 0.584 — so
+"our generator is 1.6x hot" is a summary that should not be quoted without its spread.
 
 ![Response spectra](../results/mss/mss_response_spectra.png)
 
-## Result 2 — skill transfers at short lead and collapses at long lead
+## Result 2 — only the DLinear family transfers
 
 ![Skill versus horizon](../results/mss/mss_skill_vs_horizon.png)
 
-Pitch, mean over cells and three seeds. Solid is the committed corpus `unseen_vessel` row; dashed is
-the same checkpoint on MSS trajectories.
+At the pre-registered cell, pitch at 10 s, against the committed corpus `unseen_vessel` rows. Two
+aggregators are shown because they disagree in sign for two models: `mean` is the mean of per-cell
+skill, `pooled` forms one skill from summed SSE over all cells. NRMSE is scale-free and does not
+depend on the persistence denominator at all.
 
-| horizon | `dlinear_ols` | `tcn` | `lstm` | `transformer` |
+| model | corpus | MSS (mean) | MSS (pooled) | MSS NRMSE |
 |---|---|---|---|---|
-| 1 s | 0.997 | 0.953 | 0.656 | 0.681 |
-| 2 s | 0.965 | 0.847 | 0.703 | 0.850 |
-| 3 s | 0.899 | 0.714 | 0.659 | 0.847 |
-| 5 s | 0.936 | 0.700 | 0.481 | 0.819 |
-| **10 s** | **0.383** | **−0.903** | **−1.556** | **−0.177** |
-| 15 s | 0.386 | −0.047 | −0.606 | 0.260 |
+| `dlinear` | 0.4144 ± 0.0015 | **0.3935 ± 0.0017** | 0.5153 | 0.858 |
+| `dlinear_ols` | 0.4904 | **0.3835** | 0.5065 | 0.880 |
+| `ar20` | 0.5258 | 0.1560 | 0.3186 | 1.019 |
+| `window_mean` | 0.0733 | −0.0586 | 0.3326 | 1.026 |
+| `transformer` | 0.7654 ± 0.0323 | −0.1773 ± 0.0295 | 0.2198 | 1.108 |
+| `ar40` | 0.5412 | −0.7243 | −1.0092 | 1.584 |
+| `tcn` | 0.8604 ± 0.0040 | −0.9033 ± 0.1384 | −0.3000 | 1.458 |
+| `lstm` | 0.8032 ± 0.0169 | −1.5564 ± 0.5995 | −0.9082 | 1.748 |
+| `persistence` | 0.0000 | 0.0000 | 0.0000 | 1.000 |
 
-At the pre-registered cell — pitch at 10 s — against the committed corpus values:
+Closed-form rows are deterministic and carry no seed spread by construction.
 
-| model | corpus | MSS | change |
+**The dividing line is not linear versus deep.** `ar40` is a linear model. It *beats* `dlinear_ols`
+on the corpus (0.5412 against 0.4904) and collapses to −0.7243 on MSS, worse than `transformer`.
+`ar20` loses 0.37. What transfers is the DLinear family specifically — `dlinear` loses 0.02 and
+`dlinear_ols` 0.11 — and nothing else does.
+
+P3-D1 explains why, and it did so two phases before this run: the corpus has no process noise, so a
+sum of sinusoids satisfies an exact linear recursion and **AR identifies the system**. A model that
+identifies a generator's dynamics transfers to that generator and to nothing else, and identifying
+harder makes it worse — `ar40` loses 1.27 where `ar20` loses 0.37. The deep models are doing the
+same thing implicitly. DLinear survives because its trend-plus-seasonal decomposition followed by a
+direct per-channel linear map is too constrained to identify the recursion in the first place.
+
+**Skill in the 1–5 s operational band, per DOF.** An earlier version of this document claimed
+"every model keeps positive skill through 5 s." That is false, and it was false in the committed
+CSV at the time it was written (P8-D11). It holds only for the DLinear family:
+
+| model | pitch 5 s | heave 5 s | roll 5 s (135 deg) |
 |---|---|---|---|
-| `persistence` | 0.0000 | 0.0000 | by construction |
-| `window_mean` | 0.0733 | −0.0586 | −0.132 |
-| `dlinear_ols` | 0.4904 | 0.3835 | −0.107 |
-| `dlinear` | 0.4144 | 0.3935 | −0.021 |
-| `tcn` | 0.8604 | **−0.9033** | −1.764 |
-| `lstm` | 0.8032 | **−1.5564** | −2.360 |
-| `transformer` | 0.7654 | −0.1773 | −0.943 |
+| `dlinear` | 0.956 | 0.933 | 0.948 |
+| `dlinear_ols` | 0.936 | 0.923 | 0.952 |
+| `tcn` | 0.700 | **0.011** | 0.457 |
+| `transformer` | 0.819 | **−0.486** | 0.195 |
+| `lstm` | 0.481 | **−0.228** | **−0.191** |
+| `ar20` | 0.468 | **−2.354** | **−1.301** |
+| `ar40` | **−0.639** | **−4.275** | **−2.370** |
 
-**The pre-registered primary prediction is falsified.** P8-D1 predicted the `unseen_vessel` ordering
-would hold, with `tcn` retaining skill above 0.5. Instead the three deep models go *negative* — worse
-than persistence — while the two linear models lose about 0.1 and 0.02 skill respectively.
+Heave is the channel the project exists for — timing a touchdown on a *heaving* deck — and at 5 s it
+is where everything except DLinear is at or below persistence. `lstm` is also negative in roll at 1,
+3 and 5 s.
 
-**The pre-registered counter-hypothesis is confirmed.** The same entry recorded the opposite
-prediction, implied by the generator defect found while building the bridge (P8-D6): if the deep
-models were exploiting a roll/pitch/heave phase relationship our generator gets wrong by 90 degrees,
-they should lose more than a per-channel linear map, which is the model least able to depend on
-cross-channel phase. That is what happened.
+**A caveat on the pre-registered cell.** Pitch at 10 s is the most denominator-fragile cell in the
+grid: 10 s is close to Tp = 9.7 s, so persistence is quasi-periodically lucky and its RMSE *falls*
+from 1.377 at 5 s to 0.903 at 10 s. Skill is a ratio against that denominator, so the drop is
+amplified there. NRMSE, which does not use it, tells a milder version of the same story —
+`tcn` 1.458 against `dlinear_ols` 0.880 — and the ordering is unchanged. The cell was fixed in
+P3-D12, long before this phase, so it is not a Phase 8 choice; but the headline should not be quoted
+without it.
 
 ## Controls
 
 | control | result | reading |
 |---|---|---|
-| Sign-flip ablation | skill moves by ≤ 0.006 | the conclusion does not rest on the P8-D3 sign derivation |
-| `persistence` self-skill | exactly 0.0 on both sides | the denominator was recomputed on MSS data, not carried over (delta 4) |
+| Sign-flip ablation | model means move ≤ 0.0061 at pitch/10 s, ≤ 0.0795 over the whole grid | the conclusion does not rest on the P8-D3 sign derivation |
+| `persistence` self-skill | exactly 0.0 on both sides | the denominator was re-scored on MSS data, not carried over (delta 4) |
 | Normalisation provenance | `unseen_vessel/train` | statistics come from the corpus training split (delta 3) |
 | Pipeline parity | agrees to 1e-10 with `evaluate_models` | the external path is the corpus path |
-| Amplitude rescaling | recovers ~18% of the drop | most of the collapse is structural, not a normalisation-range effect |
+| Wave-grid attribution | −0.04 to −0.19 skill | the wave field is not the cause; the hull response is |
+| Amplitude rescaling | no single decomposition; reverses on roll | the normalisation gap is not the explanation |
 
-### The amplitude control, in detail
+**Sign-flip ablation.** Individual (cell, seed, record) rows move by up to 1.81, so the small number
+above is a statement about the aggregate the conclusion is drawn from, not about every row. Stated
+as "skill moves by ≤ 0.006" without that qualifier it was wrong (P8-D11).
 
-Our generator runs ~1.6x hot (Result 1), so after normalisation by `unseen_vessel/train`
-statistics the MSS records present to the model at roughly half the amplitude of anything in
-training. That alone could depress a deep model without any structural story being true. To separate
-the two, each MSS channel was rescaled so its RMS matches the corpus mean for that cell — changing
-the amplitude the model sees and leaving every phase, period and cross-channel relationship intact.
+**Wave-grid attribution — the control the config declared and the first run skipped.**
+`configs/mss/s175_ss5.yaml` defines two wave-grid conventions: MSS's own, and one that reuses
+`dmf.sim.spectra.sample_components` so the wave field is bit-for-bit the corpus's. Re-running with
+the corpus grid changes pitch/10 s skill by −0.047 (`dlinear_ols`), −0.043 (`ar40`), −0.092 (`tcn`),
+−0.100 (`transformer`) and −0.188 (`lstm`) — small, and in the same direction for every model. So
+the difference in wave-field discretisation is not what breaks transfer. **What changes is the hull
+response**, which is the claim the phase wanted to make and could not make from the first run alone.
 
-| model | MSS as-is | MSS rescaled | recovered |
+**Amplitude rescaling.** Our generator runs hot (Result 1), so after normalisation the MSS records
+present at roughly half the amplitude of anything in training; that alone could depress a deep model
+with no structural story being true. Rescaling each MSS channel to the corpus mean RMS for its cell
+changes amplitude and leaves phase, period and cross-channel relationships intact. At 10 s:
+
+| DOF | `dlinear_ols` | `ar40` | `tcn` | `lstm` | `transformer` |
+|---|---|---|---|---|---|
+| pitch | 0.000 | +0.051 | +0.324 | +0.450 | +0.004 |
+| heave | 0.000 | +2.279 | +0.142 | +1.578 | +0.756 |
+| roll | 0.000 | **−13.382** | **−1.629** | **−1.157** | **−2.095** |
+
+The `dlinear_ols` row is exactly zero throughout, which is the control behaving as it must: skill is
+scale-invariant and a per-channel constant cannot reach it. Everything else moves, in both
+directions, by amounts spanning three orders of magnitude.
+
+**An earlier version of this document reported "recovers ~18%, so ~82% is structural."** That was
+`tcn`, at pitch, at 10 s, quoted as though it were a decomposition. It is not one. On roll the
+control makes every non-DLinear model *worse* — because the premise fails there: the corpus is
+*cold* in roll at speed (MSS/corpus 1.63 at 12 kn), so the rescale shrinks roll in half the cells.
+No fraction of the collapse can be attributed to normalisation range from this control; the honest
+statement is that scale is not the explanation, and the control does not tell us what is (P8-D11).
+
+## Result 3 — the operational metric does not survive the amplitude gap
+
+Carry-forward delta 7 required the quiescence detector to be run on the MSS records, with the base
+rate beside every F1. It is the operational metric, it is threshold-based on **absolute** limits
+(3.0 deg / 2.0 deg / 0.8 m·s⁻¹ permissive; 1.5 / 1.0 / 0.4 strict), and delta 2 predicted it would
+be the part of this phase most exposed to a scale difference. It was.
+
+| | corpus (`unseen_vessel`) | MSS |
+|---|---|---|
+| base rate, permissive | 0.793 | **0.987** |
+| base rate, strict | 0.537 | 0.652 |
+| true onsets per 600 s record, permissive | — | 3.9 |
+| true onsets per 600 s record, strict | — | 16.8 |
+
+Our generator runs hot, so the same absolute limits classify a far larger fraction of the MSS record
+as quiescent: under permissive thresholds the MSS deck is landable **98.7%** of the time and a 600 s
+record contains fewer than four onsets to detect. The detection problem is not the same problem, and
+the F1s are not comparable to the committed corpus numbers. Reported with base rates so the reader
+can see that rather than infer it:
+
+| model | permissive F1 | strict F1 | base rate (perm / strict) |
 |---|---|---|---|
-| `dlinear_ols` | 0.3835 | 0.3835 | +0.0000 |
-| `dlinear` | 0.3935 | 0.3935 | +0.0000 |
-| `tcn` | −0.9033 | −0.5796 | +0.3237 |
-| `lstm` | −1.5564 | −1.1062 | +0.4502 |
-| `transformer` | −0.1773 | −0.1732 | +0.0041 |
+| `dlinear` | 0.305 ± 0.004 | 0.105 ± 0.001 | 0.987 / 0.652 |
+| `damped_persistence` | 0.282 | 0.099 | 0.987 / 0.652 |
+| `dlinear_ols` | 0.219 | 0.082 | 0.987 / 0.652 |
+| `ar10` | 0.141 | 0.080 | 0.987 / 0.652 |
+| `tcn` | 0.104 ± 0.005 | 0.076 ± 0.005 | 0.987 / 0.652 |
+| `lstm` | 0.046 ± 0.012 | 0.064 ± 0.001 | 0.987 / 0.652 |
+| `transformer` | 0.021 ± 0.011 | 0.053 ± 0.003 | 0.987 / 0.652 |
+| `always_quiescent` (null) | 0.012 | 0.029 | 0.987 / 0.652 |
+| `persistence`, `window_mean` | 0.000 | 0.000 | 0.987 / 0.652 |
 
-The linear rows move by **exactly zero**, which is the control working: skill is scale-invariant and
-a per-channel constant cannot reach it. The deep rows recover some skill and **stay strongly
-negative**. For `tcn`, rescaling returns 0.32 of a 1.76 drop — about 18%. So the normalisation-range
-effect is real and is a minority of the story; roughly four fifths of the collapse survives it.
+The DLinear ordering holds here too, and the always-yes null still scores near zero on the onset
+formulation, reproducing P6-D2's finding that the metric is not naively base-rate-exploitable even
+at a base rate of 0.987. But `persistence` and `window_mean` emit **no onsets at all**, and every
+F1 in the table is low enough that the ranking is carried by precision against a near-degenerate
+positive class. **Treat this table as evidence that the operational comparison cannot be made across
+generators with different motion amplitudes, not as an operational result.** Making it would need
+thresholds expressed relative to each generator's own motion scale, which is a change to the metric
+definition and out of scope here.
 
 ## What this does and does not establish
 
-**It establishes** that in the 1–5 s band — the band the project exists to serve — every model keeps
-positive skill on an independent hydrodynamic computation, so short-horizon deck-motion forecasting
-is learning something real about wave response and not purely an artifact of our generator.
+**It establishes that one model family transfers.** `dlinear` and `dlinear_ols` hold 0.92–0.96 skill
+at 5 s in all three DOFs on an independent hydrodynamic computation, and lose only 0.02–0.11 at the
+10 s gate cell. Short-horizon deck-motion forecasting with a constrained linear map is learning
+something about wave response that is not an artifact of our generator.
 
-**It also establishes** that the deep models' headline advantage does not survive that transfer, and
-that the advantage was measured precisely where it fails to transfer. Gates 3, 4 and 5 were all read
-at pitch / 10 s, a cell chosen in P3-D12 and kept in P4-D1 and P5-D2. At 10 s the deep models beat
-`dlinear_ols` by 0.37 on the corpus and lose to it by 1.29 on MSS. P4-D14 restriction 2 had already
-found that `tcn` merely *ties* `dlinear_ols` in the 1–5 s operational band; this phase adds that
-where it does not tie, it does not transfer.
+**It establishes that nothing else does.** All three deep models and the AR family go to or below
+persistence, and the failure is not confined to long lead: at 5 s in heave — the channel the project
+exists for — `tcn` is at 0.011, `transformer` at −0.486, `ar40` at −4.275.
 
-**It does not establish** that the deep architectures are bad at deck-motion forecasting. It
-establishes that *these* checkpoints, trained on *this* corpus, learned long-horizon structure that
-is specific to this generator. A corpus without the P8-D6 phase defect might well support a deep
-model that transfers; that is a Phase 9 question, not one this run can answer.
+**It refutes the framing this phase started with.** The pre-registered prediction (P8-D1) was that
+the `unseen_vessel` ordering would hold with `tcn` above 0.5; it did not. But the counter-hypothesis
+as stated — deep models lose because they exploit cross-channel phase, a linear map cannot — does
+not survive either, because `ar40` is linear, per-channel, and loses *more* than `transformer`. The
+distinction that actually separates the two groups is **how completely a model identifies the
+generator's dynamics**. P3-D1 recorded in Phase 3 that this corpus has no process noise, so its
+motion satisfies an exact linear recursion and AR *identifies the system*; identifying harder makes
+transfer worse (`ar40` −1.27 against `ar20` −0.37). The deep models do the same implicitly. DLinear
+is too constrained to do it at all, and that is why it survives.
+
+**It establishes that the deep advantage was measured where it does not transfer.** Gates 3, 4 and 5
+were all read at pitch / 10 s (P3-D12, P4-D1, P5-D2). There the deep models beat `dlinear_ols` by
+0.37 on the corpus and lose to it by 1.29 on MSS. P4-D14 restriction 2 had already found `tcn`
+merely ties `dlinear_ols` in the 1–5 s operational band.
+
+**It does not establish that the deep architectures are unsuited to deck-motion forecasting.** It
+establishes that *these* checkpoints, trained on *this* corpus, learned structure specific to this
+generator. Whether a corpus without the P8-D6 defect supports a deep model that transfers is a
+Phase 9 question.
+
+**It does not establish a single cause.** The wave-grid control rules out the wave-field
+discretisation and the amplitude control rules out normalisation range, which together point at the
+hull response. Within the hull response, P8-D6's cross-DOF phase defect is one candidate among
+several — the corpus also applies an `exp(-(kL/4pi)^2)` rolloff and an `exp(-k*draft)` Smith factor
+where strip theory solves the radiation-diffraction problem. And the AR result shows the mechanism
+cannot be *only* about cross-channel phase.
 
 **It does not establish anything about real ships.** MSS is another simulator. Strip theory is
 linear potential flow: no viscous roll damping beyond an empirical term, no parametric resonance, no
-green water. The agreement or disagreement of two simulators bounds generator-specific overfitting;
-it says nothing about either one's fidelity to a real deck.
+green water. Two simulators agreeing or disagreeing bounds generator-specific overfitting; it says
+nothing about either one's fidelity to a real deck.
 
 ## The limitation this leaves
 

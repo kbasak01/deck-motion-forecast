@@ -27,6 +27,7 @@ from dmf.mss.compare import (
     COMPARE_DOFS,
     PSD_BAND_RAD_S,
     compare_against_corpus_spread,
+    marginalize_over_speed,
     response_psd,
     summarize_records,
 )
@@ -119,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
 
     stats = pd.concat(stat_rows, ignore_index=True)
     psd = pd.DataFrame(psd_rows)
+    marginal = marginalize_over_speed(stats)
+    marginal_path = args.out_dir / f"summary_marginal_{args.grid_kind}.csv"
+    marginal.to_csv(marginal_path, index=False)
     stats_path = args.out_dir / f"summary_stats_{args.grid_kind}.csv"
     psd_path = args.out_dir / f"psd_band_{args.grid_kind}.csv"
     stats.to_csv(stats_path, index=False)
@@ -127,6 +131,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[compare] grid convention: {args.grid_kind}", file=sys.stderr)
     print(f"[compare] wrote {stats_path} ({len(stats)} rows)", file=sys.stderr)
     print(f"[compare] wrote {psd_path} ({len(psd)} rows)", file=sys.stderr)
+    print(f"[compare] wrote {marginal_path} ({len(marginal)} rows)", file=sys.stderr)
+    big = marginal[(marginal["metric"] == "rms") & (marginal["ratio_spread_over_speed"] > 0.5)]
+    for _, row in big.iterrows():
+        print(
+            f"[compare] LARGE SPEED DEPENDENCE: {row['dof']} at {row['heading_deg']:.0f} deg, "
+            f"per-speed ratio {row['ratio_min_over_speed']:.3f}..{row['ratio_max_over_speed']:.3f} "
+            f"-- the marginal ratio {row['ratio_mss_over_corpus']:.3f} hides this",
+            file=sys.stderr,
+        )
 
     rms = stats[stats["metric"] == "rms"]
     print("\n[compare] RMS, MSS vs corpus, in corpus across-seed sd:", file=sys.stderr)

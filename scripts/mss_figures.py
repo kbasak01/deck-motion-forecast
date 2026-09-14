@@ -20,9 +20,14 @@ import pandas as pd
 from dmf.mss.compare import COMPARE_DOFS, response_psd
 from dmf.viz.mss_plots import plot_response_spectra_overlay, plot_skill_vs_horizon
 
-PLOT_MODELS: tuple[str, ...] = ("dlinear_ols", "tcn", "lstm", "transformer")
+#: Models drawn. `ar40` is here because it carries the phase's main finding: it is linear,
+#: per-channel, beats `dlinear_ols` on the corpus, and transfers worse than `transformer`.
+#: A figure showing only DLinear against the deep models would imply the split is
+#: linear-versus-deep, which P8-D12 shows it is not.
+PLOT_MODELS: tuple[str, ...] = ("dlinear_ols", "ar40", "tcn", "lstm", "transformer")
 MODEL_COLORS: dict[str, str] = {
     "dlinear_ols": "#14213d",
+    "ar40": "#5b2a86",
     "tcn": "#c1442a",
     "lstm": "#2a7f62",
     "transformer": "#8a6d3b",
@@ -47,10 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-#: Headings each DOF is summarised over. Head-seas roll is excluded in advance (P8-D1):
-#: MSS gives exactly 0.0000 deg there by port/starboard symmetry and the corpus gives the
-#: P1-D2 residual floor, so a skill score against that target is undefined and its
-#: persistence denominator is ~0. Including it puts a 1e12 artifact on the roll axis.
+#: Headings each DOF is summarised over. Head-seas roll is excluded in advance (P8-D1, and
+#: `dmf.mss.compare.DEGENERATE_CELLS` which also covers `roll_rate`): MSS gives exactly
+#: 0.0000 deg there by port/starboard symmetry and the corpus gives the P1-D2 residual
+#: floor, so a skill score against that target is undefined and its persistence denominator
+#: is ~0. Including it puts a 1e12 artifact on the roll axis.
 DOF_HEADINGS: dict[str, tuple[float, ...]] = {
     "roll": (135.0,),
     "pitch": (180.0, 135.0),
@@ -110,11 +116,13 @@ def main(argv: list[str] | None = None) -> int:
         horizons,
         series,
         COMPARE_DOFS,
-        "Forecast skill transfers to an independent hydrodynamic model only at short lead\n"
+        "Only the DLinear family transfers to an independent hydrodynamic model\n"
         "S175 at SS5 — solid: corpus `unseen_vessel` (committed) · dashed: MSS strip theory\n"
-        "roll shown at 135 deg only: head-seas roll is zero by symmetry in MSS "
-        "and the P1-D2 floor in the corpus",
+        "ar40 is linear and beats dlinear_ols on the corpus, yet transfers worse than the "
+        "deep models\nroll at 135 deg only: head-seas roll is zero by symmetry in MSS, "
+        "the P1-D2 floor in the corpus",
         model_colors=MODEL_COLORS,
+        ylim=(-6.0, 1.3),
     )
     p1 = out / "mss_skill_vs_horizon.png"
     fig.savefig(p1)

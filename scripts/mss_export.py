@@ -90,13 +90,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Committed evidence for Gate 8 predicate 1. artifacts/ is gitignored, so the manifest
     # alone cannot testify to the spectrum match on a fresh clone.
-    match = (
-        manifest.groupby("grid_kind")[
-            ["hs_target_m", "hs_realized_m", "hs_rel_err", "tz_target_s", "tz_realized_s",
-             "tz_rel_err"]
-        ]
-        .agg(["mean", "std", "count"])
-    )
+    match = manifest.groupby("grid_kind")[
+        ["hs_target_m", "hs_realized_m", "hs_rel_err", "tz_target_s", "tz_realized_s", "tz_rel_err"]
+    ].agg(["mean", "std", "count"])
     match.columns = ["_".join(c) for c in match.columns]
     args.results_dir.mkdir(parents=True, exist_ok=True)
     match_path = args.results_dir / "spectrum_match.csv"

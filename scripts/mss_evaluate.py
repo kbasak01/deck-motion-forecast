@@ -46,9 +46,15 @@ from dmf.mss.convert import MSS_TO_CORPUS_SIGN
 from dmf.train.closed_form import TrainingMoments
 from dmf.train.experiment import RunRecord, load_or_fit
 
-#: Models carried into the MSS table. The three baselines are mandatory (delta 4); the deep
-#: rows are what the phase is testing. AR rows are dropped only to keep the table readable --
-#: they are in the committed corpus table if a reader wants them.
+#: Models carried into the MSS table.
+#:
+#: `persistence`, `window_mean` and `dlinear_ols` are mandatory (delta 4). The AR family is
+#: here because the phase's conclusion is about linear-versus-deep transfer, and AR is the
+#: *other* linear family -- on the corpus at pitch/10 s `ar40` scores 0.5412 and `ar20`
+#: 0.5258, both above `dlinear_ols` at 0.4904. Concluding "linear models transfer" while
+#: dropping the linear models that beat DLinear would be choosing the comparison after
+#: seeing the answer. `damped_persistence` is the second trivial reference beside
+#: `window_mean`, which P4-D1 reads the gate against.
 #: Run key of the skill denominator. Models are keyed ``label|seed``; persistence is
 #: closed-form and therefore deterministic, so it carries seed 0 only.
 PERSISTENCE_RUN_KEY: str = "persistence|0"
@@ -66,6 +72,10 @@ MOTION_CHANNELS: tuple[str, ...] = (
 MSS_MODEL_LABELS: tuple[str, ...] = (
     "persistence",
     "window_mean",
+    "damped_persistence",
+    "ar10",
+    "ar20",
+    "ar40",
     "dlinear_ols",
     "dlinear",
     "tcn",

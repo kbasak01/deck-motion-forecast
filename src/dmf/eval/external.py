@@ -44,13 +44,27 @@ horizon): records are kept separate rather than pooled, so that a mean +- std ov
 records or >= 3 seeds is available downstream (non-negotiable 5) instead of a single pooled
 number whose spread nobody can recover.
 
+**Two tables, one window population.** :func:`evaluate_trajectories` produces the accuracy
+table and :func:`evaluate_quiescence_trajectories` the operational one -- the quiescent-
+window detector of :mod:`dmf.eval.quiescence`, which Phase 8 carry-forward delta 7 requires
+to be run on the external records with the base rate beside every F1. Both cut their windows
+through :func:`_prepare_windows`, so the two tables describe the same windows of the same
+record; and the quiescence path imports the corpus decision geometry from
+:mod:`dmf.eval.quiescence_runner` rather than restating it, because a quiescence number
+computed under a different geometry is not comparable to the committed corpus one and
+nothing in the output would say so. The units point above is sharper for that metric than
+for skill: the landing limits are **absolute**, so a radians-for-degrees error does not
+cancel there the way it cancels out of a ratio.
+
 Units throughout: ``frames`` and the returned ``rmse``/``mae``/``rmse_persistence``/
 ``signal_std`` columns are in corpus units -- degrees for angles, degrees per second for
 angular rates, metres for heave, metres per second for heave rate. ``skill`` and ``nrmse``
 are dimensionless. Horizons are samples; ``horizon_s`` is seconds.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -63,17 +77,55 @@ from dmf.config import DataConfig
 from dmf.data.dataset import DeckMotionDataset
 from dmf.data.normalize import NormStats, apply_norm, demean_window, invert_norm, is_train_partition
 from dmf.data.splits import REGIMES, Regime, Split, build_split, load_manifest
-from dmf.data.windows import WindowSpec, make_windows
+from dmf.data.windows import WindowSpec, make_windows, window_start_indices
 from dmf.eval.metrics import METRIC_COLUMNS, per_dof_horizon_metrics
+from dmf.eval.quiescence import (
+    PERMISSIVE,
+    STRICT,
+    QuiescenceThresholds,
+    base_rate,
+    detect_quiescent_mask,
+    false_alarms_per_minute,
+    lead_times,
+    match_onsets,
+    precision_recall_f1,
+    scorable_onsets,
+    window_onsets,
+)
+
+# The underscored names are private on purpose, and imported on purpose -- the same move
+# :mod:`dmf.eval.quiescence_runner` makes on :func:`dmf.eval.runner._bootstrap_counts`, for
+# the same reason. Phase 8 delta 7 requires the MSS quiescence numbers to be computed the
+# way the committed corpus numbers were; re-deriving the decision geometry here is exactly
+# how they would stop being comparable while still looking like a quiescence table. So the
+# geometry container, the accumulator, the thresholding fold and the two synthetic
+# detectors are the objects the corpus path uses, not copies of them. Every one of them is
+# pure-array and dataset-free, which is what makes the reuse possible at all.
+from dmf.eval.quiescence_runner import (
+    ALWAYS_QUIESCENT,
+    RATE_MATCHED,
+    RULES,
+    _DetectorState,
+    _fold,
+    _fold_always_quiescent,
+    _fold_rate_matched,
+    _Geometry,
+    _head_of,
+    _interval_bounds,
+    _TruthState,
+    decision_channel_index,
+)
 from dmf.models.base import BaseForecaster, ForecastModel
 from dmf.models.heads import PredictiveDistribution, point_view, quantile_fan
-from dmf.typedefs import FloatArray
+from dmf.typedefs import BoolArray, FloatArray, IntArray
 
 __all__ = [
     "EXTERNAL_COLUMNS",
+    "EXTERNAL_QUIESCENCE_COLUMNS",
     "MAX_PLAUSIBLE_ANGLE_DEG",
     "assert_corpus_units",
     "corpus_train_norm_stats",
+    "evaluate_quiescence_trajectories",
     "evaluate_trajectories",
     "record_labels",
 ]
@@ -410,6 +462,76 @@ def _record_series(
     return series
 
 
+@contextmanager
+def _eval_mode(models: Mapping[str, ForecastModel], device: str) -> Iterator[None]:
+    """Put every ``nn.Module`` in ``models`` on ``device`` in eval mode, then restore it.
+
+    Scoring must not depend on whether the caller happened to hand over a model in training
+    mode: dropout and batch-norm running statistics would make the table a function of that.
+    The prior mode is restored on exit, including on an exception, because a scoring call
+    that silently leaves a caller's model in eval mode is a defect in the *caller's* next
+    training loop rather than in this one.
+
+    Args:
+        models: Models to prepare. Non-module entries are left alone.
+        device: Torch device the models run on.
+
+    Yields:
+        Nothing; the context is the prepared state.
+    """
+    previous: dict[str, bool] = {}
+    torch_device = torch.device(device)
+    for name, model in models.items():
+        if isinstance(model, nn.Module):
+            previous[name] = model.training
+            model.to(torch_device)
+            model.eval()
+    try:
+        yield
+    finally:
+        for name, was_training in previous.items():
+            module = models[name]
+            if isinstance(module, nn.Module) and was_training:
+                module.train()
+
+
+def _prepare_windows(
+    series: FloatArray, spec: WindowSpec, input_stats: NormStats, target_index: Sequence[int]
+) -> tuple[Tensor, Tensor, FloatArray, IntArray]:
+    """Cut and normalise one record's windows, exactly as the dataset does.
+
+    The single windowing path of this module: :func:`evaluate_trajectories` and
+    :func:`evaluate_quiescence_trajectories` both go through it, so the skill table and the
+    quiescence table are measured on bit-for-bit the same windows of the same record. It
+    mirrors :meth:`dmf.data.dataset.DeckMotionDataset.__getitem__`: ``x`` is de-meaned and
+    scaled, ``y`` and the window mean stay in corpus units, and the mean is carried to the
+    inverse transform rather than re-derived. float64 through the transform and float32 at
+    the boundary, as the dataset stores and the runner widens -- the cast is where the two
+    pipelines could differ in the last bit, and every committed corpus table was produced
+    from float32 windows.
+
+    Args:
+        series: The record's channels, ``(n_samples, C_in)``, float64, corpus units.
+        spec: Window geometry, samples.
+        input_stats: Statistics over the input channels, from the corpus training split.
+        target_index: Position of each target channel within the input channels.
+
+    Returns:
+        Tuple ``(x_norm, window_mean, target, starts)``: model inputs ``(N, L, C_in)``
+        float32 and dimensionless; per-window target means ``(N, 1, C_out)`` float32 in
+        corpus units; targets ``(N, H, C_out)`` float64 in corpus units; and the absolute
+        start sample of each window, ``(N,)``.
+    """
+    index = list(target_index)
+    x_raw, y_raw = make_windows(series, spec)
+    x_centred, mean = demean_window(torch.from_numpy(np.ascontiguousarray(x_raw)))
+    x_norm = apply_norm(x_centred, input_stats).to(torch.float32)
+    window_mean = mean[:, :, index].to(torch.float32)
+    target = np.ascontiguousarray(y_raw[:, :, index], dtype=np.float32).astype(np.float64)
+    starts = window_start_indices(series.shape[0], spec)
+    return x_norm, window_mean, target, starts
+
+
 def _forecast_record(
     models: Mapping[str, ForecastModel],
     x_norm: Tensor,
@@ -443,37 +565,24 @@ def _forecast_record(
     n_windows = int(x_norm.shape[0])
     torch_device = torch.device(device)
     point_models = {name: _as_point_model(name, model) for name, model in models.items()}
-    previous_modes: dict[str, bool] = {}
-    for name, model in point_models.items():
-        if isinstance(model, nn.Module):
-            previous_modes[name] = model.training
-            model.to(torch_device)
-            model.eval()
-
     out: dict[str, FloatArray] = {
         name: np.empty((n_windows, max_horizon, n_targets), dtype=np.float64)
         for name in point_models
     }
-    try:
-        with torch.no_grad():
-            for start in range(0, n_windows, batch_size):
-                stop = min(start + batch_size, n_windows)
-                inputs = x_norm[start:stop].to(torch_device)
-                mean = window_mean[start:stop].double()
-                for name, model in point_models.items():
-                    raw = _reduce_to_point(name, model.forward(inputs))
-                    if tuple(raw.shape) != (stop - start, max_horizon, n_targets):
-                        raise ValueError(
-                            f"model {name!r} returned shape {tuple(raw.shape)}, expected "
-                            f"({stop - start}, {max_horizon}, {n_targets})"
-                        )
-                    pred = invert_norm(raw.detach().to("cpu", torch.float64), target_stats, mean)
-                    out[name][start:stop] = pred.numpy()
-    finally:
-        for name, was_training in previous_modes.items():
-            module = point_models[name]
-            if isinstance(module, nn.Module) and was_training:
-                module.train()
+    with _eval_mode(point_models, device), torch.no_grad():
+        for start in range(0, n_windows, batch_size):
+            stop = min(start + batch_size, n_windows)
+            inputs = x_norm[start:stop].to(torch_device)
+            mean = window_mean[start:stop].double()
+            for name, model in point_models.items():
+                raw = _reduce_to_point(name, model.forward(inputs))
+                if tuple(raw.shape) != (stop - start, max_horizon, n_targets):
+                    raise ValueError(
+                        f"model {name!r} returned shape {tuple(raw.shape)}, expected "
+                        f"({stop - start}, {max_horizon}, {n_targets})"
+                    )
+                pred = invert_norm(raw.detach().to("cpu", torch.float64), target_stats, mean)
+                out[name][start:stop] = pred.numpy()
     return out
 
 
@@ -589,21 +698,7 @@ def evaluate_trajectories(
     tables: list[pd.DataFrame] = []
     for label, frame in zip(labels, frames, strict=True):
         series = _record_series(frame, label, input_channels, spec)
-        x_raw, y_raw = make_windows(series, spec)
-        # Mirrors DeckMotionDataset.__getitem__: x is de-meaned and scaled, y and the
-        # window mean stay in corpus units, and the mean used by the inverse transform is
-        # the one the forward transform subtracted -- carried, never re-derived.
-        # float64 through the transform and float32 at the boundary, exactly as the
-        # dataset does: the cast is where the two pipelines could differ in the last bit,
-        # and every committed corpus table was produced from float32 windows.
-        x_centred, mean = demean_window(torch.from_numpy(np.ascontiguousarray(x_raw)))
-        x_norm = apply_norm(x_centred, input_stats).to(torch.float32)
-        window_mean = mean[:, :, target_index].to(torch.float32)
-        # float32 then float64, as the dataset stores and the runner widens: exact, and
-        # bitwise what the corpus path scores.
-        target = np.ascontiguousarray(y_raw[:, :, target_index], dtype=np.float32).astype(
-            np.float64
-        )
+        x_norm, window_mean, target, _ = _prepare_windows(series, spec, input_stats, target_index)
         predictions = _forecast_record(
             models,
             x_norm,
@@ -644,3 +739,498 @@ def evaluate_trajectories(
             f"windows; they are not."
         )
     return combined[list(EXTERNAL_COLUMNS)]
+
+
+#: Column order of the table :func:`evaluate_quiescence_trajectories` returns.
+#:
+#: ``base_rate`` sits immediately beside ``f1`` and is not optional (CLAUDE.md
+#: §Known traps, Phase 8 carry-forward delta 7): an F1 read without it is a statement
+#: about how often the deck happened to be quiet. ``always_yes_sample_f1`` sits beside
+#: both, so the per-sample/onset contrast that makes the onset formulation credible is
+#: readable from the row rather than from a test fixture. The three ``peak_*`` columns and
+#: the four threshold columns are in the table for one reason: the thresholds are
+#: **absolute**, so a units error moves the F1 without moving anything else, and a reader
+#: must be able to check the record's magnitudes against the limits that were applied to it
+#: without re-opening the record.
+EXTERNAL_QUIESCENCE_COLUMNS: tuple[str, ...] = (
+    "model",
+    "record",
+    "threshold_set",
+    "rule",
+    "scorable",
+    "base_rate",
+    "always_yes_sample_f1",
+    "n_onsets_true",
+    "n_onsets_pred",
+    "n_matched",
+    "precision",
+    "recall",
+    "f1",
+    "false_alarms_per_min",
+    "lead_p10",
+    "median_lead_time_s",
+    "lead_p90",
+    "n_onsets_true_raw",
+    "n_excluded_true",
+    "n_excluded_pred",
+    "n_windows",
+    "duration_s",
+    "peak_roll_deg",
+    "peak_pitch_deg",
+    "peak_heave_rate_mps",
+    "roll_limit_deg",
+    "pitch_limit_deg",
+    "heave_rate_limit_mps",
+    "sustain_s",
+    "n_records",
+)
+
+
+@dataclass(frozen=True)
+class _ExternalTruth:
+    """The truth side of one threshold set on one external record.
+
+    Attributes:
+        state: The one-realization :class:`dmf.eval.quiescence_runner._TruthState` the
+            corpus path's folds consume, so the synthetic detectors can be driven by the
+            same code.
+        base_rate: Fraction of the evaluated span inside a sustained quiescent window.
+        always_yes_sample_f1: Per-sample F1 of a detector that says "quiescent" at every
+            sample of the evaluated span.
+        n_raw_onsets: Onsets before the exclusion rule, so that ``kept + excluded == raw``
+            is checkable from the table.
+        peaks: Peak absolute value of roll (deg), pitch (deg) and heave rate (m/s) over the
+            evaluated record, for the units audit.
+    """
+
+    state: _TruthState
+    base_rate: float
+    always_yes_sample_f1: float
+    n_raw_onsets: int
+    peaks: tuple[float, float, float]
+
+
+def _external_geometry(starts: IntArray, spec: WindowSpec) -> _Geometry:
+    """Build the corpus decision geometry for one external record.
+
+    Deliberately the same arithmetic as :func:`dmf.eval.quiescence_runner._geometry`, on the
+    same :class:`dmf.eval.quiescence_runner._Geometry`, rather than a second definition of
+    where the detector stands in time. At the production geometry -- lookback 200, stride 5,
+    max horizon 150, 6000-sample record -- it yields first decision 199, last covered 6000
+    and 1131 decision times, which is exactly the span
+    ``results/e04/quiescence.csv`` was scored over (580.0 s per realization).
+
+    Args:
+        starts: Window start samples, ascending.
+        spec: Window geometry, samples.
+
+    Returns:
+        The bounds.
+
+    Raises:
+        RuntimeError: If the starts are not strictly ascending, which is what makes "keep
+            the earliest decision time" a single ``setdefault``.
+    """
+    if starts.size > 1 and not np.all(np.diff(starts) > 0):
+        raise RuntimeError(
+            "window starts are not strictly ascending; 'keep the earliest decision time "
+            "that predicts an onset' relies on visiting decision times in order"
+        )
+    return _Geometry(
+        first_decision=int(starts[0] + spec.lookback - 1),
+        last_covered=int(starts[-1] + spec.total_length),
+        horizon=spec.max_horizon,
+        decision_times=starts + spec.lookback - 1,
+    )
+
+
+def _external_truth(
+    series: FloatArray,
+    channels: tuple[int, int, int],
+    thresholds: QuiescenceThresholds,
+    fs_hz: float,
+    geometry: _Geometry,
+) -> _ExternalTruth:
+    """Build the truth side from the full TRUE trajectory of one external record.
+
+    P6-D2 item 1: the truth mask is a property of the record, not of the windowing, so it is
+    computed once over the whole trajectory rather than reassembled from window targets.
+    :func:`dmf.eval.quiescence.detect_quiescent_mask` is the definition of a quiescent
+    window and is called here unmodified; the corpus runner's ``_truth_state`` applies the
+    identical limits through its batched run-finder, which
+    ``tests/test_quiescence_runner.py`` pins to this reference row by row.
+
+    Args:
+        series: The record's channels, ``(n_samples, C_in)``, corpus units.
+        channels: Column indices of roll, pitch and heave rate.
+        thresholds: The limit set, in **absolute corpus units** -- degrees and metres per
+            second.
+        fs_hz: Sampling rate, hertz.
+        geometry: Shared absolute-time bounds.
+
+    Returns:
+        The truth side.
+    """
+    roll_c, pitch_c, rate_c = channels
+    lower, upper = geometry.first_decision, geometry.last_covered
+    decision = series[:upper, :]
+    mask: BoolArray = detect_quiescent_mask(
+        decision[:, roll_c], decision[:, pitch_c], decision[:, rate_c], thresholds, fs_hz
+    )
+    onsets, n_excluded = scorable_onsets(mask, first_decision_idx=lower)
+    # The base rate describes the span the F1 is about, not the whole record -- the same
+    # slice `_truth_state` takes, so the two tables' base rates are the same quantity.
+    span = mask[lower + 1 :]
+    n_quiescent = int(np.count_nonzero(span))
+    n_evaluated = int(span.size)
+    # Exactly the always-yes detector scored per sample: it calls every sample quiescent, so
+    # it matches every quiescent sample (recall 1.0) and predicts `n_evaluated` of them
+    # (precision = base rate). Formed through the same `precision_recall_f1` the onset rows
+    # use rather than from the closed form, so there is one definition of F1 in this table.
+    _, _, sample_f1 = precision_recall_f1(n_quiescent, n_evaluated, n_quiescent)
+    peaks = tuple(float(np.abs(decision[:, c]).max()) for c in (roll_c, pitch_c, rate_c))
+    return _ExternalTruth(
+        state=_TruthState([onsets], [n_excluded], [n_quiescent], [n_evaluated]),
+        base_rate=base_rate(span),
+        always_yes_sample_f1=sample_f1,
+        n_raw_onsets=int(window_onsets(mask).size),
+        peaks=cast(tuple[float, float, float], peaks),
+    )
+
+
+def _quiescence_row(
+    *,
+    model: str,
+    record: str,
+    thresholds: QuiescenceThresholds,
+    rule: str,
+    truth: _ExternalTruth,
+    state: _DetectorState,
+    fs_hz: float,
+    tolerance_s: float,
+    n_windows: int,
+) -> dict[str, object]:
+    """Match one detector's onsets against one record's truth and form the reported row.
+
+    Args:
+        model: Model label.
+        record: Record label.
+        thresholds: The limit set.
+        rule: ``"point"`` or ``"interval"``.
+        truth: The truth side of this record and threshold set.
+        state: The accumulated predictions for this (model, rule, threshold set).
+        fs_hz: Sampling rate, hertz.
+        tolerance_s: Onset matching tolerance, seconds.
+        n_windows: Decision times on this record.
+
+    Returns:
+        One record on :data:`EXTERNAL_QUIESCENCE_COLUMNS`.
+    """
+    true_onsets = truth.state.onsets[0]
+    predicted_map = state.earliest_flag[0]
+    predicted = np.asarray(sorted(predicted_map), dtype=np.int64)
+    matched_pred, matched_true, _ = match_onsets(predicted, true_onsets, fs_hz, tolerance_s)
+    n_true = int(true_onsets.size)
+    n_pred = int(predicted.size)
+    n_matched = int(matched_pred.size)
+    if n_matched:
+        flags = np.asarray(
+            [predicted_map[int(predicted[i])] for i in matched_pred.tolist()], dtype=np.int64
+        )
+        leads = lead_times(flags, true_onsets[matched_true], fs_hz)
+    else:
+        leads = np.zeros(0, dtype=np.float64)
+    evaluated = truth.state.n_evaluated[0]
+    duration_s = evaluated / fs_hz
+    scorable = n_true > 0
+    precision, recall, f1 = precision_recall_f1(n_matched, n_pred, n_true)
+    return {
+        "model": model,
+        "record": record,
+        "threshold_set": thresholds.name,
+        "rule": rule,
+        # A record with no scorable onset has no measurement in it. NaN, never 0.0 (which
+        # reads as model failure) and never 1.0 (which reads as success) -- P6-D7, and the
+        # rule the committed corpus table follows. `base_rate` is still filled in, because
+        # it is the column that says *why* the record is not scorable.
+        "scorable": scorable,
+        "base_rate": truth.base_rate,
+        "always_yes_sample_f1": truth.always_yes_sample_f1,
+        "n_onsets_true": n_true,
+        "n_onsets_pred": n_pred,
+        "n_matched": n_matched,
+        "precision": precision if scorable else float("nan"),
+        "recall": recall if scorable else float("nan"),
+        "f1": f1 if scorable else float("nan"),
+        "false_alarms_per_min": false_alarms_per_minute(n_pred - n_matched, duration_s),
+        "lead_p10": _lead_quantile(leads, 0.10),
+        "median_lead_time_s": _lead_quantile(leads, 0.50),
+        "lead_p90": _lead_quantile(leads, 0.90),
+        "n_onsets_true_raw": truth.n_raw_onsets,
+        "n_excluded_true": int(truth.state.n_excluded[0]),
+        "n_excluded_pred": int(state.n_excluded[0]),
+        "n_windows": n_windows,
+        "duration_s": duration_s,
+        "peak_roll_deg": truth.peaks[0],
+        "peak_pitch_deg": truth.peaks[1],
+        "peak_heave_rate_mps": truth.peaks[2],
+        "roll_limit_deg": thresholds.roll_deg,
+        "pitch_limit_deg": thresholds.pitch_deg,
+        "heave_rate_limit_mps": thresholds.heave_rate_mps,
+        "sustain_s": thresholds.sustain_s,
+    }
+
+
+def _lead_quantile(values: FloatArray, level: float) -> float:
+    """Return a quantile of the lead-time sample, or NaN when there is none.
+
+    Args:
+        values: Lead times, seconds.
+        level: Quantile level in [0, 1].
+
+    Returns:
+        The quantile, seconds, or NaN if ``values`` is empty. NaN rather than 0.0: a record
+        with no matched onset has no lead-time distribution, and 0.0 would read as "the
+        model flagged exactly at the onset".
+    """
+    if values.size == 0:
+        return float("nan")
+    return float(np.quantile(values, level))
+
+
+def evaluate_quiescence_trajectories(
+    models: Mapping[str, ForecastModel],
+    frames: Sequence[pd.DataFrame],
+    *,
+    stats: NormStats,
+    spec: WindowSpec,
+    input_channels: Sequence[str],
+    target_dofs: Sequence[str],
+    fs_hz: float,
+    threshold_sets: Sequence[QuiescenceThresholds] = (PERMISSIVE, STRICT),
+    tolerance_s: float = 0.5,
+    include_always_quiescent: bool = True,
+    device: str = "cpu",
+    batch_size: int = 4096,
+) -> pd.DataFrame:
+    """Score the quiescent-window detector on externally supplied trajectories.
+
+    The external counterpart of :func:`dmf.eval.quiescence_runner.evaluate_quiescence`, and
+    the discharge of Phase 8 carry-forward delta 7: the operational metric run on the MSS
+    strip-theory records rather than only on this project's own corpus.
+
+    **The geometry is the corpus geometry, because it is the corpus geometry's own code.**
+    A quiescence number computed under a different decision geometry is not comparable to
+    the committed corpus numbers, and the difference does not show up anywhere in the
+    output -- which is the whole reason for running the metric on MSS at all. So this
+    function does not re-derive P6-D2; it imports it.
+    :class:`dmf.eval.quiescence_runner._Geometry` fixes the decision times at the window
+    stride (0.5 s at the production arm), :func:`dmf.eval.quiescence_runner._fold` does the
+    thresholding and keeps the **earliest** decision time that predicts each absolute onset,
+    :func:`dmf.eval.quiescence.scorable_onsets` applies the exclusion rule to the truth side
+    and :func:`dmf.eval.quiescence.match_onsets` matches at +-``tolerance_s`` one-to-one.
+    The truth mask comes from the full **true** trajectory on roll, pitch and heave rate via
+    :func:`dmf.eval.quiescence.detect_quiescent_mask`, with the sustain requirement
+    ``ceil(sustain_s * fs_hz)`` samples.
+
+    **The base rate is reported beside every F1**, in the same row, and is never optional
+    (CLAUDE.md §Known traps). ``always_yes_sample_f1`` is in the row too: it is the F1 a
+    detector that says "quiescent" at every sample scores against that record's own truth
+    mask, and the gap between it and the ``always_quiescent`` row's onset F1 is what makes
+    the onset formulation credible. On the P6-D2 fixture those two numbers are 0.9691 and
+    0.0182; here they are measured on each MSS record instead of quoted.
+
+    **Records are not pooled.** One row per (model, record, threshold set, rule), so that a
+    mean +- std over the >= 3 MSS seeds of a cell is recoverable downstream
+    (non-negotiable 5). No bootstrap interval is emitted: the corpus table's interval
+    resamples whole realizations, and a single record is a single unit, so an interval
+    computed here would be a resample of one thing. Aggregate the records, then quote the
+    spread.
+
+    **Units are asserted, not assumed.** The thresholds are absolute -- 3.0 deg / 2.0 deg /
+    0.8 m/s permissive, 1.5 / 1.0 / 0.4 strict -- so unlike the skill score, which is a
+    ratio and in which a factor of 57.3 cancels exactly, this metric moves under a
+    radians-for-degrees error and moves plausibly. :func:`assert_corpus_units` is therefore
+    run over every record before a single window is cut, and each row carries the record's
+    peak roll, pitch and heave rate beside the limits that were applied to it.
+
+    Args:
+        models: Detectors to score, keyed by results-table label. Point models are scored on
+            the ``point`` rule only; a model whose ``head_kind`` is not ``"point"`` is
+            additionally scored on the two-sided ``interval`` rule (P6-D5). Note that a
+            *constant* forecast -- ``persistence``, ``window_mean`` -- cannot express a
+            transition and therefore predicts no onset at all, by construction rather than
+            by failure; read ``n_onsets_pred`` beside its F1.
+        frames: External records, one per trajectory, in the corpus schema and **corpus
+            units**. Each must be sampled at ``fs_hz`` and be at least ``spec.total_length``
+            samples long. A label may be supplied per record as ``frame.attrs["record"]``.
+        stats: Normalisation statistics from the **corpus training split**, in corpus units.
+            Must carry a training-partition provenance label (non-negotiable 3).
+        spec: Window geometry, samples. Use the geometry the checkpoints were trained
+            under; the decision stride is ``spec.stride`` and the forecast the detector
+            thresholds runs to ``spec.max_horizon``.
+        input_channels: Corpus column names the model consumes, in model input order.
+        target_dofs: Corpus column names the model forecasts, in model output order. Must
+            be a prefix of ``input_channels`` (P2-D4) and must include roll, pitch and heave
+            rate, since the prediction side thresholds the model's own output.
+        fs_hz: Sampling rate of the external records, hertz. Used for the sustain
+            requirement, the matching tolerance, the lead times and the false-alarm rate, so
+            a record sampled at another rate would change every one of them.
+        threshold_sets: Limit sets to report, each producing its own rows. Both
+            :data:`dmf.eval.quiescence.PERMISSIVE` and :data:`dmf.eval.quiescence.STRICT`
+            by default, as the committed corpus table carries both.
+        tolerance_s: Onset matching tolerance, seconds.
+        include_always_quiescent: Whether to add the two synthetic references,
+            :data:`dmf.eval.quiescence_runner.ALWAYS_QUIESCENT` and
+            :data:`dmf.eval.quiescence_runner.RATE_MATCHED`. Neither costs a forward pass
+            and between them they bound the metric from the over-flagging side and the
+            right-rate/wrong-time side.
+        device: Torch device the models run on.
+        batch_size: Windows per forward pass. Affects speed and memory only.
+
+    Returns:
+        One row per (model, record, threshold set, rule), columns
+        :data:`EXTERNAL_QUIESCENCE_COLUMNS`, sorted by
+        ``(model, record, threshold_set, rule)``. ``base_rate``, ``precision``, ``recall``,
+        ``f1`` and ``always_yes_sample_f1`` are dimensionless; lead times are seconds;
+        ``false_alarms_per_min`` is per minute; ``peak_*`` and the limit columns are in
+        corpus units. ``precision``/``recall``/``f1`` are NaN on a record with no scorable
+        onset.
+
+    Raises:
+        ValueError: If ``models`` or ``frames`` is empty, if ``fs_hz`` is not positive, if
+            ``stats`` was not fitted on a training partition, if ``target_dofs`` is not a
+            prefix of ``input_channels`` or does not forecast all three decision channels,
+            if a record is missing a channel, carries non-finite samples, looks like it is
+            still in radians, or is shorter than one window, or if a model returns an
+            unexpected output shape.
+        RuntimeError: If a record's window starts are not strictly ascending.
+    """
+    if not models:
+        raise ValueError("models is empty; there is nothing to evaluate")
+    if not fs_hz > 0.0:
+        raise ValueError(f"fs_hz must be positive, got {fs_hz}")
+    # Before a single window is cut, for the same reason the provenance guard is: both
+    # invalidate every number this function would otherwise produce.
+    _check_stats_provenance(stats)
+    input_stats, target_stats, target_index = _check_channels(stats, input_channels, target_dofs)
+    labels = record_labels(frames)
+    # Refuses a record whose angles are still in radians. The skill table can survive that
+    # error; a table of absolute thresholds cannot.
+    assert_corpus_units(frames, input_channels)
+    channels = decision_channel_index(target_dofs)
+    n_targets = len(tuple(target_dofs))
+    heads = {name: _head_of(model) for name, model in models.items()}
+    torch_device = torch.device(device)
+
+    rows: list[dict[str, object]] = []
+    for label, frame in zip(labels, frames, strict=True):
+        series = _record_series(frame, label, input_channels, spec)
+        x_norm, window_mean, _target, starts = _prepare_windows(
+            series, spec, input_stats, target_index
+        )
+        geometry = _external_geometry(starts, spec)
+        n_windows = int(x_norm.shape[0])
+        truth = {
+            thresholds.name: _external_truth(series, channels, thresholds, fs_hz, geometry)
+            for thresholds in threshold_sets
+        }
+
+        def _new_state() -> _DetectorState:
+            """Return an accumulator for one (model, rule, threshold set) on one record."""
+            return _DetectorState([{}], [0])
+
+        states: dict[tuple[str, str, str], _DetectorState] = {}
+        for name in models:
+            rules = ("point",) if heads[name][0] == "point" else RULES
+            for rule in rules:
+                for thresholds in threshold_sets:
+                    states[(name, rule, thresholds.name)] = _new_state()
+
+        with _eval_mode(models, device), torch.no_grad():
+            for start in range(0, n_windows, batch_size):
+                stop = min(start + batch_size, n_windows)
+                inputs = x_norm[start:stop].to(torch_device)
+                mean = window_mean[start:stop].double()
+                decision_times = geometry.decision_times[start:stop]
+                # One record is one realization here, so every window folds into slot 0.
+                realization_index = np.zeros(stop - start, dtype=np.int64)
+                for name, model in models.items():
+                    head, levels, width = heads[name]
+                    raw = model.forward(inputs).detach().to("cpu", torch.float64)
+                    expected = (stop - start, spec.max_horizon, n_targets, width)
+                    if head == "point":
+                        if tuple(raw.shape) != expected[:3]:
+                            raise ValueError(
+                                f"model {name!r} returned shape {tuple(raw.shape)}, "
+                                f"expected {expected[:3]}"
+                            )
+                        point_raw = raw
+                    else:
+                        if tuple(raw.shape) != expected:
+                            raise ValueError(
+                                f"model {name!r} returned shape {tuple(raw.shape)}, "
+                                f"expected {expected}"
+                            )
+                        point_raw = PredictiveDistribution(raw, head, levels).point()
+                    point = invert_norm(point_raw, target_stats, mean).numpy()
+                    for thresholds in threshold_sets:
+                        _fold(
+                            states[(name, "point", thresholds.name)],
+                            point,
+                            channels,
+                            thresholds,
+                            decision_times,
+                            realization_index,
+                            fs_hz,
+                            geometry,
+                        )
+                    if head == "point":
+                        continue
+                    bounds = invert_norm(
+                        _interval_bounds(raw, head, levels), target_stats, mean
+                    ).numpy()
+                    # Two-sided, per P6-D5: the limits are symmetric, so the conservative
+                    # statistic is max(|q05|, |q95|) and not the one-sided 0.05 quantile.
+                    conservative = np.maximum(np.abs(bounds[..., 0]), np.abs(bounds[..., 1]))
+                    for thresholds in threshold_sets:
+                        _fold(
+                            states[(name, "interval", thresholds.name)],
+                            conservative,
+                            channels,
+                            thresholds,
+                            decision_times,
+                            realization_index,
+                            fs_hz,
+                            geometry,
+                        )
+
+        if include_always_quiescent:
+            for thresholds in threshold_sets:
+                degenerate = _new_state()
+                states[(ALWAYS_QUIESCENT, "point", thresholds.name)] = degenerate
+                _fold_always_quiescent(degenerate, geometry, 1)
+                chance = _new_state()
+                states[(RATE_MATCHED, "point", thresholds.name)] = chance
+                _fold_rate_matched(chance, geometry, truth[thresholds.name].state, 1)
+
+        for (name, rule, threshold_name), state in states.items():
+            rows.append(
+                _quiescence_row(
+                    model=name,
+                    record=label,
+                    thresholds=next(t for t in threshold_sets if t.name == threshold_name),
+                    rule=rule,
+                    truth=truth[threshold_name],
+                    state=state,
+                    fs_hz=fs_hz,
+                    tolerance_s=tolerance_s,
+                    n_windows=n_windows,
+                )
+            )
+
+    table = pd.DataFrame(rows)
+    table["n_records"] = len(labels)
+    return table[list(EXTERNAL_QUIESCENCE_COLUMNS)].sort_values(
+        ["model", "record", "threshold_set", "rule"], ignore_index=True
+    )

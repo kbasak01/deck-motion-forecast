@@ -4961,3 +4961,181 @@ itself and failed a phase that had in fact done the right thing. It now locates 
 by the commit that *introduced* the P8-D1 heading (`git log -S`). The failure mode is worth naming
 because it is the same one P7-D14 identified: a check that reads a proxy for the thing it means to
 verify, and is correct only until the file it proxies through is touched again.
+
+### P8-D11 — CORRECTION: five defects in P8-D7 through P8-D9, three of which change a conclusion. RECORDED 2026-09-14
+
+Found by the Gate 8 adversarial review. Every one was checkable against the CSVs that were already
+committed when the claim was written, which is the common thread: none of them needed new data, only
+a reader who recomputed instead of reading the summary. P7-D14 named this failure mode — "a
+human-written sentence and a function-computed number will drift apart, and the sentence will be the
+wrong one" — and it recurred here three more times.
+
+**1. The 1–5 s claim was false, and pitch-only.** P8-D8 and `docs/mss_crossvalidation.md` stated
+"everything keeps positive skill through 5 s." Every table supporting it was pitch. At 5 s:
+`transformer` is −0.486 in heave, `lstm` −0.228 in heave and −0.191 in roll, `tcn` 0.011 in heave.
+Heave is the channel the project exists for. **Retracted.** The claim holds only for the DLinear
+family; corrected per-DOF table in the document.
+
+**2. The Result 1 roll row was arithmetically invalid and concealed a finding.** It printed a ratio
+of 1.13 and z of +3.10 by averaging per-speed ratios and per-speed z-scores. A ratio of means is not
+a mean of ratios, and a z whose denominator differs per cell cannot be averaged at all. Correct
+values: **0.986 and −0.32**. What the bad summary hid is larger than the error: corpus roll at
+135 deg falls 2.5x with forward speed (0.873 → 0.353 deg RMS) while MSS's is flat
+(0.566 → 0.574), so the per-speed ratio runs 0.648 → 1.117 → **1.627** at z = +14.9. The two
+generators disagree about the *speed dependence* of roll response. Fixed in code:
+`dmf.mss.compare.marginalize_over_speed` computes the marginal correctly and
+`scripts/mss_compare.py` now prints a warning whenever the per-speed ratio spread exceeds 0.5.
+
+**3. The "~18% normalisation / ~82% structural" decomposition is withdrawn.** It was one model
+(`tcn`), one DOF (pitch), one horizon (10 s), reported as though it were an attribution. Per DOF the
+amplitude control ranges from +2.28 (`ar40`, heave) to **−13.38** (`ar40`, roll), and on roll it
+makes *every* non-DLinear model worse. The premise fails there: the corpus is *cold* in roll at
+speed (MSS/corpus 1.63 at 12 kn), so rescaling shrinks roll in half the cells. **Retracted.** The
+control supports only "scale is not the explanation", and does not say what is.
+
+**4. The sign-ablation bound was quoted at the wrong level of aggregation.** "Skill moves by
+≤ 0.006" was the maximum over *model means* at pitch/10 s. Individual (cell, seed, record) rows move
+by up to **1.81**, and the maximum over model means across the whole grid is **0.0795**. The
+conclusion-level claim survives — the ordering is unchanged under either sign convention — but the
+sentence as written was wrong. Corrected to state the aggregation level.
+
+**5. `roll_rate` at 180 deg is degenerate and P8-D1 did not exclude it.** The exclusion was
+pre-registered for `roll`; its derivative is identically zero for the same symmetry reason and was
+left in. A sign-ablation summary over the full grid returned 1.1e12 from that channel, which is what
+exposed it. Both are now excluded in one place,
+`dmf.mss.compare.DEGENERATE_CELLS`, rather than filtered ad hoc per analysis. This widens a
+pre-registered exclusion after seeing data; it is recorded as such. The justification is structural
+and not result-dependent — a channel that is identically zero has no scorable content under any
+outcome — and the affected rows were never in the headline.
+
+**Two further defects in the gate machinery itself**, recorded because a gate that cannot be
+re-derived is not evidence:
+
+*`make lint` was failing across all three Phase 8 commits.* `ruff check` had been run; `ruff format`
+had not. Eight files were unformatted. Phase 8 was reported as lint-clean on the strength of the
+wrong command.
+
+*Gate 8 predicate 1 read a gitignored file.* Its evidence was `artifacts/mss/manifest.csv`, and
+`.gitignore:4` excludes `artifacts/`. Cloning the branch and re-running the gate reproduced
+predicate 1 failing while the other four passed — so the reported 5/5 depended on untracked local
+state. `scripts/mss_export.py` now writes `results/mss/spectrum_match.csv` and the predicate reads
+that.
+
+### P8-D12 — The AR baselines were dropped, and including them changes the conclusion. RECORDED 2026-09-14
+
+`scripts/mss_evaluate.py` carried seven models and omitted `ar10`, `ar20`, `ar40`,
+`ar_attitude_only` and `damped_persistence`, with a comment saying they were dropped "to keep the
+table readable". That was not a defensible reason given the conclusion being drawn: the phase
+concluded "linear models transfer, deep models do not", and AR is the other linear family — the one
+that **beats** `dlinear_ols` on the corpus at the gate cell (`ar40` 0.5412, `ar20` 0.5258 against
+0.4904). Dropping the linear models that win, then concluding that linear models transfer, is
+choosing the comparison after seeing the answer.
+
+Re-run with the AR family included, pitch at 10 s:
+
+| model | corpus | MSS | change |
+|---|---|---|---|
+| `dlinear` | 0.4144 | 0.3935 | −0.021 |
+| `dlinear_ols` | 0.4904 | 0.3835 | −0.107 |
+| `ar20` | 0.5258 | 0.1560 | −0.370 |
+| `transformer` | 0.7654 | −0.1773 | −0.943 |
+| `ar40` | 0.5412 | **−0.7243** | −1.266 |
+| `tcn` | 0.8604 | −0.9033 | −1.764 |
+| `lstm` | 0.8032 | −1.5564 | −2.360 |
+
+**`ar40` is linear, per-channel, and transfers worse than `transformer`.** So the P8-D8 framing —
+and the P8-D1 counter-hypothesis that the deep models lose because they exploit a cross-DOF phase
+relationship a linear map cannot — is wrong as stated. Both are superseded.
+
+What separates the two groups is how completely a model identifies the generator's dynamics.
+**P3-D1 said this in Phase 3**, before any of it was run: this corpus has no process noise, so its
+motion satisfies an exact linear recursion and AR *identifies the system*. A system identifier
+transfers to that system and to nothing else, and identifying harder is worse — `ar40` loses 1.27
+where `ar20` loses 0.37. The deep models do the same implicitly. DLinear's trend-plus-seasonal
+decomposition into a direct per-channel linear map is too constrained to identify the recursion, and
+that is why it is the only thing that survives the transfer.
+
+P8-D6's cross-DOF phase defect remains a real defect in the simulator, measured and unfixed. It is
+no longer sufficient as *the* explanation of the transfer failure.
+
+### P8-D13 — The declared wave-grid control existed in the config and was never run. RECORDED 2026-09-14
+
+`configs/mss/s175_ss5.yaml` defines two wave-grid conventions and labels the second "the CONTROL:
+the only thing differing from a corpus realization is the transfer function".
+`scripts/mss_evaluate.py --grid-kind corpus` implements it. The Makefile never invoked it, and
+P8-D9's "What is still not separated" paragraph conceded a confound that the unrun control was there
+to remove. Now run.
+
+Pitch at 10 s, MSS RAOs both sides, changing only the wave-field discretisation:
+
+| model | MSS grid | corpus grid | difference |
+|---|---|---|---|
+| `dlinear_ols` | 0.3835 | 0.3363 | −0.047 |
+| `ar40` | −0.7243 | −0.7675 | −0.043 |
+| `tcn` | −0.9033 | −0.9951 | −0.092 |
+| `transformer` | −0.1773 | −0.2768 | −0.100 |
+| `lstm` | −1.5564 | −1.7440 | −0.188 |
+
+Small, and the same sign for every model. The wave field is not what breaks transfer; the hull
+response is. That is the attribution the phase wanted and could not support from the first run.
+
+### P8-D14 — Delta 7 discharged, with a negative result: quiescence is not comparable across generators. RECORDED 2026-09-14
+
+Carry-forward delta 7 required the quiescence detector to be run on the MSS records with the base
+rate beside every F1. The first Phase 8 pass skipped it entirely — the word does not appear in the
+Gate 8 commit's write-up. Now run, with `dmf.eval.external.evaluate_quiescence_trajectories`
+reusing the P6-D2 geometry (truth mask from the full true trajectory on roll/pitch/heave_rate,
+0.5 s detector stride, earliest flag kept, ±0.5 s onset matching).
+
+**The result is that the comparison cannot be made, and delta 2 predicted exactly this.** The
+thresholds are absolute — 3.0 deg / 2.0 deg / 0.8 m·s⁻¹ permissive — while the two generators differ
+in motion amplitude by roughly a factor of two (P8-D7). Measured base rates:
+
+| threshold set | corpus `unseen_vessel` | MSS |
+|---|---|---|
+| permissive | 0.793 | **0.987** |
+| strict | 0.537 | 0.652 |
+
+Under permissive thresholds the MSS deck is landable 98.7% of the time and a 600 s record contains
+3.9 onsets. That is a different detection problem, not a harder or easier version of the same one,
+so the MSS F1s are **not comparable to the committed corpus quiescence table** and must not be read
+beside it.
+
+Two things do survive the comparison. The DLinear ordering is the same as in the accuracy table
+(`dlinear` 0.305 permissive, `tcn` 0.104, `lstm` 0.046, `transformer` 0.021). And the always-yes
+null scores 0.012 on the onset formulation at a base rate of 0.987, reproducing P6-D2's finding that
+the onset metric is not naively base-rate-exploitable — a stronger test of that claim than the
+corpus could provide, since the corpus base rate never gets that high.
+
+This is the concrete realisation of the warning delta 2 gave: skill is scale-invariant and was
+unaffected by the amplitude gap, while the operational metric — the one the project actually exists
+to serve — was dominated by it. A cross-generator operational comparison would need thresholds
+expressed relative to each generator's own motion scale. That is a change to the metric definition
+and is not made here.
+
+### P8-D15 — Gate 8 grows two predicates, and predicate 4 had the same defect as predicate 5. RECORDED 2026-09-14
+
+Gate 8 as first written had five predicates and passed 5/5 while the phase was, in fact, missing the
+operational metric entirely and had never run a control its own config declared. Two predicates were
+added so the gate tests what the phase claimed rather than a subset of it:
+
+* **6 — quiescence run with the base rate beside every F1.** Delta 7, unactioned in the first pass.
+* **7 — the declared wave-grid control actually run.** A control that exists in the config and not
+  in the results is not a control (P8-D13).
+
+**Predicate 4 was also wrong, in the way predicate 5 was.** It exempted rows from the three-seed
+rule by testing membership of a hardcoded three-name baseline tuple. That worked until the AR family
+and `damped_persistence` were added, at which point it failed four closed-form models for carrying
+exactly the one seed a closed-form model can carry. It now derives the exemption from each model's
+`FIT_KIND` via `MODEL_REGISTRY`, which is the property that actually determines seed dependence, and
+refuses to run if the registry is empty — because an unpopulated registry would classify everything
+as SGD and make the exemption vanish silently rather than loudly.
+
+That is three predicates in this gate (4, 5, and predicate 1's evidence path) that read a proxy for
+the thing they meant to verify. The proxies were a name list, a file's most recent commit, and a
+gitignored artifact. Each was correct when written and each stopped being correct when something
+adjacent changed. P7-D14 recorded the same shape of failure in the Phase 7 documentation checker.
+
+Gate 8 final: **7 of 7 predicates verified. No threshold was changed.** The gate passes with a
+negative headline (P8-D12) and with Result 3 reporting that the operational comparison cannot be
+made across generators at all (P8-D14).

@@ -32,6 +32,10 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+import dmf.models  # noqa: F401  -- import populates MODEL_REGISTRY
+from dmf.config import load_experiment
+from dmf.train.registry import MODEL_REGISTRY
+
 REQUIRED_BASELINES: tuple[str, ...] = ("persistence", "window_mean", "dlinear_ols")
 MIN_SEEDS: int = 3
 
@@ -41,6 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("configs/mss/s175_ss5.yaml"))
     parser.add_argument("--results-dir", type=Path, default=Path("results/mss"))
     parser.add_argument("--mss-dir", type=Path, default=Path("artifacts/mss"))
+    parser.add_argument(
+        "--experiment",
+        type=Path,
+        default=Path("configs/experiment/e02_deep.yaml"),
+        help="Experiment whose model configs say which rows are closed-form and therefore "
+        "exempt from the three-seed rule.",
+    )
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument(
         "--allow-fail",
@@ -119,22 +130,50 @@ def _predicate_3(results_dir: Path) -> tuple[bool, str]:
     )
 
 
-def _predicate_4(results_dir: Path) -> tuple[bool, str]:
+def _predicate_4(results_dir: Path, experiment: Path) -> tuple[bool, str]:
+    """Non-negotiable 5: every model-vs-model comparison rests on at least three seeds.
+
+    Which rows the rule applies to is **derived from each model's `FIT_KIND`**, not from a
+    hardcoded list of baseline names. A closed-form or untrained model is seed-independent
+    by construction -- `dmf.models.base.FitKind` is the property that says so -- and carries
+    one row legitimately; only `sgd` rows can differ between seeds and therefore only they
+    owe a spread.
+
+    An earlier version tested membership of a hardcoded three-name baseline tuple, which
+    passed until the AR family and `damped_persistence` were added and then failed four
+    closed-form models for having exactly the one seed they can have. That is the same
+    defect as the first version of predicate 5: reading a proxy for the property instead of
+    the property.
+    """
     hits = sorted(results_dir.glob("skill_mss_*.csv"))
     if not hits:
         return False, "no skill table"
     table = pd.concat([pd.read_csv(p) for p in hits], ignore_index=True)
     table["label"] = table["model"].astype(str).str.split("|").str[0]
-    table["seed"] = table["model"].astype(str).str.split("|").str[-1]
-    # Closed-form rows are deterministic and carry one seed by construction; the three-seed
-    # rule applies to the SGD rows, which are the ones a model-vs-model claim rests on.
-    sgd = table[~table["label"].isin(REQUIRED_BASELINES)]
+
+    cfg = load_experiment(experiment)
+    deterministic: set[str] = set()
+    for model_cfg in cfg.models:
+        cls = MODEL_REGISTRY.get(model_cfg.name)
+        if cls is not None and getattr(cls, "FIT_KIND", "sgd") != "sgd":
+            deterministic.add(model_cfg.label)
+
+    if not MODEL_REGISTRY:
+        return False, (
+            "MODEL_REGISTRY is empty -- `dmf.models` was not imported, so every model "
+            "would be treated as SGD and the exemption would silently vanish"
+        )
+
+    sgd = table[~table["label"].isin(deterministic)]
     if sgd.empty:
         return False, "no SGD model rows present"
-    counts = sgd.groupby("label")["seed"].nunique()
+    counts = sgd.groupby("label")["model"].nunique()
     short = counts[counts < MIN_SEEDS]
-    ok = short.empty
-    detail = f"seeds per SGD model: {counts.to_dict()}"
+    ok = bool(short.empty)
+    detail = (
+        f"seeds per SGD model: {counts.to_dict()}; "
+        f"{len(deterministic)} closed-form models exempt by FIT_KIND ({sorted(deterministic)})"
+    )
     if not ok:
         detail += f"; below {MIN_SEEDS}: {short.to_dict()}"
     return ok, detail
@@ -191,6 +230,42 @@ def _predicate_5() -> tuple[bool, str]:
     )
 
 
+def _predicate_6(results_dir: Path) -> tuple[bool, str]:
+    """Delta 7: the operational metric was run, and every F1 carries its base rate.
+
+    `CLAUDE.md` §Known traps requires the base rate beside every F1, and delta 7 names
+    quiescence the part of this phase most exposed to a units or scale error. The first
+    Phase 8 pass skipped the metric entirely, so the gate now checks for it.
+    """
+    path = results_dir / "quiescence_mss.csv"
+    if not path.exists():
+        return False, f"{path} absent; the operational metric was not run (delta 7)"
+    table = pd.read_csv(path)
+    for column in ("f1", "base_rate"):
+        if column not in table.columns:
+            return False, f"quiescence table has no {column!r} column"
+    if table["base_rate"].isna().any():
+        return False, "some rows report an F1 with no base rate beside it"
+    rates = table.groupby("threshold_set")["base_rate"].mean().round(4).to_dict()
+    return True, f"{len(table)} rows, every F1 carries a base rate; mean base rate {rates}"
+
+
+def _predicate_7(results_dir: Path) -> tuple[bool, str]:
+    """The wave-grid attribution control the config declares was actually run.
+
+    `configs/mss/s175_ss5.yaml` calls the corpus wave grid "the CONTROL", and the first
+    Phase 8 pass never invoked it while conceding the confound it removes. A control that
+    exists in the config and not in the results is not a control.
+    """
+    mss = results_dir / "skill_mss_mss.csv"
+    corpus = results_dir / "skill_mss_corpus.csv"
+    if not corpus.exists():
+        return False, f"{corpus} absent; --grid-kind corpus was never run"
+    if not mss.exists():
+        return False, f"{mss} absent"
+    return True, "both wave-grid conventions scored; attribution is separable"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = yaml.safe_load(args.config.read_text())
@@ -199,9 +274,14 @@ def main(argv: list[str] | None = None) -> int:
     checks = [
         ("1. spectrum matched to SS5 within 5%", _predicate_1(cfg, args.mss_dir, args.results_dir)),
         ("2. units and signs asserted; sign ablation run", _predicate_2(args.results_dir)),
-        ("3. baselines recomputed on MSS trajectories", _predicate_3(args.results_dir)),
-        ("4. at least three seeds behind model comparisons", _predicate_4(args.results_dir)),
+        ("3. baselines re-scored on MSS trajectories", _predicate_3(args.results_dir)),
+        (
+            "4. at least three seeds behind model comparisons",
+            _predicate_4(args.results_dir, args.experiment),
+        ),
         ("5. pre-registration committed before evaluation", _predicate_5()),
+        ("6. quiescence run with base rate beside every F1", _predicate_6(args.results_dir)),
+        ("7. declared wave-grid control actually run", _predicate_7(args.results_dir)),
     ]
 
     rows = []

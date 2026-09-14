@@ -85,6 +85,7 @@ def plot_skill_vs_horizon(
     dofs: tuple[str, ...],
     title: str,
     model_colors: dict[str, str] | None = None,
+    ylim: tuple[float, float] | None = None,
 ) -> Figure:
     """Skill versus forecast horizon, corpus against MSS, one panel per DOF.
 
@@ -104,6 +105,9 @@ def plot_skill_vs_horizon(
         dofs: DOF names, one panel each.
         title: Figure title.
         model_colors: Optional colour per model.
+        ylim: Optional y-axis clip. Skill is unbounded below, so one collapsing series can
+            flatten every other curve; series leaving the axis are annotated with the value
+            they reach rather than silently cropped.
 
     Returns:
         The figure.
@@ -139,6 +143,31 @@ def plot_skill_vs_horizon(
                 )
                 ax.fill_between(horizons_s, mean - sd, mean + sd, color=color, alpha=0.15, lw=0)
         ax.axhline(0.0, color="0.4", lw=0.8, ls=":")
+        # Clip the axis to the region that carries information. Skill is unbounded below --
+        # `ar40` reaches -19.9 in heave at 10 s -- and letting one series set the scale
+        # flattens every other curve into the zero line. Series that leave the axis are
+        # annotated with where they actually go, so nothing is hidden by the clip.
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+            for model in sorted(panel):
+                for source in ("corpus", "mss"):
+                    entry = panel[model].get(source)
+                    if entry is None:
+                        continue
+                    mean = entry[0]
+                    below = mean < ylim[0]
+                    if below.any():
+                        worst = float(mean[below].min())
+                        x = float(horizons_s[int(mean.argmin())])
+                        ax.annotate(
+                            f"{model} ({source}) -> {worst:.1f}",
+                            xy=(x, ylim[0]),
+                            xytext=(0, 4),
+                            textcoords="offset points",
+                            ha="center",
+                            fontsize=6.5,
+                            color=(model_colors or {}).get(model, "0.3"),
+                        )
         ax.set_ylabel("skill vs persistence")
         ax.set_title(dof, fontsize=9, loc="left")
         ax.grid(alpha=0.25, lw=0.5)

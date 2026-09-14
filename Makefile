@@ -64,7 +64,9 @@ mss:
 	$(PY) scripts/mss_export.py
 	$(PY) scripts/mss_octave_check.py
 	$(PY) scripts/mss_compare.py
-	$(PY) scripts/mss_evaluate.py --sign-ablation
-	$(PY) scripts/mss_evaluate.py --rescale-to-corpus
+	$(PY) scripts/mss_evaluate.py --grid-kind mss --sign-ablation
+	$(PY) scripts/mss_evaluate.py --grid-kind corpus
+	$(PY) scripts/mss_evaluate.py --grid-kind mss --rescale-to-corpus
+	$(PY) scripts/mss_quiescence.py
 	$(PY) scripts/mss_figures.py
 	$(PY) scripts/gate8.py
