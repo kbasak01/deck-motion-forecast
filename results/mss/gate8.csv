@@ -3,6 +3,6 @@ predicate,passed,evidence
 2. units and signs asserted; sign ablation run,True,"sign conventions scored: ['nominal', 'sign_flipped']"
 3. baselines re-scored on MSS trajectories,True,"all of ['persistence', 'window_mean', 'dlinear_ols'] recomputed on MSS data; persistence self-skill max |.| = 0.000e+00 (must be exactly 0)"
 4. at least three seeds behind model comparisons,True,"seeds per SGD model: {'dlinear': 3, 'lstm': 3, 'tcn': 3, 'transformer': 3}; 8 closed-form models exempt by FIT_KIND (['ar10', 'ar20', 'ar40', 'ar_attitude_only', 'damped_persistence', 'dlinear_ols', 'persistence', 'window_mean'])"
-5. pre-registration committed before evaluation,True,pre-registration 1a8a612e precedes first skill table 64ed5442: yes
+5. pre-registration committed before evaluation,True,pre-registration d0ae0f13 precedes first skill table c424144c: yes
 6. quiescence run with base rate beside every F1,True,"756 rows, every F1 carries a base rate; mean base rate {'permissive': 0.9871, 'strict': 0.6515}"
 7. declared wave-grid control actually run,True,both wave-grid conventions scored; attribution is separable
