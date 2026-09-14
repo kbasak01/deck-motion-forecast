@@ -4847,3 +4847,95 @@ P8-D1 excludes that cell from the headline in advance.
 The amplitude gap does not move skill, which is scale-invariant. The timescale agreement is the part
 that bears on forecastability, since what a short-horizon forecaster extrapolates is the phase and
 period structure of the motion, not its absolute scale.
+
+### P8-D8 — RESULT: the primary prediction is falsified and the counter-hypothesis confirmed. RECORDED 2026-09-14
+
+Pitch at 10 s, the cell P8-D1 registered in advance, mean over three seeds and six cells. Corpus
+values are the committed `unseen_vessel` rows for the same cells; MSS values are the same
+checkpoints scored on MSS trajectories.
+
+| model | corpus | MSS | change |
+|---|---|---|---|
+| `persistence` | 0.0000 | 0.0000 | by construction |
+| `window_mean` | 0.0733 | -0.0586 | -0.132 |
+| `dlinear_ols` | 0.4904 | 0.3835 | -0.107 |
+| `dlinear` | 0.4144 | 0.3935 | -0.021 |
+| `tcn` | 0.8604 | **-0.9033** | -1.764 |
+| `lstm` | 0.8032 | **-1.5564** | -2.360 |
+| `transformer` | 0.7654 | -0.1773 | -0.943 |
+
+P8-D1 predicted `tcn` > `lstm` > `dlinear_ols` with `tcn` above 0.5. **That is wrong.** The three
+deep models go negative — worse than persistence — while the linear models lose 0.02 to 0.11. The
+counter-hypothesis in the same entry, implied by the P8-D6 phase defect, is what happened: the models
+most able to depend on cross-channel phase lost the most, and the per-channel linear map lost least.
+
+**The horizon structure is the more useful finding.** Skill against horizon, pitch:
+
+| horizon | `dlinear_ols` | `tcn` | `lstm` | `transformer` |
+|---|---|---|---|---|
+| 1 s | 0.997 | 0.953 | 0.656 | 0.681 |
+| 2 s | 0.965 | 0.847 | 0.703 | 0.850 |
+| 3 s | 0.899 | 0.714 | 0.659 | 0.847 |
+| 5 s | 0.936 | 0.700 | 0.481 | 0.819 |
+| 10 s | 0.383 | -0.903 | -1.556 | -0.177 |
+| 15 s | 0.386 | -0.047 | -0.606 | 0.260 |
+
+Everything keeps positive skill through 5 s. The collapse is confined to 10 and 15 s.
+
+**This lands on the gate cell specifically, and that is worth stating plainly.** Gates 3, 4 and 5
+were all read at pitch / 10 s — P3-D12 moved Gate 3 there, P4-D1 and P5-D2 kept it. P4-D14
+restriction 2 had already recorded that `tcn` merely *ties* `dlinear_ols` in the 1-5 s operational
+band and looks best at 10-15 s. Phase 8 adds the other half: 10 s is also the horizon at which the
+deep advantage does not survive an independent hydrodynamic model. At 10 s the deep models beat
+`dlinear_ols` by 0.37 on the corpus and lose to it by 1.29 on MSS.
+
+**What this does not say.** It does not say the deep architectures are unsuited to deck-motion
+forecasting. It says these checkpoints, trained on this corpus, learned long-horizon structure
+specific to this generator. Whether a corpus without the P8-D6 defect supports a deep model that
+transfers is a Phase 9 question and this run cannot answer it.
+
+### P8-D9 — Controls, and how much of the collapse the amplitude gap explains. RECORDED 2026-09-14
+
+*Sign-flip ablation (P8-D3).* Scoring under the inverted sign convention moves skill by at most
+0.006 at pitch / 10 s, for every model. The conclusion does not rest on the sign derivation, which
+was the point of running it: P8-D3 is a derivation from SNAME axes, not a measurement, and a sign
+error does not cancel in the skill score the way a units error does.
+
+*Skill denominator.* `persistence` self-skill is exactly 0.0 on both sides, enforced in-function,
+so the denominator was measured on the MSS windows and not carried over from the corpus (delta 4).
+
+*Normalisation provenance.* `fitted_on = 'unseen_vessel/train'`, asserted before any window is cut;
+a non-training provenance raises (delta 3).
+
+*Pipeline parity.* One corpus realization scored through `evaluate_models` and through the new
+`evaluate_trajectories` agrees on every metric column to `rtol=1e-10`, so the external path is the
+corpus path and the MSS rows are comparable to the committed ones.
+
+*Amplitude control — the one that matters for the causal claim.* P8-D7 measured the corpus running
+~1.6x hot, so after normalisation the MSS records present at roughly half the amplitude of anything
+in training. That alone could depress a deep model with no structural story being true. Each MSS
+channel was therefore rescaled to the corpus mean RMS for its cell — changing amplitude, leaving
+every phase, period and cross-channel relationship intact — and rescored:
+
+| model | MSS as-is | MSS rescaled | recovered |
+|---|---|---|---|
+| `dlinear_ols` | 0.3835 | 0.3835 | +0.0000 |
+| `dlinear` | 0.3935 | 0.3935 | +0.0000 |
+| `tcn` | -0.9033 | -0.5796 | +0.3237 |
+| `lstm` | -1.5564 | -1.1062 | +0.4502 |
+| `transformer` | -0.1773 | -0.1732 | +0.0041 |
+
+The linear rows move by **exactly zero**, which is the control behaving as it must: skill is
+scale-invariant and a per-channel constant cannot reach it. The deep rows recover and remain
+strongly negative. For `tcn`, rescaling returns 0.32 of a 1.76 drop, about **18%**. The
+normalisation-range effect is real and is a minority of the story; roughly four fifths of the
+collapse survives it and is attributable to structure rather than scale.
+
+*What is still not separated.* The amplitude control does not isolate the P8-D6 cross-DOF phase
+defect from every other structural difference between the two generators — the corpus applies an
+`exp(-(kL/4pi)^2)` length rolloff and an `exp(-k*draft)` Smith factor where strip theory solves the
+radiation-diffraction problem, and those differ in more than phase. P8-D6 is the *mechanism most
+consistent* with linear models transferring and multivariate ones not, and it was recorded before
+the run, but this phase does not prove it is the only cause. The decisive test is to re-generate a
+corpus with the quadrature excitation corrected and see whether the deep models then transfer; that
+is Phase 9 work and is outside this timebox.

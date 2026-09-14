@@ -35,8 +35,8 @@ import scipy.io as sio
 import yaml
 
 from dmf.mss.export import MSSRealizationSpec, _build_grid, realization_seed
-from dmf.mss.vessel import DOF_NAMES, load_mss_vessel
 from dmf.mss.synth import synthesize_mss_motion
+from dmf.mss.vessel import DOF_NAMES, load_mss_vessel
 
 KNOT_M_S = 0.514444
 

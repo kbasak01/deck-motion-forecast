@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     print(
-        f"[mss] encounter-frame Tz (diagnostic, Doppler-shifted by speed): "
+        "[mss] encounter-frame Tz (diagnostic, Doppler-shifted by speed): "
         + ", ".join(
             f"{s:.0f}kn {g['tz_encounter_s'].mean():.2f}s"
             for s, g in manifest.groupby("speed_kn")

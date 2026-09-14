@@ -209,7 +209,8 @@ def mss_encounter_frequency(
     """
     w = np.asarray(w_rad_s, dtype=np.float64)
     beta = np.deg2rad(float(heading_deg))
-    return np.abs(w - (w**2 / float(gravity_m_s2)) * float(speed_m_s) * np.cos(beta))
+    shifted = w - (w**2 / float(gravity_m_s2)) * float(speed_m_s) * np.cos(beta)
+    return np.asarray(np.abs(shifted), dtype=np.float64)
 
 
 def _interpolate_rao(
