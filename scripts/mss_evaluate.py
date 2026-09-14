@@ -55,7 +55,12 @@ PERSISTENCE_RUN_KEY: str = "persistence|0"
 
 #: Motion channels the unit assertion and the rescaling control operate on.
 MOTION_CHANNELS: tuple[str, ...] = (
-    "roll", "pitch", "heave", "roll_rate", "pitch_rate", "heave_rate",
+    "roll",
+    "pitch",
+    "heave",
+    "roll_rate",
+    "pitch_rate",
+    "heave_rate",
 )
 
 MSS_MODEL_LABELS: tuple[str, ...] = (
@@ -124,9 +129,7 @@ def _load_models(
     spec = window_spec_from_config(cfg.data)
     split = build_split(load_manifest(corpus_root), regime)  # type: ignore[arg-type]
     train = DeckMotionDataset(corpus_root, split, "train", cfg.data, spec)
-    val = DeckMotionDataset(
-        corpus_root, split, "val", cfg.data, spec, stats=train.norm_stats
-    )
+    val = DeckMotionDataset(corpus_root, split, "val", cfg.data, spec, stats=train.norm_stats)
     holder: dict[str, TrainingMoments] = {}
     records: list[RunRecord] = []
     for model_cfg in cfg.models:
@@ -229,8 +232,14 @@ def main(argv: list[str] | None = None) -> int:
                         f.assign(
                             **{
                                 c: -f[c]
-                                for c in ("roll", "pitch", "heave",
-                                          "roll_rate", "pitch_rate", "heave_rate")
+                                for c in (
+                                    "roll",
+                                    "pitch",
+                                    "heave",
+                                    "roll_rate",
+                                    "pitch_rate",
+                                    "heave_rate",
+                                )
                             }
                         )
                         for f in frames

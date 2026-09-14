@@ -155,7 +155,11 @@ def main(argv: list[str] | None = None) -> int:
             _run_octave(mss_dir, "run_case", case, out)
             oct_df = pd.read_csv(out)
             motion = synthesize_mss_motion(
-                vessel, grid, heading, speed_kn * KNOT_M_S, t,
+                vessel,
+                grid,
+                heading,
+                speed_kn * KNOT_M_S,
+                t,
                 speed_index=int(cfg["vessel"]["speed_index"]),
             )
             for i, dof in enumerate(DOF_NAMES):
@@ -180,8 +184,11 @@ def main(argv: list[str] | None = None) -> int:
                         }
                     )
             worst = max(
-                r["rel_deviation"] for r in rows if r["heading_deg"] == heading
-                and r["speed_kn"] == speed_kn and r["check"] != "patch_equivalence"
+                r["rel_deviation"]
+                for r in rows
+                if r["heading_deg"] == heading
+                and r["speed_kn"] == speed_kn
+                and r["check"] != "patch_equivalence"
             )
             print(
                 f"[parity] heading {heading:5.1f} deg, {speed_kn:4.1f} kn: "

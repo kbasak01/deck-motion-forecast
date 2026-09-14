@@ -115,9 +115,7 @@ def response_psd(signal: FloatArray, fs_hz: float) -> tuple[FloatArray, FloatArr
     return 2.0 * np.pi * f, pxx / (2.0 * np.pi)
 
 
-def summarize_records(
-    frames: list[pd.DataFrame], fs_hz: float, source: str
-) -> pd.DataFrame:
+def summarize_records(frames: list[pd.DataFrame], fs_hz: float, source: str) -> pd.DataFrame:
     """Summarise a set of records, one row per (record, dof).
 
     Args:

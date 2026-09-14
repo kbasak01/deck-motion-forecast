@@ -51,18 +51,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _predicate_1(cfg: dict, mss_dir: Path) -> tuple[bool, str]:
-    path = mss_dir / "manifest.csv"
-    if not path.exists():
-        return False, f"{path} absent; nothing was exported"
-    m = pd.read_csv(path)
+def _predicate_1(cfg: dict, mss_dir: Path, results_dir: Path) -> tuple[bool, str]:
+    """Spectrum match, read from the COMMITTED summary.
+
+    `artifacts/` is gitignored, so `artifacts/mss/manifest.csv` cannot testify to anything
+    on a fresh clone -- a gate that reads it passes only on the machine that happens to
+    still hold the run. The committed `results/mss/spectrum_match.csv` is the evidence; the
+    manifest is used only as a fallback when the summary has not been written yet.
+    """
     tol = cfg["match_tolerance"]
-    hs, hs_sd = float(m["hs_rel_err"].mean()), float(m["hs_rel_err"].std())
-    tz, tz_sd = float(m["tz_rel_err"].mean()), float(m["tz_rel_err"].std())
+    summary = results_dir / "spectrum_match.csv"
+    if summary.exists():
+        m = pd.read_csv(summary)
+        hs = float(m["hs_rel_err_mean"].mean())
+        hs_sd = float(m["hs_rel_err_std"].mean())
+        tz = float(m["tz_rel_err_mean"].mean())
+        tz_sd = float(m["tz_rel_err_std"].mean())
+        n = int(m["hs_rel_err_count"].sum())
+        source = summary
+    else:
+        path = mss_dir / "manifest.csv"
+        if not path.exists():
+            return False, (
+                f"neither {summary} (committed) nor {path} (local) exists; the spectrum "
+                "match is unverified"
+            )
+        raw = pd.read_csv(path)
+        hs, hs_sd = float(raw["hs_rel_err"].mean()), float(raw["hs_rel_err"].std())
+        tz, tz_sd = float(raw["tz_rel_err"].mean()), float(raw["tz_rel_err"].std())
+        n = len(raw)
+        source = path
     ok = abs(hs) <= float(tol["hs_rel"]) and abs(tz) <= float(tol["tz_rel"])
     return ok, (
         f"Hs {hs:+.4f} +/- {hs_sd:.4f}, Tz {tz:+.4f} +/- {tz_sd:.4f} "
-        f"(tol {tol['hs_rel']}/{tol['tz_rel']}, read on the mean over {len(m)} records)"
+        f"(tol {tol['hs_rel']}/{tol['tz_rel']}, mean over {n} records, from {source})"
     )
 
 
@@ -175,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir or args.results_dir
 
     checks = [
-        ("1. spectrum matched to SS5 within 5%", _predicate_1(cfg, args.mss_dir)),
+        ("1. spectrum matched to SS5 within 5%", _predicate_1(cfg, args.mss_dir, args.results_dir)),
         ("2. units and signs asserted; sign ablation run", _predicate_2(args.results_dir)),
         ("3. baselines recomputed on MSS trajectories", _predicate_3(args.results_dir)),
         ("4. at least three seeds behind model comparisons", _predicate_4(args.results_dir)),

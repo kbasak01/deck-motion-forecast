@@ -20,7 +20,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from dmf.eval.quiescence import PERMISSIVE, STRICT, base_rate, detect_quiescent_mask, scorable_onsets
+from dmf.eval.quiescence import (
+    PERMISSIVE,
+    STRICT,
+    base_rate,
+    detect_quiescent_mask,
+    scorable_onsets,
+)
 
 THRESHOLDS = (PERMISSIVE, STRICT)
 
@@ -59,9 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         for limits in THRESHOLDS:
             rates, raw, scorable, samples = [], 0, 0, 0
             for path in chosen["path"]:
-                frame = pd.read_parquet(
-                    args.corpus / path, columns=["roll", "pitch", "heave_rate"]
-                )
+                frame = pd.read_parquet(args.corpus / path, columns=["roll", "pitch", "heave_rate"])
                 mask = detect_quiescent_mask(
                     frame["roll"].to_numpy(np.float64),
                     frame["pitch"].to_numpy(np.float64),
@@ -74,7 +78,9 @@ def main(argv: list[str] | None = None) -> int:
                 # `scorable_onsets` drops a run already open at the first decision index; the
                 # raw count is kept beside it because their difference IS the P6-D7 finding
                 # at SS3/permissive (one raw onset, zero scorable).
-                raw += int(np.count_nonzero(np.diff(np.concatenate(([0], mask.view(np.int8)))) == 1))
+                raw += int(
+                    np.count_nonzero(np.diff(np.concatenate(([0], mask.view(np.int8)))) == 1)
+                )
                 scorable += int(onsets.size)
                 samples += int(mask.size)
             rows.append(
@@ -101,9 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         sub = table[table["threshold_set"] == name]
         print(f"\n=== {name}: base rate by (ss, speed) ===")
         print(
-            sub.pivot_table(index="ss", columns="speed_kn", values="base_rate")
-            .round(3)
-            .to_string()
+            sub.pivot_table(index="ss", columns="speed_kn", values="base_rate").round(3).to_string()
         )
         print(f"=== {name}: scorable onsets/realization by (ss, speed) ===")
         print(

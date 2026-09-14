@@ -48,8 +48,7 @@ FS_HZ = 10.0
 requires_mss = pytest.mark.skipif(
     not MAT_PATH.exists(),
     reason=(
-        "MSS toolbox not cloned. "
-        "git clone https://github.com/cybergalactic/MSS.git mss/upstream"
+        "MSS toolbox not cloned. git clone https://github.com/cybergalactic/MSS.git mss/upstream"
     ),
 )
 
@@ -112,8 +111,9 @@ def test_port_starboard_symmetry(vessel) -> None:
             i = DOF_INDEX[dof]
             ra = float(np.sqrt(np.mean(a.eta[i] ** 2)))
             rb = float(np.sqrt(np.mean(b.eta[i] ** 2)))
-            print(f"[p8-2] {heading:5.1f}/{360.0 - heading:5.1f} deg {dof:6s}: "
-                  f"{ra:.6f} vs {rb:.6f}")
+            print(
+                f"[p8-2] {heading:5.1f}/{360.0 - heading:5.1f} deg {dof:6s}: {ra:.6f} vs {rb:.6f}"
+            )
             assert ra == pytest.approx(rb, rel=1e-6)
 
 
@@ -126,7 +126,7 @@ def test_encounter_frequency_rises_in_head_seas_and_falls_in_following(vessel) -
     frequency and running with them lowers it. With 180 deg as head seas (P8-D2) this is
     what the formula must produce.
     """
-    w = np.array([0.4, 0.6478, 0.9], dtype=np.float64)   # SS5 peak is 0.6478 rad/s
+    w = np.array([0.4, 0.6478, 0.9], dtype=np.float64)  # SS5 peak is 0.6478 rad/s
     u = 12.0 * 0.514444
     head = mss_encounter_frequency(w, u, 180.0, gravity_m_s2=vessel.gravity_m_s2)
     following = mss_encounter_frequency(w, u, 0.0, gravity_m_s2=vessel.gravity_m_s2)

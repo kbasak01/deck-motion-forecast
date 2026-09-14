@@ -1,5 +1,5 @@
 predicate,passed,evidence
-1. spectrum matched to SS5 within 5%,True,"Hs -0.0073 +/- 0.0449, Tz +0.0334 +/- 0.0394 (tol 0.05/0.05, read on the mean over 36 records)"
+1. spectrum matched to SS5 within 5%,True,"Hs -0.0073 +/- 0.0441, Tz +0.0334 +/- 0.0399 (tol 0.05/0.05, mean over 36 records, from results/mss/spectrum_match.csv)"
 2. units and signs asserted; sign ablation run,True,"sign conventions scored: ['nominal', 'sign_flipped']"
 3. baselines recomputed on MSS trajectories,True,"all of ['persistence', 'window_mean', 'dlinear_ols'] recomputed on MSS data; persistence self-skill max |.| = 0.000e+00 (must be exactly 0)"
 4. at least three seeds behind model comparisons,True,"seeds per SGD model: {'dlinear': 3, 'lstm': 3, 'tcn': 3, 'transformer': 3}"

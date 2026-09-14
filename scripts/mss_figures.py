@@ -36,9 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mss-dir", type=Path, default=Path("artifacts/mss"))
     parser.add_argument("--corpus-root", type=Path, default=Path("artifacts/corpus"))
     parser.add_argument("--grid-kind", default="mss")
-    parser.add_argument("--heading", type=float, default=135.0,
-                        help="Heading for the spectra overlay. 135 deg by default because "
-                             "head-seas roll is identically zero on the MSS side.")
+    parser.add_argument(
+        "--heading",
+        type=float,
+        default=135.0,
+        help="Heading for the spectra overlay. 135 deg by default because "
+        "head-seas roll is identically zero on the MSS side.",
+    )
     parser.add_argument("--speed", type=float, default=12.0)
     return parser
 
@@ -66,9 +70,7 @@ def _skill_series(results_dir: Path, grid_kind: str) -> tuple[np.ndarray, dict]:
         & (corpus["vessel"] == "s175")
         & (corpus["ss"] == "SS5")
         & (corpus["heading_deg"].isin([180.0, 135.0]))
-    ].drop_duplicates(
-        subset=["model", "seed", "heading_deg", "speed_kn", "dof", "horizon_samples"]
-    )
+    ].drop_duplicates(subset=["model", "seed", "heading_deg", "speed_kn", "dof", "horizon_samples"])
 
     horizons = np.array(sorted(mss["horizon_s"].unique()), dtype=float)
     series: dict[str, dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]] = {}
@@ -119,10 +121,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[fig] wrote {p1}", file=sys.stderr)
 
     # 2. Response spectra overlay.
-    cp = sorted((args.corpus_root / "s175").glob(
-        f"SS5_h{args.heading:05.1f}_u{args.speed:04.1f}_s*.parquet"))
-    mp = sorted((args.mss_dir / args.grid_kind).glob(
-        f"S175_h{args.heading:05.1f}_u{args.speed:04.1f}_s*.csv"))
+    cp = sorted(
+        (args.corpus_root / "s175").glob(
+            f"SS5_h{args.heading:05.1f}_u{args.speed:04.1f}_s*.parquet"
+        )
+    )
+    mp = sorted(
+        (args.mss_dir / args.grid_kind).glob(
+            f"S175_h{args.heading:05.1f}_u{args.speed:04.1f}_s*.csv"
+        )
+    )
     if cp and mp:
         corpus_frames = [pd.read_parquet(p) for p in cp]
         mss_frames = [pd.read_csv(p) for p in mp]
@@ -141,7 +149,11 @@ def main(argv: list[str] | None = None) -> int:
             m_psd[dof] = np.vstack(acc_m).mean(axis=0)
         assert w_ref is not None
         fig2 = plot_response_spectra_overlay(
-            w_ref, c_psd, m_psd, COMPARE_DOFS, UNITS,
+            w_ref,
+            c_psd,
+            m_psd,
+            COMPARE_DOFS,
+            UNITS,
             f"Response spectra, S175 at SS5, {args.heading:.0f} deg, {args.speed:.0f} kn "
             f"({len(corpus_frames)} corpus vs {len(mss_frames)} MSS realizations)",
             corpus_band=band,

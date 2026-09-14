@@ -57,7 +57,12 @@ def plot_response_spectra_overlay(
         if corpus_band is not None and dof in corpus_band:
             lo, hi = corpus_band[dof]
             ax.fill_between(
-                w_rad_s, lo, hi, color=CORPUS_COLOR, alpha=0.18, lw=0,
+                w_rad_s,
+                lo,
+                hi,
+                color=CORPUS_COLOR,
+                alpha=0.18,
+                lw=0,
                 label="corpus across-seed range",
             )
         ax.plot(w_rad_s, corpus_psd[dof], color=CORPUS_COLOR, lw=1.8, label="corpus (this project)")
@@ -123,8 +128,13 @@ def plot_skill_vs_horizon(
                 mean, sd = entry
                 color = colors[model]
                 ax.plot(
-                    horizons_s, mean, style, color=color, lw=1.6,
-                    marker="o" if source == "corpus" else "s", ms=3.0,
+                    horizons_s,
+                    mean,
+                    style,
+                    color=color,
+                    lw=1.6,
+                    marker="o" if source == "corpus" else "s",
+                    ms=3.0,
                     label=f"{model} ({'corpus' if source == 'corpus' else 'MSS'})",
                 )
                 ax.fill_between(horizons_s, mean - sd, mean + sd, color=color, alpha=0.15, lw=0)
