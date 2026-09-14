@@ -550,9 +550,24 @@ Amplitudes are correct and every Gate 1 invariant still holds, because a common 
 within one channel does not change its spectrum. It is unfixed -- fixing it invalidates the corpus
 and Phases 2-7 -- and it is not sufficient on its own to explain the AR result.
 
+### The operational metric could not be compared at all
+
+Quiescence detection is threshold-based on absolute limits (3.0 deg / 2.0 deg / 0.8 m/s). Our
+generator runs ~2x hot, so those same limits classify far more of the MSS record as landable: at
+permissive thresholds in head seas the MSS deck **never leaves limits** -- base rate 1.0000, zero
+onsets, nothing to detect -- against a corpus base rate of 0.655 in the same cell. Two of six
+permissive cells are unscorable outright.
+
+This is the sharpest result in the phase and it is a methodological one. Skill is a ratio and was
+completely unaffected by the amplitude gap; the operational metric, the one this project exists to
+serve, was dominated by it. Where the metric *is* scorable the ordering matches the accuracy
+finding -- `dlinear`/`dlinear_ols`/`ar40` on top, the deep models below -- but chance-timing
+(`rate_matched`) beats `transformer` at four of six strict cells, so those rows are not detecting
+anything measurable.
+
 Full write-up including the statistical comparison of the two generators, the Octave parity check
 (the NumPy bridge reproduces MSS's own `waveMotionRAO.m` to 4.4e-12), and the corrections made after
-the Gate 8 review: `docs/mss_crossvalidation.md`, protocol entries P8-D1 to P8-D13.
+the Gate 8 review: `docs/mss_crossvalidation.md`, protocol entries P8-D1 to P8-D15.
 
 ## Quickstart
 

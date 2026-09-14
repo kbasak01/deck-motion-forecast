@@ -5082,36 +5082,55 @@ response is. That is the attribution the phase wanted and could not support from
 ### P8-D14 — Delta 7 discharged, with a negative result: quiescence is not comparable across generators. RECORDED 2026-09-14
 
 Carry-forward delta 7 required the quiescence detector to be run on the MSS records with the base
-rate beside every F1. The first Phase 8 pass skipped it entirely — the word does not appear in the
-Gate 8 commit's write-up. Now run, with `dmf.eval.external.evaluate_quiescence_trajectories`
-reusing the P6-D2 geometry (truth mask from the full true trajectory on roll/pitch/heave_rate,
-0.5 s detector stride, earliest flag kept, ±0.5 s onset matching).
+rate beside every F1. The first Phase 8 pass skipped it entirely. Now run, via
+`dmf.eval.external.evaluate_quiescence_trajectories`, which **imports** the P6-D2 decision geometry
+from `dmf.eval.quiescence_runner` rather than restating it, and is verified against the corpus path
+row by row at `rtol=0` on a fabricated realization. Every MSS record yields 1131 decision times over
+580.0 s, identical to the committed corpus. The computation is the same quantity; the numbers are
+not comparable, and the reason is instructive.
 
-**The result is that the comparison cannot be made, and delta 2 predicted exactly this.** The
-thresholds are absolute — 3.0 deg / 2.0 deg / 0.8 m·s⁻¹ permissive — while the two generators differ
-in motion amplitude by roughly a factor of two (P8-D7). Measured base rates:
+**Two cells have nothing in them to measure.** Per cell, truth side:
 
-| threshold set | corpus `unseen_vessel` | MSS |
-|---|---|---|
-| permissive | 0.793 | **0.987** |
-| strict | 0.537 | 0.652 |
+| thresholds | heading | kn | MSS base rate | MSS true onsets | corpus base rate | corpus true onsets |
+|---|---|---|---|---|---|---|
+| permissive | 135 | 0 | 0.9855 | 336 | 0.877 | 212 |
+| permissive | 180 | 0 | **1.0000** | **0 — NOT SCORABLE** | 0.655 | 377 |
+| permissive | 180 | 6 | **0.9998** | **0 — NOT SCORABLE** | 0.755 | 334 |
+| permissive | 180 | 12 | 0.9988 | 21 (1 of 3 records) | 0.869 | 234 |
+| strict | 135 | 0 | 0.5505 | 1197 | 0.318 | 104 |
+| strict | 180 | 0 | **0.8357** | 861 | **0.173** | 86 |
 
-Under permissive thresholds the MSS deck is landable 98.7% of the time and a 600 s record contains
-3.9 onsets. That is a different detection problem, not a harder or easier version of the same one,
-so the MSS F1s are **not comparable to the committed corpus quiescence table** and must not be read
-beside it.
+The thresholds are absolute while the two generators differ in motion amplitude by roughly two
+(P8-D7), so at permissive limits in head seas the MSS deck never leaves limits at all. At
+strict/180/0 kn the base rates differ by 4.8x. An MSS F1 must not be placed beside a corpus F1.
 
-Two things do survive the comparison. The DLinear ordering is the same as in the accuracy table
-(`dlinear` 0.305 permissive, `tcn` 0.104, `lstm` 0.046, `transformer` 0.021). And the always-yes
-null scores 0.012 on the onset formulation at a base rate of 0.987, reproducing P6-D2's finding that
-the onset metric is not naively base-rate-exploitable — a stronger test of that claim than the
-corpus could provide, since the corpus base rate never gets that high.
+**This is the concrete realisation of delta 2's warning**, and the sharpest available demonstration
+of it: skill is scale-invariant and was untouched by the amplitude gap, while the operational metric
+— the one the project exists to serve — was dominated by it to the point of becoming undefined in
+two cells.
 
-This is the concrete realisation of the warning delta 2 gave: skill is scale-invariant and was
-unaffected by the amplitude gap, while the operational metric — the one the project actually exists
-to serve — was dominated by it. A cross-generator operational comparison would need thresholds
-expressed relative to each generator's own motion scale. That is a change to the metric definition
-and is not made here.
+**What is comparable is the ordering within a cell, and it inverts.** On the corpus at strict
+thresholds `tcn` and `lstm` beat `dlinear` by 2-4x; on MSS every strict cell is topped by
+`dlinear` / `dlinear_ols` / `ar40` / `damped_persistence`. Same direction as P8-D12's accuracy
+result, arrived at through a different metric.
+
+**Three caveats that belong with the table.** `rate_matched` — chance timing at the correct rate —
+**beats `transformer` at four of six strict cells and `lstm` at three**, so those rows have no
+measurable timing skill on MSS. Onset counts are thin and no bootstrap interval is computed, because
+a single record is one resampling unit; differences below ~0.03 F1 per cell are not readable.
+`persistence` and `window_mean` score exactly zero with zero predicted onsets, which is a property
+of a constant forecast rather than a measured failure.
+
+**An error of the same family, caught before publication.** The first write-up of this result quoted
+a single grid-pooled base rate of 0.987 and a single pooled F1 per model — averaging the two
+unscorable head-seas cells in with the scorable bow-quartering ones. That is precisely what P6-D19
+retracted a whole table for, and P6-D7 before it. Corrected to per-cell reporting with scorability
+stated. The committed CSV was never affected; it has always been one row per (model, record,
+threshold set, rule).
+
+Not run: the `corpus`-grid wave-field arm of this metric, which would separate hull response from
+wave field for quiescence as P8-D13 does for accuracy. Delta 7 did not ask for it and
+`scripts/mss_quiescence.py --grid-kind corpus` will produce it if Phase 9 wants it.
 
 ### P8-D15 — Gate 8 grows two predicates, and predicate 4 had the same defect as predicate 5. RECORDED 2026-09-14
 

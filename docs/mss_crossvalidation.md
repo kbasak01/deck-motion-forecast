@@ -190,46 +190,70 @@ control makes every non-DLinear model *worse* — because the premise fails ther
 No fraction of the collapse can be attributed to normalisation range from this control; the honest
 statement is that scale is not the explanation, and the control does not tell us what is (P8-D11).
 
-## Result 3 — the operational metric does not survive the amplitude gap
+## Result 3 — the operational metric cannot be compared across generators
 
-Carry-forward delta 7 required the quiescence detector to be run on the MSS records, with the base
-rate beside every F1. It is the operational metric, it is threshold-based on **absolute** limits
-(3.0 deg / 2.0 deg / 0.8 m·s⁻¹ permissive; 1.5 / 1.0 / 0.4 strict), and delta 2 predicted it would
-be the part of this phase most exposed to a scale difference. It was.
+Carry-forward delta 7 required the quiescence detector to be run on the MSS records with the base
+rate beside every F1. It is threshold-based on **absolute** limits (3.0 deg / 2.0 deg / 0.8 m·s⁻¹
+permissive; 1.5 / 1.0 / 0.4 strict), and delta 2 predicted it would be the part of this phase most
+exposed to a scale difference. It was — to the point that two cells have nothing in them to measure.
 
-| | corpus (`unseen_vessel`) | MSS |
-|---|---|---|
-| base rate, permissive | 0.793 | **0.987** |
-| base rate, strict | 0.537 | 0.652 |
-| true onsets per 600 s record, permissive | — | 3.9 |
-| true onsets per 600 s record, strict | — | 16.8 |
+**Truth side first, per cell, because that is the story.** Pooling these into one number is the
+error P6-D19 retracted a whole table for, and an earlier version of this section did exactly that:
 
-Our generator runs hot, so the same absolute limits classify a far larger fraction of the MSS record
-as quiescent: under permissive thresholds the MSS deck is landable **98.7%** of the time and a 600 s
-record contains fewer than four onsets to detect. The detection problem is not the same problem, and
-the F1s are not comparable to the committed corpus numbers. Reported with base rates so the reader
-can see that rather than infer it:
+| thresholds | heading | kn | MSS base rate | MSS true onsets | corpus base rate | corpus true onsets |
+|---|---|---|---|---|---|---|
+| permissive | 135 | 0 | 0.9855 | 336 | 0.877 | 212 |
+| permissive | 135 | 6 | 0.9705 | 504 | 0.890 | 174 |
+| permissive | 135 | 12 | 0.9681 | 630 | 0.944 | 100 |
+| permissive | 180 | 0 | **1.0000** | **0 — NOT SCORABLE** | 0.655 | 377 |
+| permissive | 180 | 6 | **0.9998** | **0 — NOT SCORABLE** | 0.755 | 334 |
+| permissive | 180 | 12 | 0.9988 | 21 (1 of 3 records) | 0.869 | 234 |
+| strict | 135 | 0 | 0.5505 | 1197 | 0.318 | 104 |
+| strict | 180 | 0 | **0.8357** | 861 | **0.173** | 86 |
 
-| model | permissive F1 | strict F1 | base rate (perm / strict) |
-|---|---|---|---|
-| `dlinear` | 0.305 ± 0.004 | 0.105 ± 0.001 | 0.987 / 0.652 |
-| `damped_persistence` | 0.282 | 0.099 | 0.987 / 0.652 |
-| `dlinear_ols` | 0.219 | 0.082 | 0.987 / 0.652 |
-| `ar10` | 0.141 | 0.080 | 0.987 / 0.652 |
-| `tcn` | 0.104 ± 0.005 | 0.076 ± 0.005 | 0.987 / 0.652 |
-| `lstm` | 0.046 ± 0.012 | 0.064 ± 0.001 | 0.987 / 0.652 |
-| `transformer` | 0.021 ± 0.011 | 0.053 ± 0.003 | 0.987 / 0.652 |
-| `always_quiescent` (null) | 0.012 | 0.029 | 0.987 / 0.652 |
-| `persistence`, `window_mean` | 0.000 | 0.000 | 0.987 / 0.652 |
+Our generator runs ~2x hot (Result 1), so the same absolute limits classify far more of the MSS
+record as landable. At permissive thresholds in head seas the MSS deck **never leaves limits**: base
+rate 1.0000, zero onsets, nothing to detect. At strict/180/0 kn the base rates differ by a factor of
+4.8 (0.836 against 0.173). The two detectors are not facing the same problem, so an MSS F1 must not
+be placed beside a corpus F1 and read as a model comparison.
 
-The DLinear ordering holds here too, and the always-yes null still scores near zero on the onset
-formulation, reproducing P6-D2's finding that the metric is not naively base-rate-exploitable even
-at a base rate of 0.987. But `persistence` and `window_mean` emit **no onsets at all**, and every
-F1 in the table is low enough that the ranking is carried by precision against a near-degenerate
-positive class. **Treat this table as evidence that the operational comparison cannot be made across
-generators with different motion amplitudes, not as an operational result.** Making it would need
-thresholds expressed relative to each generator's own motion scale, which is a change to the metric
-definition and out of scope here.
+**What is comparable is the ordering within a cell, and it inverts.** On the corpus at strict
+thresholds `tcn` and `lstm` beat `dlinear` by 2–4x. On MSS at strict, every cell is topped by
+`dlinear` / `dlinear_ols` / `ar40` / `damped_persistence`, with `tcn`, `lstm` and `transformer`
+below them. Strict thresholds, F1, mean over 3 training seeds (deterministic rows carry one seed):
+
+| model | 135/0 | 135/6 | 135/12 | 180/0 | 180/6 | 180/12 |
+|---|---|---|---|---|---|---|
+| base rate | 0.551 | 0.522 | 0.523 | 0.836 | 0.792 | 0.685 |
+| `dlinear` | **0.098** | **0.081** | 0.069 | **0.149** | **0.148** | 0.083 |
+| `dlinear_ols` | 0.098 | 0.056 | 0.051 | 0.152 | 0.054 | 0.080 |
+| `ar40` | 0.077 | 0.073 | **0.173** | 0.125 | 0.067 | **0.114** |
+| `tcn` | 0.078 | 0.067 | 0.074 | 0.081 | 0.079 | 0.077 |
+| `lstm` | 0.061 | 0.048 | 0.061 | 0.057 | 0.078 | 0.086 |
+| `transformer` | 0.039 | 0.036 | 0.086 | 0.059 | 0.051 | 0.068 |
+| `rate_matched` (chance timing) | **0.071** | **0.061** | 0.000 | 0.050 | **0.069** | 0.000 |
+| `always_quiescent` (onset) | 0.033 | 0.029 | 0.031 | 0.024 | 0.027 | 0.032 |
+| `persistence`, `window_mean` | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+That ordering is the same direction as the accuracy result, which is worth something: the DLinear
+family is on top under the operational metric too.
+
+**Three things this table must not be read as saying.** First, `rate_matched` — a detector that
+fires at the right *rate* with chance timing — **beats `transformer` at four of six cells and
+`lstm` at three**. Those rows have no measurable timing skill on MSS and should not be described as
+detecting anything. Second, onset counts are thin (per-record counts are single digit), no bootstrap
+interval is computed because a single record is one resampling unit, and differences below roughly
+0.03 F1 at a cell should not be read as real. Third, `persistence` and `window_mean` score exactly
+zero because a constant forecast cannot express a transition — that is a property of the model
+class, not a measured failure.
+
+The always-yes null scores 0.024–0.033 on the onset formulation while its *per-sample* F1 reaches
+0.99 at these base rates, reproducing P6-D2's finding that the onset metric is not naively
+base-rate-exploitable — a stronger test of that claim than the corpus can provide, since the corpus
+base rate never gets this high.
+
+**Making an operational comparison across generators would need thresholds expressed relative to
+each generator's own motion scale.** That is a change to the metric definition and is not made here.
 
 ## What this does and does not establish
 
