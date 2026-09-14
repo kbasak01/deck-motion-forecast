@@ -1,0 +1,3 @@
+grid_kind,hs_target_m_mean,hs_target_m_std,hs_target_m_count,hs_realized_m_mean,hs_realized_m_std,hs_realized_m_count,hs_rel_err_mean,hs_rel_err_std,hs_rel_err_count,tz_target_s_mean,tz_target_s_std,tz_target_s_count,tz_realized_s_mean,tz_realized_s_std,tz_realized_s_count,tz_rel_err_mean,tz_rel_err_std,tz_rel_err_count
+corpus,3.3,0.0,18,3.312827850452545,0.1475671355888929,18,0.0038872274098620888,0.04471731381481596,18,7.5466,0.0,18,7.789967269244223,0.317536178282144,18,0.03224859794400439,0.04207672041477539,18
+mss,3.3,0.0,18,3.2391511307985863,0.14323596581742362,18,-0.018439051273155573,0.043404838126491936,18,7.5466,0.0,18,7.806985408194113,0.2840017067918654,18,0.03450367161292692,0.03763306744651438,18

@@ -110,6 +110,8 @@ Read those two bottom rows together. Over all 144 cells every deep model loses m
 wins — but roughly 40% of the losses come from `unseen_heading` alone, which is a corpus
 artifact (below), and dropping it reverses the result for `tcn` and ties it for `lstm`. The
 honest summary is **`tcn` wins outside `unseen_heading`, `lstm` ties, `transformer` loses.**
+(Phase 8 qualifies this: on an independent hydrodynamic model none of the three
+transfers, and `tcn` falls to -0.9033 skill at the same cell where it reads 0.8604 here.)
 
 The split by lead time is sharper, and cuts against the deep models where it matters most
 (excluding `unseen_heading`):
@@ -488,6 +490,84 @@ contended resource, not on winning a race.
 in this section comes from anywhere but this machine; no speedup multiple is quoted that is not a
 ratio of two rows in `results/latency.csv`, and `make gate7` checks that mechanically. All results
 are from **simulated** vessel motion.
+
+## Phase 8 -- cross-validation against an independent hydrodynamic model
+
+Every number above comes from one simulator, and two protocol entries already said that prejudges
+the headline: P4-D16 ("the corpus makes a linear forecaster Bayes-optimal by construction") and
+`configs/sim/vessels/s175.yaml`, which admits the held-out hull is "a reduced-order stand-in ...
+not a strip-theory computation of the S-175's actual RAOs". Phase 8 tests the models against the
+computation that file says it is not: the MSS toolbox's ShipX strip-theory motion RAOs for the same
+ITTC S-175, under a JONSWAP matched to SS5. Because the corpus already holds the S175 out as
+`unseen_vessel`, the same checkpoints, normalisation statistics and task apply to both -- only the
+generator changes.
+
+**Both sides are simulations.** MSS is another simulator, not a measurement of a real deck. This
+bounds generator-specific overfitting; it says nothing about fidelity to a real ship.
+
+### The result: one model family transfers, and it is not the one the gates favour
+
+Pitch at 10 s, the cell Gates 3-5 are read at, against the committed `unseen_vessel` rows:
+
+| model | corpus | MSS | change |
+|---|---|---|---|
+| `dlinear` | 0.4144 | **0.3935** | -0.021 |
+| `dlinear_ols` | 0.4904 | **0.3835** | -0.107 |
+| `ar20` | 0.5258 | 0.1560 | -0.370 |
+| `transformer` | 0.7654 | -0.1773 | -0.943 |
+| `ar40` | 0.5412 | **-0.7243** | -1.266 |
+| `tcn` | 0.8604 | **-0.9033** | -1.764 |
+| `lstm` | 0.8032 | **-1.5564** | -2.360 |
+
+The DLinear family loses 0.02-0.11 and everything else goes to or below persistence. In the 1-5 s
+operational band the split is the same: at 5 s in **heave**, the channel this project exists for,
+`dlinear_ols` holds 0.923 while `tcn` is at 0.011, `transformer` at -0.486 and `ar40` at -4.275.
+
+**The dividing line is not linear versus deep.** `ar40` is linear and per-channel, it *beats*
+`dlinear_ols` on the corpus, and it transfers worse than `transformer`. P3-D1 explains it, two
+phases early: this corpus has no process noise, so its motion satisfies an exact linear recursion
+and AR *identifies the system*. A system identifier transfers to that system and nothing else, and
+identifying harder is worse -- `ar40` loses 1.27 where `ar20` loses 0.37. The deep models do the
+same implicitly; DLinear is too constrained to do it at all.
+
+**This lands on the gate cell.** Gates 3, 4 and 5 are all read at pitch / 10 s. There the deep
+models beat `dlinear_ols` by 0.37 on the corpus and lose to it by 1.29 on MSS. Read together with
+the 1-5 s table above, the deep models' advantage is concentrated exactly where it does not
+transfer.
+
+### What the controls rule out
+
+The wave-field discretisation is not the cause: re-running with the corpus's own wave grid and MSS's
+RAOs moves skill by -0.04 to -0.19 for every model, same direction. Normalisation range is not the
+cause either: rescaling MSS channels to corpus RMS leaves `dlinear_ols` exactly unchanged (skill is
+scale-invariant) and moves everything else in both directions, by -13.4 to +2.3 depending on DOF.
+What remains is the hull response itself.
+
+One concrete defect was found in our simulator while building the bridge, before any model was run:
+`src/dmf/sim/response.py` applies a **real** wave-slope excitation, so roll and pitch come out in
+phase with heave where strip theory puts them in quadrature (measured 0.1 deg against 87.8 deg).
+Amplitudes are correct and every Gate 1 invariant still holds, because a common phase rotation
+within one channel does not change its spectrum. It is unfixed -- fixing it invalidates the corpus
+and Phases 2-7 -- and it is not sufficient on its own to explain the AR result.
+
+### The operational metric could not be compared at all
+
+Quiescence detection is threshold-based on absolute limits (3.0 deg / 2.0 deg / 0.8 m/s). Our
+generator runs ~2x hot, so those same limits classify far more of the MSS record as landable: at
+permissive thresholds in head seas the MSS deck **never leaves limits** -- base rate 1.0000, zero
+onsets, nothing to detect -- against a corpus base rate of 0.655 in the same cell. Two of six
+permissive cells are unscorable outright.
+
+This is the sharpest result in the phase and it is a methodological one. Skill is a ratio and was
+completely unaffected by the amplitude gap; the operational metric, the one this project exists to
+serve, was dominated by it. Where the metric *is* scorable the ordering matches the accuracy
+finding -- `dlinear`/`dlinear_ols`/`ar40` on top, the deep models below -- but chance-timing
+(`rate_matched`) beats `transformer` at four of six strict cells, so those rows are not detecting
+anything measurable.
+
+Full write-up including the statistical comparison of the two generators, the Octave parity check
+(the NumPy bridge reproduces MSS's own `waveMotionRAO.m` to 4.4e-12), and the corrections made after
+the Gate 8 review: `docs/mss_crossvalidation.md`, protocol entries P8-D1 to P8-D15.
 
 ## Quickstart
 

@@ -21,7 +21,7 @@ GATE6_DIR ?= $(or $(RESULTS),results)
 # Gate 7 reads the deploy artifacts, which also live at the top of results/.
 GATE7_DIR ?= $(or $(RESULTS),results)
 
-.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report test lint format all
+.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report test lint format all mss
 
 data:   ; $(PY) scripts/generate_corpus.py --config $(SIMCFG) --out artifacts/corpus --workers $(WORKERS)
 train:  ; $(PY) scripts/train.py --config $(CFG)
@@ -57,3 +57,16 @@ lint:   ; $(RUFF) check src tests && $(RUFF) format --check src tests && $(MYPY)
 format: ; $(RUFF) format src tests && $(RUFF) check --fix src tests
 
 all: data train eval bench report gate7
+
+# Phase 8: MSS cross-validation. Needs the corpus and the deep checkpoints; the Octave
+# parity step skips cleanly when Octave is absent. Every step is idempotent.
+mss:
+	$(PY) scripts/mss_export.py
+	$(PY) scripts/mss_octave_check.py
+	$(PY) scripts/mss_compare.py
+	$(PY) scripts/mss_evaluate.py --grid-kind mss --sign-ablation
+	$(PY) scripts/mss_evaluate.py --grid-kind corpus
+	$(PY) scripts/mss_evaluate.py --grid-kind mss --rescale-to-corpus
+	$(PY) scripts/mss_quiescence.py
+	$(PY) scripts/mss_figures.py
+	$(PY) scripts/gate8.py

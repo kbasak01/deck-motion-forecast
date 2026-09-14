@@ -1,0 +1,69 @@
+# Phase 8 MSS cross-validation: ITTC S-175 under a JONSWAP matched to the SS5 cell.
+#
+# The sea state is copied from configs/sim/sea_states.yaml SS5 and must stay identical to
+# it. The point of the exercise is that only the *hull response* differs from the corpus;
+# if the spectrum drifts, the comparison silently becomes a vessel-AND-sea-state shift, and
+# Phase 8 carry-forward delta 1 shows those two shifts predict opposite model rankings.
+#
+# Units: hs_m metres, tp_s seconds, gamma dimensionless, headings degrees, speeds knots,
+# frequencies rad/s. Angles are stored in DEGREES in the exported CSV, per CLAUDE.md.
+
+sea_state:
+  name: SS5
+  hs_m: 3.3
+  tp_s: 9.7
+  gamma: 3.3
+
+# Headings in the corpus convention: 180 head, 135 bow-quartering, 90 beam, 0 following.
+# MSS uses the same convention (0 following, pi head) -- established by measurement, see
+# src/dmf/mss/convert.py, not from MSS's own source comments, two of which are stale.
+#
+# 135 deg is here because MSS head-seas roll is *exactly* zero by port/starboard symmetry,
+# so a head-seas-only run leaves roll skill undefined against a zero-variance target. 135 is
+# an in-distribution heading, so it adds no confound. 90 deg is deliberately excluded: it is
+# the held-out `unseen_heading` regime and would stack a heading shift on the vessel shift.
+headings_deg: [180.0, 135.0]
+
+# All three corpus speeds. "The SS5 head-seas cell" is ambiguous across this axis, and
+# P6-D19 is the precedent for why that is not cosmetic: it found a quiescence table that had
+# silently collapsed a three-speed axis to speed 0 and reported the result as a property of
+# the sea state.
+speeds_kn: [0.0, 6.0, 12.0]
+
+seeds: [0, 1, 2]
+
+# Record geometry, matched exactly to configs/sim/corpus.yaml so the window count per
+# realization is identical (1131 at lookback 200, stride 5).
+record:
+  fs_hz: 10.0
+  duration_s: 600.0
+  t_start_s: 120.0   # matches the corpus, whose t begins after a 120 s spinup
+
+# Wave-field discretisation. Two conventions are exported:
+#
+#   mss    -- MSS's own waveDirectionalSpectrum.m convention, bins over [0, omega_max].
+#             This is the PRIMARY, fully independent path: MSS spectrum, MSS RAOs.
+#   corpus -- reuses dmf.sim.spectra.sample_components, so the wave field is bit-for-bit
+#             the corpus's own. This is the CONTROL: the only thing differing from a corpus
+#             realization is the transfer function, which attributes any change in skill to
+#             the hull response rather than to the wave field.
+#
+# Both jitter frequencies within bins, so neither carries the synthesis-periodicity artifact
+# tests/test_spectra.py guards against. MSS arrived at the same mitigation independently.
+grids:
+  n_components: 299        # matches the corpus (P1-D4: 299, not 300)
+  corpus_band_rad_s: [0.2, 2.5]
+  mss_omega_max_rad_s: 2.5
+
+vessel:
+  mat_path: mss/upstream/HYDRO/vessels_shipx/s175/s175.mat
+  # MSS's own waveMotionRAO.m reads the RAO table at speed index 1 (MATLAB) = 0 (Python),
+  # i.e. zero speed, and carries forward speed only through the encounter frequency.
+  # Reproduced so the Octave parity check compares like with like.
+  speed_index: 0
+
+# Gate 8 predicate 1: the realized spectrum must match the target this closely.
+match_tolerance:
+  hs_rel: 0.05
+  tz_rel: 0.05
+  tz_over_tp: 0.778   # from configs/sim/sea_states.yaml at gamma = 3.3

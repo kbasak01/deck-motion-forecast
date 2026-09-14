@@ -52,6 +52,13 @@ Layout:
   floor and the reproducibility control, joined from committed CSVs with no corpus, no
   checkpoints and no GPU. Deliberately not part of the scoring driver: a table that is a
   *join* should not sit in the call path of a function that can start a sweep.
+- :mod:`dmf.eval.external` -- the Phase 8 seam: scoring committed checkpoints on an
+  externally supplied trajectory (an MSS record) rather than on a corpus partition. It
+  composes the corpus windowing, normalisation and metrics rather than restating them, and
+  it enforces the two things that path makes easy to get wrong and impossible to see
+  afterwards -- the scale comes from the corpus *training* split and never from the
+  external record, and the persistence denominator is recomputed on the external
+  trajectories themselves.
 - :mod:`dmf.eval.report` -- table aggregation and rendering, including the seed policy.
 - :mod:`dmf.eval.gate` -- the Gate 4 read-out: the gate criterion computed from the
   committed tables rather than by an ad-hoc script, in both the readings that ship (the

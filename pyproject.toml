@@ -110,6 +110,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
 markers = [
+  "octave: requires GNU Octave and the cloned MSS toolbox (Phase 8 parity check)",
   "slow: takes more than a few seconds (long simulation records, training runs)",
   "gpu: requires a CUDA device",
 ]
