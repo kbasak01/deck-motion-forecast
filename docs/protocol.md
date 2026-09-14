@@ -4615,3 +4615,235 @@ was the one part of the section it never read; editing `8.152` to `5.152` there 
 now reads table cells too, and coverage went from 6 figures to 37. And P7-D7 was still being cited
 by both live documents as the current stability list while describing the superseded sweep; it is
 marked superseded and replaced by P7-D13.
+
+---
+
+## Phase 8 — MSS cross-validation
+
+Timeboxed to 5 hours by the user. Everything in this phase compares one simulation against
+another; MSS trajectories are not measurements of a real ship, and no statement below may be read
+as real-world validation.
+
+Entries P8-D1 through P8-D7 were **all written and committed before the first model evaluation
+run**, which is Gate 8 predicate 5 and is checkable from `git log`. Phase 6 recorded the opposite
+(`protocol.md:2559-2568`: all of P6-D1..D24 landed in one commit, so its pre-registration "should be
+treated as asserted, not proven"). This phase does not repeat that.
+
+### P8-D1 — PRE-REGISTRATION: which shift this tests, what is predicted, and what is excluded. RECORDED 2026-09-14
+
+**The shift.** MSS's S175 under a JONSWAP matched to SS5 is a **vessel shift**, not a sea-state
+shift. Carry-forward delta 1 shows why the distinction decides the verdict: measured on this corpus
+at pitch/10 s, `unseen_vessel` gives `tcn` 0.8298 / `lstm` 0.8007 / `dlinear` 0.5019, while
+`unseen_seastate` inverts the ordering to `dlinear` 0.4775 / `lstm` 0.3437 / `tcn` 0.2772. "The deep
+model held up" and "the deep model collapsed" are both purchasable here by choosing how tightly the
+spectrum is matched. The match is therefore fixed in advance (see predicate 1 below) and the
+comparison baseline is fixed in advance: the committed `unseen_vessel` rows for
+`vessel=s175, ss=SS5, heading_deg in {180,135}` in `results/e04/metrics_by_cell.csv`.
+
+This is the first genuine hull-form comparison in the project. `configs/sim/vessels/s175.yaml:42-45`
+states the limitation it closes: our S175 is "a reduced-order stand-in for a different ship, not a
+strip-theory computation of the S-175's actual RAOs, so `unseen_vessel` measures transfer across a
+parameter shift rather than across a genuinely different hull form." The MSS tables *are* that
+strip-theory computation, for the same nominal hull. Same models, same normalisation statistics,
+same task, same nominal ship: only the generator changes.
+
+**Evaluation setup, fixed in advance.** The `unseen_vessel` regime checkpoints and its
+`unseen_vessel/train` normalisation statistics (frigate-only, in corpus units), default data arm,
+lookback 200, horizons `[10,20,30,50,100,150]`, `observation_mode: ideal`. No ablation arm and no
+sea-state conditioning (deltas 3 and 5). Baselines `persistence`, `window_mean` and `dlinear_ols`
+recomputed on the MSS trajectories themselves (delta 4). Three seeds (0, 1, 2), two headings
+(180, 135 deg), three speeds (0, 6, 12 kn).
+
+**Prediction, recorded before the first evaluation run.** At pitch / 10 s the ordering follows
+`unseen_vessel`, i.e. `tcn` > `lstm` > `dlinear_ols` > `window_mean` ~ `persistence`, and `tcn`
+retains skill > 0.5. This is recorded **as a prediction to be scored, not as a pass condition**.
+Gate 8 is a process gate; a collapse is a pass with a negative finding, and per `CLAUDE.md`
+non-negotiable 6 it goes in the README body.
+
+**Counter-hypothesis, also recorded in advance.** P8-D6 below identifies a cross-DOF phase defect in
+our own generator, found while building this bridge and before any model was run. It predicts the
+*opposite* of the above for the multivariate models specifically: if `tcn` and `lstm` are exploiting
+a roll/pitch/heave phase relationship that our generator gets wrong by 90 degrees, they should lose
+more skill on MSS data than `dlinear_ols` does, because a per-channel linear map is the model least
+able to depend on cross-channel phase. Both predictions are on the record; the run decides.
+
+**Excluded from the headline, and why, stated in advance.** Roll at 180 degrees. MSS gives *exactly*
+0.0000 deg RMS there, because head-seas roll vanishes by port/starboard symmetry. The corpus gives
+0.0383 deg, which is entirely the P1-D2 residual floor (`roll_factor = sqrt(sin^2(180) + 0.05^2)`
+= 0.05) and not roll physics. A skill score against a zero-variance target is undefined. This cell
+is reported separately as a finding about the floor -- an artifact strip theory says should not
+exist -- and never as a measured skill. This exclusion is the reason 135 deg was added to the run:
+it is an in-distribution heading where MSS roll is live (0.576 deg RMS), so roll remains testable
+without stacking the held-out `unseen_heading` regime on top of the vessel shift.
+
+**Known in advance, so it cannot later be offered as an excuse.** The corpus generator is hotter
+than strip theory at the same sea state, measured before any model was run (P8-D7): RMS ratios
+MSS/corpus of 0.46 (heave) and 0.44 (pitch) at 180 deg, 0.77 and 0.79 at 135 deg. Skill is a ratio
+and is scale-invariant, so this does not move skill directly. What it does move is the *normalised*
+input: scaled by `unseen_vessel/train` statistics, the MSS records present at roughly half the
+amplitude of anything in training. That is a legitimate part of a vessel shift, not a bug.
+
+### P8-D2 — The heading convention was resolved by measurement, because two MSS source comments are stale. RECORDED 2026-09-14
+
+MSS's `waveMotionRAO.m:21` and `encounter.m:7` both document "0 following sea, pi head sea", which
+matches the corpus convention in `configs/sim/headings.yaml`. But
+`HYDRO/utils/readdata/read_veres_TF.m:143` heads its transform block with
+"(x-forward, y-starboard, z-upwards, 0 deg beam seas)", and both halves of that are wrong.
+
+*Headings.* The loop at `read_veres_TF.m:178-181` reverses the heading index, with the comment "in
+Veres the headings are defined relative to the bow while the MSS standard is relative to the stern
+with x-axis forward, i.e 180 deg difference". Veres 0 deg is head seas, so MSS 180 deg is head seas.
+The RAO data agrees independently: roll is ~0 at both 0 and 180 deg and maximal near 135 deg, so
+0/180 are the symmetric directions and 90 deg is beam. **MSS 180 deg is head seas; headings pass
+through to the corpus convention unchanged.**
+
+*Axes.* "z-upwards" with x-forward and y-starboard would be a left-handed frame. Measured instead:
+the MSS heave RAO phase tends to pi as `w -> 0` while its amplitude tends to 1.0 m/m. A ship
+contouring a long wave moves *with* the surface, so a phase of pi means heave is positive **down**,
+i.e. SNAME z-down as Fossen's convention requires and as the comment denies. See P8-D3.
+
+Neither point could have been settled by reading the documentation, because the documentation
+disagrees with itself. Both were settled from the code's behaviour and the data's own symmetry.
+
+### P8-D3 — Sign convention: only heave inverts, and the conclusion is covered by an ablation. RECORDED 2026-09-14
+
+Carry-forward delta 2 warns that a radians/degrees error cannot be caught by the skill score,
+because skill is a ratio over the same data and a uniform factor of 57.3 cancels exactly. Signs are
+the sharper version of the same trap and delta 2 does not mention them: **a sign error does not
+cancel.** A linear forecaster is sign-equivariant, but a TCN or an LSTM is not, so a flipped channel
+silently degrades exactly the models this phase exists to test.
+
+Given SNAME axes (x forward, y starboard, z down, established in P8-D2), the rotation conventions
+follow from the rotation matrices: positive roll takes starboard down and positive pitch takes the
+bow up, which are both already the corpus conventions. Heave is the only channel that inverts.
+`MSS_TO_CORPUS_SIGN = {roll: +1, pitch: +1, heave: -1}`.
+
+Because this is a derivation rather than a measurement, the evaluation additionally runs a
+**sign-flip ablation** and reports whether the conclusion moves. If skill is insensitive to the
+choice, the result is robust to the derivation being wrong; if it is sensitive, that is itself
+reportable.
+
+### P8-D4 — Octave parity: the NumPy bridge is numerically identical to MSS's m-file, and the check caught two real bugs. RECORDED 2026-09-14
+
+`src/dmf/mss/synth.py` is a NumPy port of `waveMotionRAO.m`, vectorised over time and taking the
+random phases as an argument. Both differences are checked rather than asserted.
+
+*The local patch is behaviour-preserving.* `mss/waveMotionRAO_seeded.m` differs from upstream in
+three lines, all concerning where the phases come from (upstream seeds `rng(12345,"twister")` into a
+`persistent` variable, so every fresh process yields the *same* realization and three "seeds" drawn
+by calling it three times would be one record three times). Stock and patched, run against the
+phases stock itself draws, agree with `max_abs_diff = 0` exactly.
+
+*The port reproduces the m-file.* Driven from an identical wave grid and phase set across four cells
+(180 deg at 0 and 12 kn, 135 deg at 6 and 12 kn), all six DOF, both `eta` and `eta_dot`: **worst
+relative pointwise deviation 4.42e-12, RMS ratios 1.00000000.** This is far stronger than the <1%
+agreement the phase was scoped for. It means the claim available is "independent hydrodynamics *and*
+an implementation verified equivalent to MSS's own", not the weaker fallback of independent
+hydrodynamics alone.
+
+**The check paid for itself twice, and neither bug was reachable by any self-consistency test.**
+
+1. *Gravity.* MSS ships `vessel.main.g = 9.8100004`; this project uses 9.80665. It enters the
+   encounter frequency, and on an absolute time axis beginning at t = 120 s the accumulated phase
+   drift reached ~1.3% pointwise **while RMS still agreed to 0.1%**. A statistics-only comparison —
+   which is what the plan asks for — would have passed it without comment.
+2. *Heading interpolation.* MSS `interp1`s the RAO across headings; the first port snapped to the
+   nearest node of the 10-degree grid. Exact at 180 deg (a node) and **38% wrong at 135 deg** (not a
+   node). 135 deg is the only heading in this run where roll is live, so the bug would have
+   corrupted precisely the channel that heading was added to test, in a way the head-seas cell could
+   never have revealed.
+
+Octave verifies; NumPy generates. The m-file is called once per timestep, ~80 s per 6000-sample
+record against 0.4 s for the vectorised path, so running the full 36-record set through Octave would
+have consumed most of the timebox to produce numbers already known to agree to 12 significant
+figures.
+
+### P8-D5 — The spectrum-match predicate: the statistic was wrong, and MSS's elevation is in the encounter frame. RECORDED 2026-09-14
+
+Two corrections, both made before the pre-registration was committed.
+
+*The statistic.* Predicate 1 was first written as "Hs and Tz within 5% of target" and read on the
+**maximum over realizations**. That measures per-record sampling scatter, not spectral match: at 299
+components over a 600 s record the per-record standard deviation of Hs is ~4.5%, so a max over 36
+records exceeds 5% routinely with no bias whatever. The predicate is now read on the **mean over
+realizations**, which is the estimator of the target, with the spread printed beside it rather than
+hidden (delta 6). Measured: **Hs -0.73% +/- 4.49%, Tz +3.34% +/- 3.94%**, both inside the band.
+
+*The frame.* `waveMotionRAO.m` synthesises its returned wave elevation at the **encounter**
+frequency, so its zero-crossing period is Doppler-shifted by forward speed — measured at 7.82 /
+6.10 / 5.07 s for 0 / 6 / 12 kn, a 35% drop that is correct physics and not a mismatch. Tz of a sea
+state is a property of the sea state, so the predicate is read from an earth-frame elevation
+synthesised from the same components at the wave frequency; the encounter-frame value is retained as
+a diagnostic.
+
+### P8-D6 — DEFECT IN THE CORPUS GENERATOR: roll and pitch are in phase with heave where strip theory puts them in quadrature. RECORDED 2026-09-14
+
+Found while establishing the sign convention, before any model was evaluated.
+
+`src/dmf/sim/response.py:229` reads:
+
+```python
+excitation = np.exp(-k * vessel.draft_m) if dof == "heave" else k
+```
+
+Both excitations are **real**. The docstring is right that wave slope has amplitude `k*a` radians
+per metre, but wave slope is the *spatial derivative* of elevation and therefore leads it by 90
+degrees — a factor of `i` the code does not carry. So our roll and pitch come out in phase with
+heave instead of in quadrature.
+
+Measured, s175, head seas, 0 kn, pitch-minus-heave phase in the corpus sign convention:
+
+| w (rad/s) | ours (deg) | MSS (deg) |
+|---|---|---|
+| 0.300 | 0.1 | +87.8 |
+| 0.378 | 1.1 | +86.2 |
+| 0.456 | 3.4 | +83.2 |
+| 0.533 | 7.6 | +76.9 |
+
+It is a phase error only, not an amplitude one. In the long-wave limit both track `k = w^2/g`: at
+w = 0.3142, `k` = 0.01006, MSS gives 0.01011 (1.005k) and ours 0.01134 (1.127k). MSS is right — a
+ship contouring a long wave heaves with the surface *elevation* and pitches with its *slope*, and
+those are inherently 90 degrees apart.
+
+**Why this matters here specifically.** Per-DOF marginals are untouched: a common phase rotation
+within one channel does not change its PSD, RMS or zero-crossing period, so every Gate 1 invariant
+still holds and nothing in `results/physics_validation.md` is affected. What is wrong is the
+**cross-DOF structure** — and `response.py:283-285` notes that all three DOFs are driven from one
+shared phase set, describing it as "the multivariate structure a forecaster is meant to exploit".
+The models have therefore been trained to exploit a roll/pitch/heave phase relationship that strip
+theory says is wrong by 90 degrees. That is a concrete, mechanistic, pre-registered reason a
+multivariate model might lose more skill on MSS data than a per-channel linear one, and it is a
+generator artifact of exactly the kind this phase was commissioned to detect.
+
+**Not fixed, deliberately.** Changing `response.py` would invalidate the corpus and every committed
+result in Phases 2 through 7, which is far outside a 5-hour timebox and was not what was asked. It
+is recorded, its consequence is what the evaluation measures, and it is carried forward to Phase 9
+as the most substantive open item this phase produced.
+
+### P8-D7 — Statistical comparison: the timescales agree, the amplitudes do not. RECORDED 2026-09-14
+
+Per-DOF statistics over 8 corpus seeds against 3 MSS seeds per cell, SS5, averaged over the three
+speeds. Every MSS value is quoted against the corpus's **own across-seed standard deviation**, per
+delta 6, because "the spectra overlay closely" is unfalsifiable without that yardstick.
+
+| heading | DOF | corpus mean | corpus sd | MSS mean | ratio | z (corpus sd) |
+|---|---|---|---|---|---|---|
+| 135 deg | heave (m) | 0.4799 | 0.0274 | 0.3633 | 0.767 | -4.02 |
+| 135 deg | pitch (deg) | 1.1131 | 0.0625 | 0.8709 | 0.791 | -3.71 |
+| 135 deg | roll (deg) | 0.5841 | 0.0258 | 0.5760 | 1.131 | +3.10 |
+| 180 deg | heave (m) | 0.4585 | 0.0292 | 0.2022 | 0.459 | -9.00 |
+| 180 deg | pitch (deg) | 1.5010 | 0.1155 | 0.6418 | 0.443 | -7.51 |
+| 180 deg | roll (deg) | 0.0383 | 0.0017 | 0.0000 | 0.000 | -22.39 |
+
+Zero-crossing periods, same layout, agree far better: ratios 0.90 to 1.04 at 135 deg and 0.85 to
+1.04 at 180 deg, i.e. within 0.7 to 5.4 corpus standard deviations.
+
+**Reading.** The two generators agree on *when* the ship moves and disagree on *how much*. Our
+reduced-order model is 1.3x hot at bow-quartering and 2.2x hot in head seas. The head-seas roll row
+is not a disagreement about roll at all: MSS is exactly zero by symmetry and the corpus value is the
+P1-D2 residual floor, so the z of -22.39 is measuring the size of a known artifact, which is why
+P8-D1 excludes that cell from the headline in advance.
+
+The amplitude gap does not move skill, which is scale-invariant. The timescale agreement is the part
+that bears on forecastability, since what a short-horizon forecaster extrapolates is the phase and
+period structure of the motion, not its absolute scale.

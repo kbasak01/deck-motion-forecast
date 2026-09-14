@@ -13,3 +13,7 @@ artifacts/
 
 # build output
 *.egg-info/
+
+# Phase 8: upstream MSS toolbox clone (pinned SHA recorded in docs/protocol.md).
+# Our own .m driver scripts in mss/ ARE tracked; only the third-party clone is not.
+mss/upstream/
