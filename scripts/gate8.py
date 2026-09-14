@@ -121,35 +121,51 @@ def _predicate_4(results_dir: Path) -> tuple[bool, str]:
 def _predicate_5() -> tuple[bool, str]:
     """Was the pre-registration committed before the first evaluation run?
 
-    Checked from git rather than from an artifact, because no artifact can testify to its
-    own ordering. The pre-registration commit must touch `docs/protocol.md` and must be an
-    ancestor of -- and distinct from -- the commit that first introduced a skill table.
-    """
-    def _log(path: str) -> list[str]:
-        out = subprocess.run(
-            ["git", "log", "--format=%H", "--", path], capture_output=True, text=True
-        )
-        return [line for line in out.stdout.split("\n") if line]
+    Checked from git, because no artifact can testify to its own ordering.
 
-    protocol = _log("docs/protocol.md")
-    skill = _log("results/mss/skill_mss_mss.csv")
-    if not protocol:
-        return False, "docs/protocol.md has no commits"
-    if not skill:
+    The pre-registration is located by the commit that *introduced* the P8-D1 heading, found
+    with `git log -S`, not by the newest commit touching `docs/protocol.md` -- the results
+    entries are appended to that same file later, so "newest commit touching the protocol"
+    would compare the results commit against itself and fail a phase that did the right
+    thing. That is the first thing this predicate got wrong, and it is recorded rather than
+    quietly corrected.
+    """
+    marker = "P8-D1 — PRE-REGISTRATION"
+    prereg_log = subprocess.run(
+        ["git", "log", "--format=%H", "-S", marker, "--", "docs/protocol.md"],
+        capture_output=True,
+        text=True,
+    )
+    prereg_commits = [line for line in prereg_log.stdout.split("\n") if line]
+    if not prereg_commits:
+        return False, f"no commit introduces {marker!r} in docs/protocol.md"
+    prereg = prereg_commits[-1]  # oldest commit touching that string = the one that added it
+
+    skill_log = subprocess.run(
+        ["git", "log", "--format=%H", "--", "results/mss/skill_mss_mss.csv"],
+        capture_output=True,
+        text=True,
+    )
+    skill_commits = [line for line in skill_log.stdout.split("\n") if line]
+    if not skill_commits:
         return False, (
             "the skill table is not committed yet, so the ordering cannot be verified. "
             "Commit the results and re-run this gate."
         )
-    prereg = protocol[0]
-    # Oldest commit touching the skill table is the one whose ordering matters.
-    first_skill = skill[-1]
-    anc = subprocess.run(
+    first_skill = skill_commits[-1]
+
+    if prereg == first_skill:
+        return False, (
+            f"the pre-registration and the first skill table are the same commit "
+            f"({prereg[:8]}); the pre-registration must land first"
+        )
+    ordered = subprocess.run(
         ["git", "merge-base", "--is-ancestor", prereg, first_skill], capture_output=True
     )
-    ok = anc.returncode == 0 and prereg != first_skill
+    ok = ordered.returncode == 0
     return ok, (
-        f"pre-registration {prereg[:8]} vs first skill table {first_skill[:8]}: "
-        + ("ordered correctly" if ok else "NOT committed before the evaluation")
+        f"pre-registration {prereg[:8]} precedes first skill table {first_skill[:8]}: "
+        + ("yes" if ok else "NO -- the evaluation was committed first")
     )
 
 

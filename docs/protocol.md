@@ -4939,3 +4939,25 @@ consistent* with linear models transferring and multivariate ones not, and it wa
 the run, but this phase does not prove it is the only cause. The decisive test is to re-generate a
 corpus with the quadrature excitation corrected and see whether the deep models then transfer; that
 is Phase 9 work and is outside this timebox.
+
+### P8-D10 — Gate 8: 5 of 5 predicates verified, and a bug in predicate 5 itself. RECORDED 2026-09-14
+
+| # | predicate | evidence |
+|---|---|---|
+| 1 | spectrum matched to SS5 within 5% | Hs -0.0073 +/- 0.0449, Tz +0.0334 +/- 0.0394, on the mean over 36 records |
+| 2 | units and signs asserted; sign ablation run | both conventions scored; boundary assertion on every frame |
+| 3 | baselines recomputed on MSS trajectories | all three present; `persistence` self-skill exactly 0.0 |
+| 4 | >= 3 seeds behind model comparisons | 3 each for `dlinear`, `lstm`, `tcn`, `transformer` |
+| 5 | pre-registration committed before evaluation | `1a8a612` precedes `64ed544` |
+
+**No threshold was changed.** Gate 8 passes with a negative headline finding, which is what a process
+gate is for: P8-D8 falsifies the phase's own primary prediction and it is reported as found, per
+`CLAUDE.md` non-negotiable 6.
+
+**Predicate 5 was wrong on its first run and is recorded rather than quietly fixed.** It located the
+pre-registration as the newest commit touching `docs/protocol.md`. But the results entries P8-D8 and
+P8-D9 are appended to that same file in the results commit, so the check compared that commit against
+itself and failed a phase that had in fact done the right thing. It now locates the pre-registration
+by the commit that *introduced* the P8-D1 heading (`git log -S`). The failure mode is worth naming
+because it is the same one P7-D14 identified: a check that reads a proxy for the thing it means to
+verify, and is correct only until the file it proxies through is touched again.

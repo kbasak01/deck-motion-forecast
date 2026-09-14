@@ -3,4 +3,4 @@ predicate,passed,evidence
 2. units and signs asserted; sign ablation run,True,"sign conventions scored: ['nominal', 'sign_flipped']"
 3. baselines recomputed on MSS trajectories,True,"all of ['persistence', 'window_mean', 'dlinear_ols'] recomputed on MSS data; persistence self-skill max |.| = 0.000e+00 (must be exactly 0)"
 4. at least three seeds behind model comparisons,True,"seeds per SGD model: {'dlinear': 3, 'lstm': 3, 'tcn': 3, 'transformer': 3}"
-5. pre-registration committed before evaluation,False,"the skill table is not committed yet, so the ordering cannot be verified. Commit the results and re-run this gate."
+5. pre-registration committed before evaluation,True,pre-registration 1a8a612e precedes first skill table 64ed5442: yes
