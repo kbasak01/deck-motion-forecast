@@ -14,6 +14,11 @@ version was wrong.
 Where this file and `docs/IMPLEMENTATION_PLAN.md` disagree, the plan is the *original* plan and
 this is what happened.
 
+The adversarial counterpart to this document is [`docs/audit_report.md`](audit_report.md): a
+pre-release audit that returned three blocking findings, the §5 validation protocol worked through
+checkbox by checkbox, and the re-verification appended after the fixes. Two of the audit's own
+numbers did not reproduce and were not adopted; that is recorded there too.
+
 Status: **Phases 1–8 complete.** Gates 1, 2, 4, 6, 7 and 8 pass as written; Gate 3 failed as
 written and was restated at the same threshold; Gate 5 passes at its registered cell and does
 not pass across the surrounding table. Every one of those is unpacked below.

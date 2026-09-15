@@ -5467,3 +5467,39 @@ surrounding paragraph states the exception.
 **Not a defect in any result.** No number in `results/` changed, nothing was re-run, and no
 threshold moved. What changed is seven sentences and three tables that had drifted from artifacts
 that were correct all along.
+
+### P9-D10 — The audit's verdict was stale for a day, because its own exit condition was never executed. RECORDED 2026-09-15
+
+`docs/audit_report.md` ended **NOT RELEASE READY — 3 blocking findings** and, in the same verdict,
+wrote the condition under which that would change: "Re-run this audit's §5.6 and §5.5 sections after
+those and the verdict flips." All three findings were fixed on 2026-09-14 and the Resolution section
+recorded the fixes. **The re-run was not done.** So §5.5 and §5.6 kept FAIL rows citing B1 and B3,
+and the verdict line kept describing a repository that no longer existed.
+
+That is a fourth instance of this project's most persistent defect shape — P8-D15 (a gate predicate
+reading a gitignored file), P7-D14 (a documentation checker whose clause never read a table cell),
+P9-D8 (an audit checkbox citing a section that was never written), and now a verdict whose own
+refutation condition was met and unexecuted. In every case the reference was correct when written and
+stopped being correct when the thing it pointed at changed.
+
+**Re-run, and appended rather than edited in place.** The audit's body, tables and verdict are left
+exactly as written, per the Resolution's own rule; the re-verification is a new section beneath it
+with its own verdict. Both §5.5 rows that were FAIL and all three §5.6 rows that were FAIL now pass,
+each against a fact measured on 2026-09-15: the committed `all:` recipe, `git ls-files` over every
+file the README asserts is present, an empty `git ls-files --others results/`, and a byte-identical
+re-render from `make figures` and `make report`.
+
+**The new verdict is RELEASE READY, and it says what it does not cover**: no fresh `make all` was
+run (~160 h), and the `CLAUDE.md` deliverable "calibrated prediction intervals" remains **unmet** —
+no conformal calibration is run anywhere. A release-readiness verdict that quietly implied a complete
+deliverable list would be the same defect in a new place.
+
+**Two line-number citations in §5.6 were stale and are deliberately not repaired in place.** The
+simulation-only caveat was cited at `README.md:322`, `:403`, `:460`; after the Phase 9 restructure it
+sits at `:6-7`, `:172`, `:385`, `:481`, `:543`. The correction is recorded in the re-verification
+section with the reason, because the stale citation is itself the evidence for the paragraph above
+it, and silently fixing it would delete the example.
+
+**The audit was linked from nothing.** It is a release-readiness verdict that neither the README nor
+`docs/findings.md` pointed at, so the only way to reach it was to already know it existed. Both now
+link it. A document nobody can find cannot be the document that clears a repository for release.

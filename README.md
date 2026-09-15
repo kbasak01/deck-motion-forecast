@@ -508,6 +508,7 @@ Read these before reading any number above.
 |---|---|
 | [`docs/findings.md`](docs/findings.md) | The phase-by-phase record, with every withdrawn claim beside the one that replaced it. Start here. |
 | [`docs/protocol.md`](docs/protocol.md) | The complete decision log, ~5200 lines. Every gate, every threshold change, every retraction, with what was measured. |
+| [`docs/audit_report.md`](docs/audit_report.md) | The pre-release audit: three blocking findings, ten should-fix items, the §5 validation protocol checkbox by checkbox, and the re-verification that follows it. Two of the audit's own numbers did not reproduce and were not adopted. |
 | [`docs/corpus_card.md`](docs/corpus_card.md) | What the corpus contains, how it is generated, and how to reproduce it. |
 | [`docs/mss_crossvalidation.md`](docs/mss_crossvalidation.md) | Phase 8 in full: the Octave parity check, the two-generator comparison, and what the transfer failure does and does not show. |
 | [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The original plan. Where it and the protocol disagree, the protocol is what happened. |

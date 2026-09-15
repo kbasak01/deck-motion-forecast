@@ -544,3 +544,56 @@ one the `gamma` directional test of S10); `make gate7` PASS,
 including its mechanical check of the README's latency section; Gates 4 and 5 PASS; Gate 6 unchanged
 at its committed 7/7. The three blocking findings are resolved. **Publication remains the
 repository owner's decision, and the commit itself has deliberately been left to them.**
+
+---
+
+# Re-verification — 2026-09-15, read against commit `6aa98e5`
+
+Appended by the session that closed Gate 9. **The audit's body, its checkbox tables and its verdict
+are left exactly as written**, per the Resolution section's own rule; this section re-runs the two
+checkbox tables that the audit's exit condition at the end of its verdict asked to be re-run
+("Re-run this audit's §5.6 and §5.5 sections after those and the verdict flips"). That re-run had
+never happened, so §5.5, §5.6 and the verdict above still described the repository as it stood
+before the fixes.
+
+## §5.5 Reproducibility — re-run
+
+| checkbox | audit verdict | now | evidence, measured 2026-09-15 |
+|---|---|---|---|
+| Fresh clone + `make all` reproduces every committed number | **FAIL** (B3) | **PASS as far as it is checkable without a 160 h run** | `Makefile` carries `all: data sweeps gate4 gate5 gate6-full bench report gate7 mss figures-extract`, the corrected recipe, and it is committed. Every file the README asserts is in the repository is tracked, and `git ls-files --others --exclude-standard results/` is empty. **The full pipeline was not re-run for this verification**; what changed is that a clone now contains the recipe and the files, which is what B3 said it did not. |
+| Seeds fixed and recorded | PASS | PASS | unchanged |
+| No absolute paths, no machine-specific config | PASS | PASS | unchanged |
+| `results/` regenerable and consistent with the README | PASS for the documents, see B1/B2/B3 for the README | **PASS** | B1 and B2 are fixed (below). `make figures` and `make report` were re-run here and both reproduce their outputs **byte-identically** from committed artifacts with no corpus, no checkpoints and no GPU. |
+
+## §5.6 Honesty pass — re-run
+
+| checkbox | audit verdict | now | evidence |
+|---|---|---|---|
+| Every README claim traceable to a committed artifact | **FAIL** (B1, B3) | **PASS** | B1 fixed: the MSS result is in its own section against the matched-cell column, and the false "only the generator changes" clause is gone. B3 fixed: committed in `6aa98e5`. An independent adversarial pass on 2026-09-15 re-derived every numeric claim in the README from the committed CSVs; **five sentences and row sets did not reproduce and all five are corrected** — recorded as P9-D9 in `docs/protocol.md`. |
+| No model omitted because it underperformed | **FAIL** (S6, B2) | **PASS** | S6 fixed (all 12 models and the `nrmse` column restored). Gate 9 found the same defect once more in the MSS transfer table — `ar10`, `damped_persistence`, `window_mean` and `persistence` were missing — and all four are now in the README, `docs/findings.md` and `docs/mss_crossvalidation.md`. Adding `ar10` **falsified a published conclusion**; see P9-D9 item 3. |
+| Negative results in the README body, not a footnote | **FAIL** (B2) | **PASS** | B2 fixed: the 1–5 s versus 10–15 s band table is back in the body with its caveat sentence, carrying the committed envelope numbers rather than the audit's. |
+| Simulation-only caveat in the first paragraph | PASS | PASS | See the citation note below. |
+
+**Citation note, and it is the audit's own defect class.** §5.6's last row cites the simulation-only
+caveat at `README.md:322`, `:403` and `:460`. The README has been restructured since, and those
+lines now hold a latency sentence, a runtime-provenance sentence and a blank line. The caveat
+currently appears at **`:6-7`, `:172`, `:385`, `:481` and `:543`**. The original citation is left in
+place above rather than silently repaired, because it is an instance of exactly what P9-D8 recorded —
+a reference that was correct when written and stopped being correct when the thing it pointed at
+moved — and the third such instance this project has found. Line numbers are the weakest form of
+citation available and this document now says so.
+
+## Verdict — superseding the one above
+
+**RELEASE READY**, read against commit `6aa98e5` on 2026-09-15.
+
+All three blocking findings are fixed, all ten SHOULD FIX items are actioned, and the two integrity
+controls the audit flagged (the untrained control's literal failure, the p99 latency drift) remain
+**disclosed rather than repaired**, which is the disposition the audit itself recommended.
+
+**What this verdict does not say.** It does not say every committed number was re-derived by a fresh
+`make all` — that is ~160 h and was not run. It does not say the project's deliverables are complete:
+the README states in three places that **no conformal calibration is run anywhere**, so the
+"calibrated prediction intervals" deliverable in `CLAUDE.md` is **not met**, and that is a scope gap
+this audit never had in scope. It says that what the repository publishes is traceable to what the
+repository commits, which is the question this audit asked.
