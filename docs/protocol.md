@@ -5503,3 +5503,136 @@ it, and silently fixing it would delete the example.
 **The audit was linked from nothing.** It is a release-readiness verdict that neither the README nor
 `docs/findings.md` pointed at, so the only way to reach it was to already know it existed. Both now
 link it. A document nobody can find cannot be the document that clears a repository for release.
+
+## Phase 10 — split-conformal calibration
+
+All results in this project are from **simulated** vessel motion. No real deck data is used.
+
+Everything in P10-D1 below was written and committed **before the first calibration run**, which is
+checkable from `git log`: the commit carrying this entry precedes the first commit of
+`results/e05/`. Gate 10 predicate 6 checks exactly that.
+
+### P10-D1 — PRE-REGISTRATION: what is being calibrated, what is predicted, and what would falsify it. RECORDED 2026-09-15
+
+**Why this phase exists.** `CLAUDE.md` lists "calibrated prediction intervals" among the
+deliverables and no conformal calibration is run anywhere; `docs/IMPLEMENTATION_PLAN.md` §Phase 5
+only requires that `heads.py` be *structured* so a `ConformalWrapper` can be added later, and §7
+item 2 lists split conformal as an extension. So no phase ever scheduled it, no gate ever caught
+it, and the README has said in three places that the deliverable is unmet. This phase closes it.
+
+**The shift, and where the guarantee does and does not hold.** `src/dmf/data/splits.py` carves the
+validation partition from the **complement of the test condition**. Calibration and test are
+therefore exchangeable in `id` and in no other regime:
+
+| regime | calibration set | windows | exchangeable with test? |
+|---|---|---:|---|
+| `id` | all 48 frigate cells, seeds 27-31 | 271 440 | **yes** — same distribution, different seeds |
+| `unseen_seastate` | SS3-SS5 only, 36 cells | 244 296 | no — test is SS6 |
+| `unseen_heading` | 180/135/45 deg only, 36 cells | 244 296 | no — test is beam seas |
+| `unseen_vessel` | frigate only, 48 cells | 325 728 | no — test is the S175 hull |
+
+`assert_seed_disjoint` *enforces* that the held-out axis value never appears in train or val, so
+this is structural rather than incidental. **Split conformal has a coverage guarantee in one of the
+four regimes**, and the point of the phase is to measure how badly that bites in the other three.
+
+**Construction, fixed in advance.** Width-normalised CQR (Romano, Patterson & Candes 2019; Sesia &
+Candes 2020 for the ratio form). Per `(horizon sample, target channel)`, on the calibration split,
+in normalised space, with `m` the point forecast and `(lo, hi)` the 0.05/0.95 fan members:
+
+```
+s_i   = max( (m_i - y_i) / (m_i - lo_i),  (y_i - m_i) / (hi_i - m_i) )
+gamma = the ceil((n+1)(1-alpha))-th ORDER STATISTIC of ascending {s_i}
+```
+
+and the calibrated distribution is the base scaled about its own point forecast by `gamma`:
+`c_k = m + gamma*(f_k - m)` for a quantile head, `log_var + 2*log(gamma)` for a Gaussian head,
+which is the same operation. `y_i` is covered iff `s_i <= gamma`, so this is split conformal with
+score `s`, and the marginal guarantee is `1-alpha <= P(Y in C(X)) <= 1-alpha + 1/(n+1)`.
+
+Four properties of that choice, each one a reason it is the construction rather than an alternative:
+
+1. **The point forecast is bitwise unchanged** (`m + gamma*(m-m) = m`), so no RMSE, MAE, skill,
+   nrmse or phase-lag number in this project can move. This is the strongest available form of the
+   additivity that Gate 5's "report, do not fix" rule (P5-D2) demands.
+2. **Conditional sharpness is preserved.** At `id`/pitch/10 s the committed `width_ratio_mean` runs
+   from 0.737 (`dlinear_quantile`) to 0.284 (`lstm_quantile`), a 2.6x spread. An *additive* offset
+   widens the sharpest and the widest window by the same absolute amount and compresses exactly the
+   structure P6-D6 built the floor contrast to measure; a multiplicative one moves only the scale,
+   so `width_ratio_calibrated / width_ratio_uncalibrated == gamma` per cell.
+3. **Monotonicity is automatic** — `gamma > 0` times a non-decreasing fan is non-decreasing — so
+   crossing is structurally impossible rather than repaired post hoc.
+4. **One code path for both head kinds**, because scaling deviations from a Gaussian mean is exactly
+   `sigma -> gamma*sigma`.
+
+The **order statistic, not `np.quantile`'s linear interpolation.** `dmf.train.closed_form` records
+that the interpolation rule "is not load-bearing" for the residual floor. That is true for a floor
+and false here: for a conformal claim the order statistic *is* the guarantee. This is also why the
+conformity score is not an absolute residual — `EmpiricalResidualInterval` (P6-D6) is already split
+conformal in all but the order statistic and the conditionality, so an additive-residual arm would
+ship the committed floor under a second label and call it a new result.
+
+A **secondary arm** applies a per-level additive CQR offset to all nine levels, sharing the same
+calibration pass. It calibrates every level marginally rather than only the 90 percent interval, so
+it is the better-specified object for the `pinball` and `crps` columns. Both arms are reported.
+
+**Setup, fixed in advance.** The committed `e03_probabilistic` checkpoints at
+`artifacts/checkpoints/probabilistic/<regime>/`, six heads x three seeds x four regimes, loaded
+through `load_or_fit` with `strict=True` and **not retrained**. `alpha = 0.1`. Calibration
+sub-sampled at a fixed stride to 25 000 windows, reusing `RESIDUAL_QUANTILE_MAX_WINDOWS` and its
+effective-sample-size rationale. Normalisation statistics stay train-fitted; the calibration split
+contributes nothing but the conformity scores (non-negotiable 3). Scored on the same four test
+partitions by the same `evaluate_probabilistic_models` at the same bootstrap settings as e03.
+
+**Baselines, measured from the committed `results/e03/probabilistic.csv` before any calibration**
+(216 cells per regime; in-band means `picp_mean` within Gate 5's `[0.85, 0.95]`):
+
+| regime | in-band now | median PICP | median width ratio |
+|---|---:|---:|---:|
+| `id` | 102 / 216 | 0.9451 | 0.103 |
+| `unseen_seastate` | 5 / 216 | 0.6099 | 0.102 |
+| `unseen_heading` | 37 / 216 | 0.4940 | 0.297 |
+| `unseen_vessel` | 41 / 216 | 0.6910 | 0.127 |
+
+**Prediction, recorded as a prediction to be scored and not as a pass condition.** Gate 10 is a
+process gate; a failure to calibrate under shift is a PASS with a negative finding
+(non-negotiable 6), in the shape Gate 8 used.
+
+| regime | predicted in-band after calibration | falsified by |
+|---|---|---|
+| `id` | **>= 205 / 216**, median PICP in [0.895, 0.905] | fewer than 180 in band, or median PICP outside [0.88, 0.92] |
+| `unseen_seastate` | improves but stays broken: **20-80 / 216**, median PICP 0.65-0.80 | >= 150 in band |
+| `unseen_heading` | **essentially unmoved, 37 +/- 25** | a move of more than +/- 60 either way |
+| `unseen_vessel` | **60-140 / 216** | < 45 (no improvement) or >= 180 |
+
+Ordering: the improvement is `id` >> `unseen_vessel` > `unseen_seastate` > `unseen_heading`.
+
+**The headline claim to be scored:** *split conformal restores nominal 90 percent coverage
+in-distribution and does not survive sea-state shift; the residual degradation is a property of the
+shift and not of the head, because the same construction is exact on `id`.*
+
+**Counter-hypothesis, and why the boring prediction is the risky one.** A multiplicative
+recalibration can fix a *scale* error and never a *location* error, and the committed table shows
+both failure modes side by side at `unseen_heading`/pitch/10 s: `dlinear_quantile` at PICP 1.0000
+with width ratio 11.78 is a pure scale error, while `lstm_quantile` at PICP 0.6115 with width ratio
+8.50 is wide *and* under-covering, which is a biased point forecast that no width scaling repairs.
+Since `gamma` is fitted on unshifted validation data it should come out near 1 on that regime, so
+"nothing moves at `unseen_heading`" is the prediction at risk: a large move in either direction
+falsifies the mechanism, not merely the number.
+
+**Known in advance, so it cannot later be an excuse.** (i) 25 000 windows at 0.5 s spacing on a
+~12 s roll period are far fewer than 25 000 independent samples, so the `1/(n+1)` finite-sample term
+advertises a precision the dependence structure does not support; the binding uncertainty on any
+reported coverage is the realization bootstrap interval `prob_runner` already computes, and a
+realization-level `gamma` is recorded beside the window-level one as a sensitivity. (ii) Both
+DLinear heads are wide and both LSTM heads are sharp, so `gamma < 1` is expected for DLinear on `id`
+and `gamma > 1` for LSTM — the arm will **narrow** some rows, and a narrowed interval that still
+covers is the intended outcome, not a suspicious one. (iii) The calibrated rows' `crossing_rate` is
+structurally 0.0, because the wrapper must sort the base fan before scaling it; that zero is the
+removal of a measurement, not the removal of crossing, and the uncalibrated rows keep the real
+number.
+
+**Excluded by construction.** No ablation arm and no sea-state conditioning (P6-D18: its one-hot is
+privileged information). No re-run of quiescence detection in this pass — the interval decision rule
+reads the same fan positions and "does calibration improve the *decision*" is the better question,
+but it is a second scoring pass over consecutive windows and is deliberately scoped out of the first
+run rather than done badly inside it.
