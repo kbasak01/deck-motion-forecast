@@ -98,19 +98,27 @@ depend on the persistence denominator at all.
 | `dlinear` | 0.4144 ± 0.0015 | **0.3935 ± 0.0017** | 0.5153 | 0.858 |
 | `dlinear_ols` | 0.4904 | **0.3835** | 0.5065 | 0.880 |
 | `ar20` | 0.5258 | 0.1560 | 0.3186 | 1.019 |
+| `ar10` | 0.5195 | −0.0004 | 0.1215 | 1.143 |
+| `damped_persistence` | 0.0734 | −0.0585 | 0.3326 | 1.026 |
 | `window_mean` | 0.0733 | −0.0586 | 0.3326 | 1.026 |
 | `transformer` | 0.7654 ± 0.0323 | −0.1773 ± 0.0295 | 0.2198 | 1.108 |
 | `ar40` | 0.5412 | −0.7243 | −1.0092 | 1.584 |
 | `tcn` | 0.8604 ± 0.0040 | −0.9033 ± 0.1384 | −0.3000 | 1.458 |
 | `lstm` | 0.8032 ± 0.0169 | −1.5564 ± 0.5995 | −0.9082 | 1.748 |
-| `persistence` | 0.0000 | 0.0000 | 0.0000 | 1.000 |
+| `persistence` | 0.0000 | 0.0000 | 0.0000 | 1.188 |
 
-Closed-form rows are deterministic and carry no seed spread by construction.
+Closed-form rows are deterministic and carry no seed spread by construction. Every model scored on
+both generators appears above; `ar_attitude_only` was never run on the MSS records and so has no
+row rather than a withheld one. `persistence` NRMSE is **1.188**, not 1.0 — NRMSE is
+`RMSE / signal_std`, and repeating the last sample at a 10 s lead is worse than the record's own
+mean. An earlier version of this table printed 1.000 there, which was assumed rather than computed.
 
 **The dividing line is not linear versus deep.** `ar40` is a linear model. It *beats* `dlinear_ols`
 on the corpus (0.5412 against 0.4904) and collapses to −0.7243 on MSS, worse than `transformer`.
-`ar20` loses 0.37. What transfers is the DLinear family specifically — `dlinear` loses 0.02 and
-`dlinear_ols` 0.11 — and nothing else does.
+`ar20` loses 0.37 and is the only model besides the DLinear family to keep positive skill (0.156);
+`ar10` loses 0.52 and lands on persistence (−0.0004). What transfers with its skill largely intact
+is the DLinear family specifically — `dlinear` loses 0.02 and `dlinear_ols` 0.11 — and nothing else
+does.
 
 P3-D1 explains why, and it did so two phases before this run: the corpus has no process noise, so a
 sum of sinusoids satisfies an exact linear recursion and **AR identifies the system**. A model that
@@ -118,6 +126,13 @@ identifies a generator's dynamics transfers to that generator and to nothing els
 harder makes it worse — `ar40` loses 1.27 where `ar20` loses 0.37. The deep models are doing the
 same thing implicitly. DLinear survives because its trend-plus-seasonal decomposition followed by a
 direct per-channel linear map is too constrained to identify the recursion in the first place.
+
+**The ladder is not monotone at the short end, and that qualifies the sentence above.** `ar10`
+identifies less than `ar20` and transfers *worse* — 0.52 lost against 0.37, MSS skill −0.0004
+against 0.156 — so the AR family peaks at order 20 rather than at its floor. "Identifying harder is
+worse" describes the 20 → 40 step, which is the step the argument rests on; it does not describe the
+family as a whole, and `ar10` was left out of an earlier version of this table, where the
+non-monotonicity would not have been visible.
 
 **Skill in the 1–5 s operational band, per DOF.** An earlier version of this document claimed
 "every model keeps positive skill through 5 s." That is false, and it was false in the committed

@@ -5158,3 +5158,312 @@ adjacent changed. P7-D14 recorded the same shape of failure in the Phase 7 docum
 Gate 8 final: **7 of 7 predicates verified. No threshold was changed.** The gate passes with a
 negative headline (P8-D12) and with Result 3 reporting that the operational comparison cannot be
 made across generators at all (P8-D14).
+
+---
+
+## Phase 9 — documentation and packaging
+
+All results in this project are from **simulated** vessel motion. No real deck data is used.
+
+### P9-D1 — The README was restructured, and the old one is kept rather than compressed. RECORDED 2026-09-14
+
+`docs/IMPLEMENTATION_PLAN.md` Phase 9 specifies an eight-item README structure. The README that
+existed was a 578-line chronological lab notebook: accurate, heavily corrected, and ordered by when
+the work happened rather than by what a reader needs. It also carried a **stale status line**
+("Phases 1-7 complete") three commits after Phase 8 closed, and **no Phase 6 section at all** — the
+operational metric this project exists to serve had never been written up in prose anywhere.
+
+Decision, taken with the user: the narrative moves verbatim to **`docs/findings.md`** and the README
+becomes the eight-item front door. Nothing is deleted. The alternative considered and rejected was
+compressing the narrative into the new structure and letting `docs/protocol.md` carry the detail —
+rejected because the protocol is a 5200-line decision log, not a readable account, and the layer
+between "here are the headline tables" and "here is every decision" is the one a reader actually
+uses.
+
+`docs/findings.md` gains the **missing Phase 6 section**, written from `results/results.md` §6.2–6.4
+and P6-D1…D25, including the four retractions that phase produced.
+
+**Phase 7 is deliberately not duplicated in `docs/findings.md`.** It points at the README section
+instead. P7-D14 found five claims in this project that had drifted out of agreement with the
+artifacts they described, one of them published in both `results/latency.md` and the README, and
+`make gate7` now checks the README's latency section mechanically. A third hand-maintained copy
+would be the one copy nothing checks.
+
+### P9-D2 — `make all` did not do what section 5.5 reads it as doing. RECORDED 2026-09-14
+
+Validation protocol §5.5 is "fresh clone + `make all` reproduces every committed number". The recipe
+was:
+
+```
+all: data train eval bench report gate7
+```
+
+`train` runs **one** config — `CFG`, defaulting to `e01_baselines`. So `make all` generated the
+corpus, trained the baselines, and never ran the e02, e03 or e04 sweeps, Gates 4, 5 and 6, or the
+Phase 8 cross-validation. It reproduced a small fraction of the committed numbers and nothing said
+so. This was not caught by any gate because no gate reads the Makefile.
+
+Corrected to the real dependency order, with the sweeps factored into their own target so the ~163 h
+of fitting can be started and resumed independently:
+
+```
+all: data sweeps gate4 gate5 gate6-full bench report gate7 mss figures-extract
+```
+
+Two details that are not cosmetic. `gate6-full` rather than `eval` + `gate6`, because `make gate6`
+alone reports predicate 1 as UNVERIFIED — it has no exit status to read — and `gate6-full` has
+`eval` as a prerequisite, so `eval` runs exactly once and predicate 1 gets a real exit code.
+`figures-extract` rather than `figures`, because `figures` re-renders from the committed trace and a
+fresh reproduction must not re-render a trace it did not itself produce.
+
+**Recorded as a defect in the harness, not in the results.** Every committed number was produced by
+running these stages by hand, in this order; what was missing was the single command that says so.
+
+### P9-D3 — The two figures the plan asks for had no generator. RECORDED 2026-09-14
+
+`src/dmf/viz/forecast_plots.py` existed with three fully specified docstrings and three bodies that
+read `raise NotImplementedError`. Nothing imported it and it was not exported from `dmf.viz`. Plan
+items 2 (headline forecast-with-intervals figure) and 4 (quiescence lead-time histogram) therefore
+had no producer, and neither figure existed on disk. The lead-time *data* did:
+`results/e04/quiescence_lead_times.csv.gz`, 2 075 284 rows, written and never plotted.
+
+Implemented to the existing docstrings, plus `plot_interval_fan_grid` for the multi-panel headline.
+Three properties are enforced in code rather than left to the caller, each because the failure is
+invisible in a rendered image:
+
+* **Persistence is drawn on the same axes** as any forecast (non-negotiable 4 in visual form). On a
+  narrowband signal a forecast curve looks impressive alone whether or not it beat repeating the
+  last sample — and at a 3 s lead persistence is a *quarter period* out of phase, which is the most
+  informative thing on the figure.
+* **The measured coverage is annotated beside the nominal.** A band labelled only "90 %" is exactly
+  the claim P5-D15 forbids. The annotation says "on this span", because the hit rate of a drawn
+  60 s window is not the PICP of a test partition and the two must not be read as one number.
+* **The base rate is on the histogram**, not in the caption. Captions get separated from figures.
+
+**Extraction and drawing are separate modules on purpose.** `dmf.viz.traces` needs the corpus, the
+committed checkpoints and a forward pass; `dmf.viz.forecast_plots` needs arrays. `make figures`
+re-renders from a 12 kB committed `results/headline_trace.npz` with no corpus, no checkpoints and no
+GPU, and does so **bit-identically** — the same property `make report` gives the Pareto figure, and
+what makes "is this figure a function of committed artifacts?" answerable in a second.
+
+The headline cell is `SS5` / beam seas / 12 kn / roll at 3 s lead, from the `id` regime. Beam seas
+is the held-out heading of `unseen_heading`, but `id` splits by seed across every grid cell, so this
+cell is genuinely in-distribution there. Roll is the right channel at this heading for a reason
+worth stating: the roll heading factor at 90 deg is `hypot(sin 90, 0.05) = 1.001`, so roll is a real
+signal, while **pitch** at the same heading sits on the P1-D2 residual floor at 0.05 and a pitch
+panel here would be a picture of the artifact.
+
+Two models are drawn, `dlinear_quantile` and `tcn_quantile`, not one. They are the project's
+calibration-versus-sharpness trade-off — TCN is 11.6x sharper at this cell (0.294 deg against
+3.42 deg) and both over-cover — and drawing either alone would be choosing the flattering half.
+
+### P9-D4 — Two published numbers were wrong on the first pass, and the failure mode was the familiar one. RECORDED 2026-09-14
+
+Caught by checking the draft README against the CSVs before the audit ran, not by the audit:
+
+* **"9.1–41.7 false alarms per minute on the point rule."** 41.7 is right; 9.1 is not. Both came
+  from the per-row best-F1 model, whose minimum is **2.58** (`unseen_seastate` / strict), and 9.12
+  is the `id` / strict row specifically. Corrected, and the sentence now says *which* models the
+  range is over — across all models and scorable cells the medians are 16.7 and 2.8 per minute with
+  maxima of 117.0 and 60.0, which is a different and larger claim.
+* **"the point rule is near [40/min] in three of the eight rows."** One row exceeds 40; four exceed
+  20. Corrected to the second statement.
+
+Both are the same shape as P6-D24, P6-D19 and P8-D11 item 4: **a range quoted over one subset and
+described as if it were quoted over another.** The count was right for what was computed and wrong
+for what the sentence said. The general lesson stands where P7-D14 put it — the number a function
+computed and the sentence a human wrote around it drift apart, and it is the sentence that is wrong.
+
+A third claim was removed rather than corrected: the opening sentence described the project as
+having "calibrated-interval" evaluation, which contradicts this project's own finding that **no
+conformal calibration is run anywhere** and the deliverable is not met. The README says that in two
+other places; the first sentence had quietly claimed the opposite.
+
+### P9-D5 — Restoring a gate artifact that a partial run overwrote. RECORDED 2026-09-14
+
+`make gate6` was run to check for a regression. It writes `results/gate6.csv` and `results/gate6.md`
+unconditionally, and on its own it reports predicate 1 as UNVERIFIED — by design, since no artifact
+can testify that `make eval` exited 0. The committed 7/7 PASS, produced by a real `gate6-full` run,
+was therefore overwritten with a **NOT PASSED, 6 of 7**.
+
+Restored from git rather than left standing. The committed file is the record of a run that
+happened; replacing it with a weaker verdict produced by running the gate incorrectly would be a
+false downgrade of the project's own audit trail, which is as much a defect as a false pass.
+Criteria 2–7 were confirmed PASS by the partial run, including criterion 2 — that re-rendering
+`results.md` from the CSVs reproduces it byte for byte — which is the property the README claims.
+
+### P9-D6 — A licensing defect found before publication, not by the audit. RECORDED 2026-09-14
+
+`mss/waveMotionRAO_seeded.m` is a tracked, committed, modified copy of an upstream MSS file. MSS is
+**MIT-licensed, Copyright (c) 2004 Thor I. Fossen**, and the MIT license requires that "the above
+copyright notice and this permission notice shall be included in all copies or substantial portions
+of the Software". The file retained upstream's `Author: Thor I. Fossen` line — which is attribution
+— and carried **neither notice**. The repository's own `LICENSE` names only this project's author.
+
+For a repository about to be made public this is a real defect, and it is a legal one rather than a
+methodological one, which is why it is recorded here rather than left to a code comment. Fixed in
+three places: the upstream MIT notice is now in the file's header, `mss/PATCHES.md` records the
+header as a fourth (comment-only) change so its "three changes" claim stays true, and a root-level
+`THIRD_PARTY_NOTICES.md` states what is redistributed, what is not, and under what terms.
+
+**`mss/upstream/` remains gitignored and is not redistributed** — only this one derived file is.
+
+### P9-D7 — The pre-release audit: three blocking findings, and two of its own numbers were wrong. RECORDED 2026-09-14
+
+`/full-audit` returned **NOT RELEASE READY, 3 blocking**. All three were real and all three are
+fixed. Recorded here with what each actually was, because two of them are the same failure mode this
+project keeps producing.
+
+**B1 — the MSS table told the reader to compare two columns that are not comparable.** The README's
+accuracy table carried an MSS column beside the four regime columns and said to read it against
+`unseen_vessel` "because only the generator changes between the two". False: `unseen_vessel` is the
+full held-out-hull grid (4 sea states x 4 headings x 3 speeds) and the MSS run is a matched subset
+(SS5, headings 135 and 180, three speeds). Worse, the *prose* deltas were computed against the
+matched-corpus column, which `docs/mss_crossvalidation.md` prints and the README did not — so a
+reader doing the subtraction the README instructed would get 1.25 where the text said 1.27. Fixed by
+moving the transfer result into its own section against the matched column, with the seed spreads
+that column already carried.
+
+**B2 — a negative result was deleted in the rewrite.** The previously committed README carried a
+1-5 s versus 10-15 s band table showing the deep models lose to `dlinear_ols` in the operational
+band, with the sentence "the gate is read where the deep models look best, and that belongs next to
+the word 'passes'". The restructure dropped both. That is **CLAUDE.md non-negotiable 6**, and the
+content survived only in an untracked file. Restored to the README body.
+
+**B3 — the release candidate depended on files that were not in the repository**, while the README
+asserted they were ("`results/` is committed in full", "a 12 kB committed trace"). Nine new files
+were untracked and the corrected `Makefile` was uncommitted, so a clone made at that moment still
+had `all: data train eval bench report gate7` and still had the P9-D6 licensing defect. The audit
+also noted that the README sourced its runtime table to `artifacts/logs/`, which is gitignored.
+
+**The runtime table was worse than the audit said, and the fix goes further.** It was not merely
+unverifiable from a clone; the claim "the seven logged stages sum to 163 hours" was wrong, because
+only **66.5 h** of it is in any log. The Phase 4 and Phase 5 sweeps predate the status-file
+convention and their figures come from protocol prose; Phase 7 and Phase 8 were never timed.
+`scripts/collect_runtimes.py` now derives **`results/runtime_stages.csv`** from the logs and the
+README's table carries a `source` column naming, per row, whether the figure is logged, prose, or
+derived — with four rows marked as the only ones traceable from a clone.
+
+#### Two of the audit's own numbers did not reproduce
+
+**The band counts in B2 were slightly wrong.** The audit reported 1-5 s as `tcn` 34-35,
+`transformer` 20-49, `lstm` 25-43. Recomputing from `results/e02/paired_contrasts.csv` gives 34-34,
+19-47 and 23-42 — which is exactly what the previously committed README carried — under this
+project's documented aggregation, where a multi-seed interval is the **envelope** of the per-run
+intervals (P3-D22). The audit appears to have aggregated the seed dimension differently. The
+committed numbers were restored, not the audit's. **The finding was right and its evidence was
+not**, which is the reason a reported number gets recomputed before it is published, including when
+it arrives from a reviewer.
+
+**S8's seed spread was right and this session's first recomputation was not.** An intermediate
+check reported quiescence seed spreads of 0.06-0.18 by taking a standard deviation across cells
+*and* seeds together. The quantity a "mean F1 over scorable cells" row needs is the spread of that
+mean across the three training seeds: average over cells within a seed first, then take the standard
+deviation over seeds. That gives 0.0008-0.0255 at the published cells, matching the audit's
+0.001-0.049 over all rows. Third instance in this project of a statistic computed over the wrong
+grouping (P6-D24, P6-D20, P8-D11 item 2).
+
+#### Accepted and actioned from SHOULD FIX
+
+S1 (the shuffle control's subject is AR(20), now stated at the point the README leans on it), S2
+(its bound is **0.0095** excess over 144 rows, not the 0.001 quoted, and the residual-floor exemption
+post-dates a 5.52 % failure), S3 (the README contradicted its own table on `unseen_seastate` — only
+the TCN family scores any cell in band, 5 of 72), S4 ("2x hot" is above the source document's own
+figure and was quoted without the spread its source explicitly requires — now 1.0-2.3x with the
+per-speed range), S5 (the MSS column now carries ±), S6 (the heave table listed 7 of 12 models and
+dropped `nrmse`; all 12 and the column are restored), S7 (parameter counts restored — a 45x spread
+between models compared head to head), S8, S9 (`results/physics_validation.md` told a reader the
+cross-DOF structure was sound; it now forward-references P8-D6), S10 (the `gamma` directional test
+the module docstring had always claimed now exists).
+
+**S10 is worth one line of its own.** `tests/test_response.py` asserted that `gamma`, `Hs`, `Tp`,
+`beta` and `U` each move the output in the physically correct direction. Four of those tests
+existed. `gamma` was held at 3.3 in every construction in the file. The physics was right — `S(wp)`
+rises 1.51 to 4.65 across gamma 1.0 to 7.0 — so this was a missing assertion, not a bug, and
+§5.1 checkbox 4 had been reported as satisfied on the strength of a docstring.
+
+### P9-D8 — The audit terminated early, and its stability checkbox pointed at a section that was never written. RECORDED 2026-09-14
+
+The `/full-audit` agent hit a usage limit while running integrity control 4 (benchmark stability).
+It had already written the body of `docs/audit_report.md`; what it had not written was the Control 4
+section. Two forward references survived — the control's own stub and the §5.4 checkbox — and the
+checkbox recorded **PASS** on the strength of one of them.
+
+**That is a verdict resting on a pointer to nothing**, and it is the third instance of this shape in
+the project: Gate 8 predicate 1 read a gitignored file (P8-D15), the Phase 7 documentation checker's
+clause 3 never read a table cell (P7-D14), and now an audit checkbox cited a section that does not
+exist. In each case the reference was correct when written and stopped being correct when the thing
+it pointed at changed or failed to arrive.
+
+Control 4 was completed against the committed `results/latency_stability.csv` rather than by
+re-sweeping, which was the disposition agreed for this pass. It **changes the checkbox**: p50 is
+within 10 % on 52 of 52 configurations, but the worst row — `tcn`/torch-eager/cpu at batch 32 —
+drifts **9.91 %** against a 10 % bar, passing by 0.09 of a percentage point on one row of 52. The
+entry now reads "PASS, marginally" and says so. The p99 outcome (43 of 52 within 10 %, worst
+−43.59 % on `tcn_quantile`/torch-eager/cuda at batch 32, clustering as 4 `torch-compile`, 3
+`torch-eager`, 2 TensorRT engine-build) was already recorded in P7-D13 and is unchanged.
+
+Every other section of the report was verified complete by resolving every B/S/N cross-reference in
+the document; none dangles.
+
+### P9-D9 — Gate 9: five published claims did not match their artifacts, and adding the dropped rows broke a conclusion. RECORDED 2026-09-15
+
+The Phase 9 gate check re-derived the README's numbers from the committed CSVs. The tables
+reproduce; five *sentences and row sets* did not. All five are fixed. Two of them changed a
+conclusion, which is the reason non-negotiable 6 is worded as it is.
+
+**1. `README.md` — "everything else falls to or below persistence" was contradicted by the row two
+lines above it.** `ar20` scores **+0.1560** on MSS (`results/mss/skill_mss_mss.csv`, pitch at 10 s),
+and the table printed that number. The same sentence appears in `docs/findings.md`. Corrected in
+both to name `ar20` as the one model outside the DLinear family that keeps positive skill.
+
+**2. Four models were missing from the MSS transfer table.** `ar10`, `damped_persistence`,
+`window_mean` and `persistence` are in the committed artifact and were in no version of the table;
+`window_mean` and `persistence` were in `docs/mss_crossvalidation.md` but not the README. P8-D12 is
+this project's own precedent — dropping AR orders from this exact table changed its conclusion once
+already. All four are now in all three documents. `ar_attitude_only` is stated as never having been
+run on the MSS records, rather than omitted silently.
+
+**3. DEFECT IN A CONCLUSION, found by adding those rows: the AR ladder is not monotone.** Three
+documents argued that a model transferring badly is a model that identified the generator harder,
+evidenced as "`ar40` loses 1.27 where `ar20` loses 0.37". With `ar10` visible the ladder reads
+0.52 / 0.37 / 1.27 at orders 10 / 20 / 40 — **`ar10` identifies less than `ar20` and transfers
+worse**, and MSS skill peaks at order 20 (−0.0004 / +0.1560 / −0.7243). The claim survives for the
+20 → 40 step, which is the step the argument rests on, and is now stated at that scope with the
+non-monotonicity beside it. It did not survive as a statement about the family. **The row that
+falsifies the general form is the row that was missing from the table** — which is what
+non-negotiable 6 is for, and the third time in this project (P8-D12, P8-D13) that a model left out
+of a comparison was the one carrying the counter-evidence.
+
+**4. `docs/mss_crossvalidation.md` printed `persistence` NRMSE as 1.000.** Measured: **1.188**.
+NRMSE is `RMSE / signal_std` and carries no persistence denominator, so there is no reason for the
+persistence row to be 1.0 at a 10 s lead; the value had been assumed rather than computed. The
+aggregation recipes for that table are otherwise exact — mean over cells within a seed then mean ±
+std over seeds for the skill columns, `1 − ΣSSE/ΣSSE_p` for the pooled column, and the mean of the
+per-row `nrmse` for the last one; all nine previously published rows reproduce to the printed digits
+under them.
+
+**5. `README.md` — "the denominator of every skill score in this project is itself worse than
+predicting the test partition's mean" is false globally.** `persistence` has `nrmse` ≤ 1.0 in
+**33 of 144** cells (`results/e02/baselines.csv`), best **0.4588**. The preceding clause was correct
+as scoped to the two printed tables and the sentence after it was not. Now scoped, with the 111/33
+split stated. Same shape as P9-D4, P6-D24 and P8-D11 item 4: a quantity computed over one subset,
+described as if computed over another.
+
+**6. `docs/findings.md` never received the audit's S6, S7 and S8 corrections.** The README calls it
+"Start here." Its gate-cell table listed **8 of 12** models with no seed spreads and no `nrmse`, and
+its quiescence table had lost the ± and the `det.` marks — the exact three defects the audit fixed
+in the README and nowhere else. Non-negotiables 4, 5 and 6 apply to that document too. Both tables
+replaced with the corrected ones. Its lead-time sentence also carried the mislabel N5 corrected in
+the README ("median lead" for what is a mean of per-cell medians).
+
+**7. `README.md` advertised `make gate6` as an artifact-only re-read needing "nothing".** It writes
+`results/gate6.csv` unconditionally and, run without an `eval` exit status, reports predicate 1
+UNVERIFIED — so a reader following the README replaces the committed 7/7 PASS with a NOT PASSED
+6 of 7. P9-D5 records exactly that happening in this project, one phase earlier, and the README was
+telling the next reader to do it. The partial-target table now names `gate6-full` and the
+surrounding paragraph states the exception.
+
+**Not a defect in any result.** No number in `results/` changed, nothing was re-run, and no
+threshold moved. What changed is seven sentences and three tables that had drifted from artifacts
+that were correct all along.

@@ -5,13 +5,20 @@ to `mss/upstream/`, which is gitignored. Nothing in the clone is edited in place
 
 ## `waveMotionRAO_seeded.m`
 
-A copy of `upstream/LIBRARY/environment/waveMotionRAO.m` with **three** changes, all to the
-source of the random phases and nothing else. Reproduce with
+A copy of `upstream/LIBRARY/environment/waveMotionRAO.m` with **three** functional changes, all to
+the source of the random phases and nothing else, plus a comment-only attribution block. Reproduce
+with
 `diff -u <(sed 's/\r$//' mss/upstream/LIBRARY/environment/waveMotionRAO.m) mss/waveMotionRAO_seeded.m`.
 
 1. Renamed, and `phasesIn` added as a trailing argument.
 2. `randomPhases` dropped from the `persistent` list and assigned from `phasesIn`.
 3. The `rng(12345,"twister")` draw removed.
+4. **Comment only, no behaviour:** a `Revisions:` note recording 1-3, and the upstream MIT
+   copyright and permission notice. MSS is MIT-licensed, Copyright (c) 2004 Thor I. Fossen, and
+   that licence requires the notice to travel with "copies or substantial portions of the
+   Software". This file is a substantial portion of one, so it carries the notice; before Phase 9
+   it carried only the upstream `Author:` line, which is attribution but is not the required
+   notice. See also `THIRD_PARTY_NOTICES.md` at the repository root.
 
 **Why.** Upstream seeds `rng(12345,"twister")` into a `persistent` variable, so every fresh
 MATLAB/Octave process produces the *same* realization. Generating three "seeds" by calling

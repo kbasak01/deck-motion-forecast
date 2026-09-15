@@ -21,7 +21,8 @@ GATE6_DIR ?= $(or $(RESULTS),results)
 # Gate 7 reads the deploy artifacts, which also live at the top of results/.
 GATE7_DIR ?= $(or $(RESULTS),results)
 
-.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report test lint format all mss
+.PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report \
+        figures figures-extract test lint format all sweeps mss
 
 data:   ; $(PY) scripts/generate_corpus.py --config $(SIMCFG) --out artifacts/corpus --workers $(WORKERS)
 train:  ; $(PY) scripts/train.py --config $(CFG)
@@ -56,7 +57,37 @@ test:   ; $(PYTEST)
 lint:   ; $(RUFF) check src tests && $(RUFF) format --check src tests && $(MYPY) src
 format: ; $(RUFF) format src tests && $(RUFF) check --fix src tests
 
-all: data train eval bench report gate7
+# Re-render the two Phase 9 figures from committed artifacts alone: the 12 kB
+# results/headline_trace.npz and the e04 quiescence CSVs. No corpus, no checkpoints, no GPU,
+# which is what makes "is the headline figure a function of committed artifacts?" answerable
+# in a second -- the same property `report` gives the Pareto figure.
+figures: ; $(PY) scripts/make_figures.py --render-only
+# Re-extract the trace from the corpus and the committed checkpoints, then render. This is
+# the one `all` runs, because a fresh reproduction must not re-render a committed trace it
+# did not itself produce.
+figures-extract: ; $(PY) scripts/make_figures.py
+
+# Every training run the committed tables are read from, in dependency order. Separated from
+# `all` so the ~155 h of fitting can be started on its own and resumed per stage.
+#
+# The e04 lookback arms MUST be followed by `rescore` before `eval`: until it has run,
+# ablations.csv carries no lookback rows and Gate 6 predicate 5 cannot pass (P6-D15/D16).
+sweeps:
+	$(PY) scripts/train.py --config configs/experiment/e01_baselines.yaml --results-dir results
+	$(PY) scripts/train.py --config configs/experiment/e01_baselines_imu.yaml --results-dir results/imu
+	$(PY) scripts/train.py --config configs/experiment/e02_deep.yaml --results-dir results/e02
+	$(PY) scripts/train.py --config configs/experiment/e03_probabilistic.yaml --results-dir results/e03
+	./scripts/run_e04.sh cheap
+	./scripts/run_e04.sh deep
+	./scripts/post_sweep.sh
+
+# The whole project, in the order the methodology requires. `make all` is what
+# docs/IMPLEMENTATION_PLAN.md 5.5 ("fresh clone + make all reproduces every committed
+# number") is read against, so it runs the sweeps and every gate rather than one config and
+# one gate -- the previous recipe was `data train eval bench report gate7`, which trained
+# only e01 and left gates 4, 5, 6 and 8 unrun. Expected wall clock is about 160 h on one
+# RTX A4000; the per-stage breakdown is in the README.
+all: data sweeps gate4 gate5 gate6-full bench report gate7 mss figures-extract
 
 # Phase 8: MSS cross-validation. Needs the corpus and the deep checkpoints; the Octave
 # parity step skips cleanly when Octave is absent. Every step is idempotent.

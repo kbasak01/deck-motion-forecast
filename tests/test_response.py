@@ -51,7 +51,13 @@ from dmf.sim.response import (
     second_order_transfer,
     synthesize_motion,
 )
-from dmf.sim.spectra import WaveComponents, jonswap, sample_components
+from dmf.sim.spectra import (
+    WaveComponents,
+    hs_from_moments,
+    jonswap,
+    sample_components,
+    spectral_moment,
+)
 from dmf.sim.vessel import Vessel
 from dmf.typedefs import FloatArray
 
@@ -604,3 +610,44 @@ def test_motion_record_shapes_and_rate_consistency(
     )
     assert rate_err < 0.02
     assert acc_err < 0.02
+
+
+def test_peak_enhancement_concentrates_energy_without_changing_hs() -> None:
+    """Raising ``gamma`` must sharpen the peak while leaving ``Hs`` fixed.
+
+    The module docstring has always claimed a directional test for `gamma` alongside those
+    for `Hs`, `Tp`, `beta` and `U`; it did not exist, and `gamma` is held at 3.3 in every
+    other construction in this file (docs/protocol.md P9-D7). This is that test.
+
+    `gamma` is the one JONSWAP parameter that is *not* supposed to move the variance: the
+    normalisation absorbs it, so `4*sqrt(m0)` stays at `Hs` while `S(wp)` rises. Asserting
+    both halves is the point -- a normalisation bug that let energy grow with `gamma` would
+    pass a peak-height check on its own.
+    """
+    w = np.linspace(W_MIN_RAD_S, W_MAX_RAD_S, 4000)
+    hs_m, tp_s = 3.3, 9.7
+    w_peak = 2.0 * np.pi / tp_s
+
+    peaks: list[float] = []
+    realized: list[float] = []
+    for gamma in (1.0, 2.0, 3.3, 5.0, 7.0):
+        s = jonswap(w, hs_m, tp_s, gamma)
+        peaks.append(float(np.interp(w_peak, w, s)))
+        realized.append(hs_from_moments(spectral_moment(w, s, 0)))
+        print(f"[mono] gamma={gamma:.1f}: S(wp)={peaks[-1]:.4f}, 4*sqrt(m0)={realized[-1]:.4f} m")
+
+    # Offset pairing, so the two sequences are deliberately of different length.
+    assert all(peaks[i + 1] > peaks[i] for i in range(len(peaks) - 1)), (
+        f"S(wp) must increase strictly with gamma at fixed Hs and Tp, got {peaks}"
+    )
+    # Every realized Hs sits slightly below nominal because the corpus band
+    # [W_MIN_RAD_S, W_MAX_RAD_S] truncates the spectral tails, and how much it truncates
+    # depends weakly on how sharp the peak is -- so the realized value wanders by about 1 %
+    # across this gamma range (3.267 to 3.298 m) rather than staying fixed. That is
+    # truncation, not a normalisation error: the point is that it stays *bounded* near Hs
+    # while S(wp) triples. A normalisation that let energy grow with gamma would send this
+    # column up with the peak column, and the bound below would fail.
+    assert all(r == pytest.approx(hs_m, rel=1.5e-2) for r in realized), realized
+    assert max(realized) / min(realized) < 1.02, (
+        f"realized Hs must stay bounded as gamma varies, got {realized}"
+    )

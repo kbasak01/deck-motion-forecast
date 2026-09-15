@@ -1,386 +1,279 @@
 # deck-motion-forecast
 
-Short-horizon (1-15 s) forecasting of ship deck motion — roll, pitch, heave and their rates —
-from JONSWAP-driven vessel simulation, for deciding when to commit to a rotorcraft touchdown on a
-heaving deck. The decision the forecast serves is a *quiescent window*: an interval in which all
-six channels stay inside landing limits for long enough to get the aircraft down, which is what a
-full-scale manned or unmanned helicopter needs, not attitudes alone.
+Short-horizon (1–15 s) forecasting of 6-DOF ship deck motion — roll, pitch, heave and their
+rates — for deciding when to commit a rotorcraft to a touchdown on a heaving deck, evaluated on
+prediction intervals and on operational quiescent-window detection rather than on RMSE alone. **Every result in this repository comes
+from simulated vessel motion: a JONSWAP-driven linear seakeeping model. No real deck data is used
+anywhere in this project, and no sim-to-real claim is made.**
 
-**All results in this repository are from simulated vessel motion. No real deck data is used,
-and no sim-to-real claim is made.**
+The decision the forecast serves is a *quiescent window*: an interval in which all six channels
+stay inside landing limits long enough to get the aircraft down. That, rather than raw RMSE, is
+the metric this project is built around — and it behaves very differently from RMSE, which is
+[the sharpest finding here](#the-decision-quiescent-window-detection).
 
-Status: **Phases 1-7 complete; Gate 7 passes. Phase 5 result unchanged: Gate 5 passes at its registered cell. The probabilistic heads are calibrated in-distribution at 10-15 s lead and nowhere else: they over-cover across the 1-5 s operational band, and coverage falls far below nominal under every distribution shift tested. The degradation is the finding, and it is reported rather than fixed. No probabilistic baseline was run, so the coverage column has no floor to clear -- the largest gap in the phase.**
+**Status: Phases 1–8 complete.** Gates 1, 2, 4, 6, 7 and 8 pass as written. Gate 3 **failed** as
+written and was restated at the same threshold. Gate 5 passes at its pre-registered cell and does
+**not** pass across the surrounding table. The full phase-by-phase record, including every claim
+this project withdrew, is in [`docs/findings.md`](docs/findings.md).
 
-The simulator (`src/dmf/sim/`) and corpus are complete and Gate 1 passes; the realization-level
-split, windowing and train-only normalization are complete and Gate 2 passes (`src/dmf/data/`).
-The four baseline families — persistence, damped persistence, AR(p), DLinear — are implemented and
-tested.
+---
 
-**Gate 3 as originally written did not pass.** AR(20) forecasts roll 3 s ahead in-distribution at
-0.9987 skill vs persistence (0.9958 under the `imu` observation model), against a 0.8 "task is too
-easy" threshold. This is not leakage — the shuffle control passes 36/36 — it is structural: the
-vessel response is narrowband with no process noise, so a 3 s horizon is a quarter of the roll
-period and a linear model identifies the system rather than approximating it. Roll is also the
-*most* predictable channel in the corpus, so the original gate measured the easiest available cell.
+## The forecast, with intervals
 
-Two things followed. The task now forecasts all six channels — attitudes **and** their rates, which
-the operational metric needs and a full-scale rotorcraft landing requires — out to 15 s, where four
-of six channels fall below 0.8 skill. And the gate was **restated, not relaxed**: the same 0.8
-threshold, read at the decision horizon (10 s) on the binding DOF (pitch), where AR(20) scores
-0.545 (`ideal`) / 0.513 (`imu`). Both the original failure and the restatement are recorded in
-`docs/protocol.md` §Phase 3, which is the full decision log for this phase.
+![Roll forecast at 3 s lead with 90 % intervals, SS5 beam seas](results/headline_forecast_intervals.png)
 
-`results/baselines.csv` (`ideal`) and `results/imu/baselines.csv` (`imu`) carry the Gate 3 sweep:
-1296 rows each, nine baselines x four regimes x six DOFs x six horizons, three seeds for the one
-SGD-fitted model and deterministic single rows for the eight closed-form ones. Phase 4's
-twelve-model sweep is in `results/e02/`.
+Roll at 3 s lead, SS5, beam seas, 12 kn, in distribution. Both panels are the same 60 s of the
+same realization. Three things are worth reading off it:
 
-**Read the gate number with its context.** Passing is one cell of thirty-six. On `id`, AR(20) still
-exceeds 0.8 skill in 28 of 36 cells, and across the 1–5 s operational band it exceeds 0.8 in 89 of
-96 cells over all four regimes. The task is easy by construction; the gate marks where it stops
-being easy, not that it is hard. A zero-parameter `window_mean` baseline beats persistence — the
-denominator of every skill score here — in 107 of 144 cells.
+- **Persistence (grey, dashed) is a full quarter-period out of phase.** At a 3 s lead on a ~9 s
+  roll period, repeating the last sample is not a weak baseline, it is an inverted one. Persistence
+  is nonetheless the denominator of every skill score in this project, which is why skill scores
+  here are flattering and why `nrmse` is printed beside every one of them.
+- **Both heads track the truth closely, and `tcn_quantile` is an order of magnitude sharper** —
+  mean 90 % interval width 0.294° against `dlinear_quantile`'s 3.42° at this channel and lead
+  (`mean_interval_width_mean` in `results/e03/probabilistic.csv`).
+- **Both over-cover.** The bands are labelled 90 % and measure 100 % and 99 % on this span; over
+  the `id` test partition at this same channel and lead they are 0.961 and 0.984 against a 0.90
+  nominal. That is the calibration
+  failure described in [Limitations](#limitations): the heads are calibrated at 10–15 s and
+  systematically too wide across the 1–5 s band the landing decision is actually taken in.
 
-Two results worth stating plainly, both of which reversed an earlier claim of ours:
+The figure is regenerated by `make figures` from a 12 kB committed trace, with no corpus, no
+checkpoints and no GPU.
 
-- **A converged linear model is competitive at the gate cell.** `dlinear_ols` (60 300 parameters,
-  solved closed-form) scores 0.568 there against AR(20)'s 0.545 with 108 900. Read across the whole
-  `id` regime the ranking flips back — AR(20) wins 28 of 36 cells, median +0.0056 — so this is a
-  cell-level result, not a general one. What is general: DLinear was previously trained by SGD to a
-  60-epoch cap that early stopping never reached, and that shortfall was being read as an
-  architecture gap. Removing it drops AR(20)'s wins over DLinear from 107/144 to 89/144 under
-  `ideal`.
-- **The rate channels are worth less than they first appeared.** At matched parameter count the
-  paired per-cell effect is +0.0006 median under `ideal` and +0.0025 under `imu` — small and positive
-  in both, and of the same order as simply doubling the lag budget. An earlier version of this line
-  claimed the ordering reversed between modes; that came from comparing two unpaired medians and does
-  not survive a paired contrast. The measurement also still carries a downward bias, because matching
-  parameter counts left the two models with different lag depths.
+## Accuracy: skill against persistence, across four regimes
 
-`docs/protocol.md` §Phase 3 is the full decision log, including the defects an adversarial audit
-found in the first sweep and what changed as a result.
+Four evaluation regimes, **split by simulation seed, never by time window**. `id` holds out seeds
+within every grid cell; the other three hold out a condition entirely: SS6, 90° beam seas, and the
+S175 hull, which is never trained on in any regime.
 
-A caveat that travels with every number here: the generator has no process noise, so the
-achievable-skill ceiling is unrealistically high and absolute values flatter every model. Only
-relative comparisons and out-of-distribution degradation should be read as findings.
+Skill vs persistence at **pitch, 10 s** — the cell Gates 3, 4 and 5 are all read at — with the
+parameter count and `nrmse` in distribution beside it. Closed-form models are deterministic and
+carry one seed; SGD models are mean ± std over three. The parameter column spans 45x between models
+compared head to head, which is context for every comparison below:
 
-## Phase 4 — deep models
+| model | params | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` | `nrmse` (`id`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `persistence` | 0 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.256 |
+| `window_mean` | 0 | 0.3656 | 0.3082 | 0.2246 | 0.1724 | 1.001 |
+| `damped_persistence` | 6 | 0.3657 | 0.3082 | 0.2247 | 0.1724 | 1.000 |
+| `ar10` | 54 900 | 0.5348 | 0.1384 | **−50.11** | 0.4644 | 0.857 |
+| `ar20` | 108 900 | 0.5446 | 0.1584 | **−49.43** | 0.4786 | 0.848 |
+| `ar40` | 216 900 | 0.5765 | 0.0856 | **−44.94** | 0.5263 | 0.817 |
+| `ar_attitude_only` | 108 900 | 0.5419 | 0.2112 | **−18.27** | 0.4778 | 0.850 |
+| `dlinear` | 60 300 | 0.5147 ± 0.0001 | **0.4775** ± 0.0003 | 0.5191 ± 0.0013 | 0.5019 ± 0.0009 | 0.875 |
+| `dlinear_ols` | 60 300 | 0.5683 | 0.4499 | **0.5775** | 0.5344 | 0.825 |
+| `tcn` | 196 804 | 0.8346 ± 0.0006 | 0.2772 ± 0.0322 | −81.09 ± 6.65 | **0.8298** ± 0.0034 | 0.511 |
+| `transformer` | 2 712 708 | 0.8080 ± 0.0032 | 0.1953 ± 0.0270 | −79.22 ± 25.17 | 0.7250 ± 0.0141 | 0.550 |
+| `lstm` | 317 828 | **0.8680** ± 0.0016 | 0.3437 ± 0.0241 | **−279.44** ± 59.98 | 0.8007 ± 0.0044 | 0.456 |
 
-Three architectures were added: a TCN (dilated causal convolutions, receptive field 253 >= the
-200-sample lookback, asserted arithmetically in `tests/test_windows.py`), an encoder-only
-Transformer over 1 s patches, and a 2-layer LSTM. All twelve models — the nine Phase 3 baselines
-re-fitted and re-scored beside the three new ones — were trained in **one** run under one data
-pipeline, one normalization, one horizon list and one early-stopping rule
-(`configs/experiment/e02_deep.yaml`, 31 h on one A4000, **`ideal` observation mode only**; the
-`imu` ablation is Phase 6.3). Full artifacts in `results/e02/`; the Gate 3 artifacts in
-`results/` are untouched.
+And at **heave, 3 s** — the channel and the lead time the landing decision actually uses. Every
+model is listed, including the ones that lose:
 
-**Gate 4 passes.** Both the original criterion (3 s on `id` vs damped persistence, 18 of 18
-model-DOF rows) and the restated one (10 s on pitch vs the stronger trivial baseline, 3 of 3),
-with every paired bootstrap interval excluding zero and margins exceeding the three-seed spread
-by two to four orders of magnitude (Reading B 139x-839x, Reading A 709x-12 033x). `make gate4` regenerates the read-out from the CSVs.
+| model | params | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` | `nrmse` (`id`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `persistence` | 0 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.516 |
+| `window_mean` | 0 | 0.4746 | 0.4298 | 0.4512 | 0.4339 | 1.099 |
+| `damped_persistence` | 6 | 0.4663 | 0.4311 | 0.4477 | 0.4333 | 1.108 |
+| `ar10` | 54 900 | 0.9956 | 0.9937 | 0.9892 | 0.9967 | 0.100 |
+| `ar20` | 108 900 | 0.9974 | 0.9960 | 0.9929 | 0.9979 | 0.077 |
+| `ar40` | 216 900 | 0.9985 | 0.9978 | **0.9962** | **0.9988** | 0.058 |
+| `ar_attitude_only` | 108 900 | 0.9947 | 0.9926 | 0.9877 | 0.9944 | 0.111 |
+| `dlinear` | 60 300 | 0.9502 ± 0.0001 | **0.7743** ± 0.0006 | 0.9701 ± 0.0002 | 0.9405 ± 0.0003 | 0.339 |
+| `dlinear_ols` | 60 300 | 0.9823 | 0.9013 | 0.9895 | 0.9782 | 0.202 |
+| `tcn` | 196 804 | **0.9987** ± 0.0001 | **0.9941** ± 0.0004 | 0.9252 ± 0.0113 | 0.9877 ± 0.0015 | 0.055 |
+| `transformer` | 2 712 708 | 0.9972 ± 0.0005 | 0.9644 ± 0.0051 | 0.9571 ± 0.0049 | 0.9476 ± 0.0047 | 0.080 |
+| `lstm` | 317 828 | **0.9987** ± 0.0001 | 0.9746 ± 0.0033 | **0.6760** ± 0.0476 | 0.9840 ± 0.0022 | 0.055 |
 
-Skill at the gate cell (pitch, 10 s lead):
-
-| model | params | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` |
-|---|---:|---:|---:|---:|---:|
-| `damped_persistence` | 6 | 0.366 | 0.308 | 0.225 | 0.172 |
-| `dlinear` | 60 300 | 0.515 | **0.478** | 0.519 | 0.502 |
-| `dlinear_ols` | 60 300 | 0.568 | 0.450 | **0.578** | 0.534 |
-| `ar20` | 108 900 | 0.545 | 0.158 | -49.4 | 0.479 |
-| `ar40` | 216 900 | 0.577 | 0.086 | -44.9 | 0.526 |
-| `tcn` | 196 804 | 0.835 | 0.277 | -81.1 | **0.830** |
-| `transformer` | 2 712 708 | 0.808 | 0.195 | -79.2 | 0.725 |
-| `lstm` | 317 828 | **0.868** | 0.344 | **-279.4** | 0.801 |
-
-**Where the deep models win, and where they do not.** Counted by paired bootstrap against
-`dlinear_ols` (36 cells per regime, interval excluding zero in favour of the deep model / of
-`dlinear_ols`):
-
-| | `tcn` | `transformer` | `lstm` |
-|---|---|---|---|
-| `id` | 27 - 7 | 25 - 10 | 27 - 9 |
-| `unseen_seastate` | 17 - 15 | 9 - 21 | 10 - 20 |
-| `unseen_heading` | 0 - 32 | 0 - 36 | 0 - 35 |
-| `unseen_vessel` | 16 - 20 | 10 - 24 | 12 - 20 |
-| **all 144** | 60 - 74 | 44 - 91 | 49 - 84 |
-| *excluding `unseen_heading`* | *60 - 42* | *44 - 55* | *49 - 49* |
-
-Read those two bottom rows together. Over all 144 cells every deep model loses more than it
-wins — but roughly 40% of the losses come from `unseen_heading` alone, which is a corpus
-artifact (below), and dropping it reverses the result for `tcn` and ties it for `lstm`. The
-honest summary is **`tcn` wins outside `unseen_heading`, `lstm` ties, `transformer` loses.**
-(Phase 8 qualifies this: on an independent hydrodynamic model none of the three
-transfers, and `tcn` falls to -0.9033 skill at the same cell where it reads 0.8604 here.)
-
-The split by lead time is sharper, and cuts against the deep models where it matters most
-(excluding `unseen_heading`):
+At 3 s on heave the whole field above `damped_persistence` sits between 0.94 and 0.999 and the
+differences are not readable from this table. **They are readable from a paired test, and they go
+the other way.** Paired bootstrap against `dlinear_ols`, counting cells whose 95 % interval excludes
+zero, `unseen_heading` excluded (`results/e02/paired_contrasts.csv`):
 
 | band | `tcn` | `transformer` | `lstm` |
 |---|---|---|---|
-| **1-5 s** — the operational band this project exists to serve | 34 - 34 | 19 - 47 | 23 - 42 |
-| **10-15 s** — where Gate 4 is read | 26 - 8 | 25 - 8 | 26 - 7 |
+| **1–5 s** — the operational band this project exists to serve | 34 – 34 | 19 – 47 | 23 – 42 |
+| **10–15 s** — where Gate 4 is read | 26 – 8 | 25 – 8 | 26 – 7 |
 
-The deep models' advantage is concentrated at long lead times. In the 1-5 s band, `tcn` ties the
-linear model and the other two lose to it. Gate 4's 10 s cell was fixed in advance of the sweep
-and on Gate-3-era reasoning, so this is not cell-picking — but the gate is read where the deep
-models look best, and that belongs next to the word "passes".
+**The deep models' advantage is concentrated at long lead times.** In the 1–5 s band `tcn` ties the
+closed-form linear model and the other two lose to it roughly 2:1. Gate 4's 10 s cell was fixed in
+advance of the sweep and on Gate-3-era reasoning, so this is not cell-picking — but the gate is read
+where the deep models look best, and that belongs next to the word "passes".
 
-**Robustness.** Counting cells where normalised RMSE exceeds 1.0 — the model does worse than
-predicting the scored partition's mean — `dlinear_ols` is the most robust model in the table at
-8 of 144, against `tcn` 25, `transformer` 26, `lstm` 27. That gap also narrows once
-`unseen_heading` is removed, where the worst-case gap is `transformer` 12 against `dlinear_ols` 7
-— 1.7x rather than 3.4x, and `ar40` and `ar_attitude_only` are then marginally better than
-`dlinear_ols` at 6 each. The `nrmse` column is new this phase and the finding was invisible
-without it: `tcn` on `unseen_vessel`/roll at 10 s reads as **+0.388 skill** while sitting at
-`nrmse` **1.183 +/- 0.019** — worse than predicting that partition's mean — because persistence
-is worse still there (`nrmse` 1.512). Skill against a bad reference is not evidence of a good
-forecast.
+**Read these numbers with four caveats, none of which is optional.**
 
-**`unseen_heading` needs care in both directions.** The magnitude is a corpus artifact: that
-regime's test set is beam seas, where the pitch heading factor sits on the `eps = 0.05` residual
-floor (see limitations), so a model fitted where pitch is a real signal imposes an amplitude on a
-channel that has almost none — hence -49 to -279. The two channel-independent DLinear rows
-structurally cannot import that amplitude from roll, and survive. **But the floor does not
-explain the direction on the other channels**: on roll and heave, where it does not apply, the
-deep models still lose 4-6 of 6 cells each, and `lstm` exceeds `nrmse` 1.0 on heave and
-heave_rate too. This is a real heading-generalisation failure with an artifact on top of it, not
-an artifact alone.
+1. **The task is easy by construction, and every absolute number here is flattered by it.** The
+   generator has no process noise and the vessel RAO is a narrowband filter, so the deck record is
+   a finite sum of sinusoids — which satisfies an *exact* linear recursion. Least-squares AR over
+   200 lags is therefore **identifying** the system, not approximating it, which is why heave at
+   3 s runs to 0.998. The shuffle control settles that this is not leakage: refitting **AR(20)** on
+   time-shuffled targets leaves at most **0.0095 excess** against a 2 % tolerance over 144 rows.
+   Two things travel with that. The control's subject is AR(20), not the best model — it certifies
+   the pipeline the deep rows are built on, not the deep rows. And its residual-floor exemption
+   (cells whose test signal sits on the P1-D2 floor are computed and reported, never asserted on)
+   was introduced *after* the control failed at 5.52 % on one arm; raising the tolerance instead was
+   considered and rejected. Read **relative** comparisons and **out-of-distribution degradation** as
+   findings; do not read an absolute skill here as an achievable accuracy.
+2. **Gate 3 failed as written, and was restated rather than relaxed.** The original criterion said
+   AR(p) must *not* exceed 0.8 skill at 3 s on roll, or the task is too easy. It measured 0.9987.
+   The failure is recorded as a failure; the gate was restated at the **same 0.8 threshold**, read
+   at the decision horizon on the binding DOF, where AR(20) scores 0.545 and passes. Both readings
+   are in [`docs/findings.md`](docs/findings.md#phase-3--baselines-and-the-gate-that-failed).
+3. **`persistence` has `nrmse` above 1.0 in every column of the two tables above** — 1.26 at
+   pitch/10 s and 1.52 at heave/3 s — meaning that at these cells the denominator of the skill
+   score is itself worse than predicting the test partition's mean. Across all 144 cells it is
+   above 1.0 in 111 and below in 33, best 0.459, so this is a statement about the long horizons
+   and not about every cell. A zero-parameter `window_mean` beats it in 107 of 144
+   cells. Skill against a bad reference is not evidence of a good forecast, which is why `nrmse` is
+   printed beside it.
+4. **`unseen_heading` is part corpus artifact and part real failure.** That regime's test set is
+   entirely beam seas, where the pitch heading factor sits on a residual floor of 0.05, so a model
+   fitted where pitch is a real signal imposes an amplitude on a channel that has almost none —
+   hence −49 to −279. The two channel-independent DLinear rows structurally cannot import that
+   amplitude and survive. But the floor does **not** explain the direction on roll and heave, where
+   it does not apply and the deep models still lose. It is a real heading-generalisation failure
+   with an artifact on top of it.
 
-Two methodological notes, both in `docs/protocol.md` §Phase 4:
+### Transfer to an independent hydrodynamic model
 
-- **A budget pilot must run at the cap it justifies.** An 18-epoch pilot predicted early stopping
-  would not fire; at cap 60 it fired for the Transformer and LSTM, because the cosine schedule is
-  sized by the cap and epoch 16 sits near peak learning rate rather than at the end of an anneal.
-  Both are *worse* at cap 60 than at cap 18 (3.2% and 7.4%). The cap was not changed after seeing
-  this — that would be selecting a hyperparameter on the results it produced (P4-D9). The two
-  models carrying most of the loss column above are therefore shipped in a configuration this
-  project has measured as worse than one it already ran (P4-D14).
-- **Two prerequisites were built first**: normalised RMSE, which `docs/protocol.md` had mandated
-  twice and implemented nowhere, and a paired bootstrap for model-vs-model differences, without
-  which an earlier claim in this project was published wrong twice (P4-D3, P4-D4).
+**The result that qualifies every row above.** The same `unseen_vessel` checkpoints and the same
+hull, scored against the MSS toolbox's ShipX strip-theory RAOs. Pitch at 10 s. The corpus column
+here is **not** the `unseen_vessel` column above: it is the corpus restricted to the cells MSS was
+run on (SS5, headings 135° and 180°, three speeds), because that is the only comparison in which
+the generator is the sole thing that changes. Full table and controls in
+[`docs/mss_crossvalidation.md`](docs/mss_crossvalidation.md):
 
-The re-scored Phase 3 rows reproduce Phase 3 **bitwise** — all 1296 shared rows agree exactly in
-`rmse_mean`, `skill_mean` and the bootstrap bounds, while `fit_time_s` differs, so it is a real
-re-fit and not a join. That is the positive control on the whole pipeline (P4-D10).
+| model | corpus (matched cells) | MSS | change |
+|---|---:|---:|---:|
+| `dlinear` | 0.4144 ± 0.0015 | **0.3935** ± 0.0017 | −0.021 |
+| `dlinear_ols` | 0.4904 | **0.3835** | −0.107 |
+| `damped_persistence` | 0.0734 | −0.0585 | −0.132 |
+| `window_mean` | 0.0733 | −0.0586 | −0.132 |
+| `ar20` | 0.5258 | 0.1560 | −0.370 |
+| `ar10` | 0.5195 | −0.0004 | −0.520 |
+| `transformer` | 0.7654 ± 0.0323 | −0.1773 ± 0.0295 | −0.943 |
+| `ar40` | 0.5412 | **−0.7243** | −1.266 |
+| `tcn` | 0.8604 ± 0.0040 | **−0.9033** ± 0.1384 | −1.764 |
+| `lstm` | 0.8032 ± 0.0169 | **−1.5564** ± 0.5995 | −2.360 |
+| `persistence` | 0.0000 | 0.0000 | 0.000 |
 
-**The limitation that bounds every comparison above.** The simulator applies a linear RAO to a
-finite sum of sinusoids with no process noise, so a linear forecaster is **optimal for this
-corpus by construction** and enough lags identify the system rather than approximate it. "A
-linear model matches three deep architectures" is therefore a much weaker statement here than it
-would be on a stochastic process, and says nothing about how these architectures would rank on
-real deck motion with nonlinear roll damping and short-crested excitation (P4-D16). The cell
-counts are also a description of one table, not 144 independent hypothesis tests (P4-D17).
+Every model scored on both generators is listed. `ar_attitude_only` is the one corpus baseline
+absent here: it was never run on the MSS records, so it has no transfer number rather than a
+withheld one.
 
-## Phase 5 -- probabilistic heads
+Only the DLinear family transfers with its skill largely intact, losing 0.02–0.11. **`ar20` is the
+one other model that keeps positive skill** — 0.156, down 0.37 — and `ar10` lands exactly on
+persistence at −0.0004. The four heaviest models fall *below* persistence, losing 0.94 to 2.36.
+**The dividing line is not linear versus deep.** `ar40` is linear, per-channel, beats `dlinear_ols`
+on the corpus, and transfers worse than `transformer`. What separates them is how completely a model
+identifies *this* generator's dynamics — `ar40` loses 1.27 where `ar20` loses 0.37, on the same
+model class at twice the order. **That ladder is not monotone at the short end**: `ar10` loses 0.52,
+worse than `ar20`, so "less capacity transfers better" is the wrong summary and the AR family peaks
+at order 20 rather than at its floor. Both sides are simulations; this bounds generator-specific
+overfitting and says nothing about fidelity to a real ship.
 
-Two predictive-distribution heads were added behind a config flag -- a **quantile** head (nine
-levels, 0.05 to 0.95, pinball loss, post-hoc sorting) and a **Gaussian** head (mean and
-log-variance, NLL) -- and attached to three backbones: `dlinear`, `tcn` and `lstm`. Six
-probabilistic rows, four regimes, three seeds, one run
-(`configs/experiment/e03_probabilistic.yaml`, ~66 h on one A4000, `ideal` mode only -- wall clock
-from file timestamps, since `sweep.log` captured nothing; the traceable figure is the 60.65 h of
-SGD that `fit_time_s` sums to). Full
-artifacts in `results/e03/`; `results/` and `results/e02/` are the Gate 3 and Gate 4 records and
-are untouched.
+## The decision: quiescent-window detection
 
-`src/dmf/models/heads.py` is structured as a **calibration seam**: a `PredictiveDistribution`
-value object and an `IntervalPredictor` protocol, so a `ConformalWrapper` can be attached later
-without touching any model. That claim is exercised by a test, not asserted in a docstring.
+The operational metric, and the reason this project does not report RMSE alone. A quiescent
+window is an interval in which roll, pitch and heave rate all stay inside landing limits long
+enough to get an aircraft down. Two threshold sets, and two decision rules: the **point** rule
+flags a window when the point forecast is inside limits, the **interval** rule flags it when the
+whole 90 % predictive interval is.
 
-**Gate 5 passes at its registered cell.** PICP@90 within [0.85, 0.95] on `id`, read at pitch /
-10 s -- the cell Gates 3 and 4 are read at, registered in `docs/protocol.md` P5-D2 **before the
-sweep ran** -- is 6 of 6. Across every `id` cell it is **102 of 216**.
+Mean F1 over the scorable cells of each regime, ± the spread across the three training seeds
+(closed-form models are deterministic and marked `det.`). **The base rate is printed beside every
+F1**,
+because an F1 without it is uninterpretable — the strict base rate on `unseen_seastate` is 0.0245,
+and almost any number looks impressive against that. `always_quiescent` and `rate_matched`
+(chance timing at the true onset rate) are forecast-free nulls and apply to either rule:
 
-Two of those six pass on a seed mean whose own realization bootstrap reaches below the band floor
-(`dlinear_gaussian` `picp_ci_lo` 0.8489, `dlinear_quantile` 0.8410). The verdict is taken on the
-mean, which is the registered rule, but the interval belongs beside it. Note also that the DLinear
-rows' seed std is 1e-4 to 2e-4 against a realization CI half-width of 0.016 -- the pinball
-objective on a linear model is convex, so three seeds land in the same place and "exceeds the seed
-std" is not a meaningful test for those rows.
+| regime | thresholds | base rate | best **interval** | best **point** | `always_quiescent` | `rate_matched` |
+|---|---:|---:|---|---|---:|---:|
+| `id` | permissive | 0.5655 | `dlinear_gaussian` **0.4405** ± 0.0012 | `lstm_quantile` 0.2724 ± 0.0230 | 0.0406 | 0.0463 |
+| `id` | strict | 0.3494 | `lstm_gaussian` **0.4211** ± 0.0061 | `lstm_quantile` 0.1939 ± 0.0255 | 0.0143 | 0.0144 |
+| `unseen_seastate` | permissive | 0.2068 | `tcn_gaussian` **0.3749** ± 0.0106 | `lstm_gaussian` 0.1666 ± 0.0037 | 0.0352 | 0.0419 |
+| `unseen_seastate` | strict | 0.0245 | `lstm_gaussian` **0.3863** ± 0.0107 | `lstm_gaussian` 0.1443 ± 0.0040 | 0.0042 | 0.0054 |
+| `unseen_heading` | permissive | 0.5227 | `dlinear_gaussian` **0.4292** ± 0.0010 | `damped_persistence` 0.1998 (det.) | 0.0382 | 0.0455 |
+| `unseen_heading` | strict | 0.3511 | `tcn_gaussian` **0.2031** ± 0.0238 | `dlinear_ols` 0.0798 (det.) | 0.0132 | 0.0136 |
+| `unseen_vessel` | permissive | 0.6686 | `dlinear_gaussian` **0.4149** ± 0.0038 | `damped_persistence` 0.2119 (det.) | 0.0404 | 0.0478 |
+| `unseen_vessel` | strict | 0.4296 | `tcn_gaussian` **0.2748** ± 0.0027 | `tcn_quantile` 0.0980 ± 0.0008 | 0.0167 | 0.0224 |
 
-### Coverage under distribution shift -- the finding
+Four readings, three of them unflattering:
 
-Median PICP@90 over each regime's 36 cells. Nominal is 0.90:
+1. **The interval rule roughly doubles the point rule in every regime.** Requiring the whole band
+   to clear the limit is a materially better detector than requiring the median to. That is the
+   clearest operational argument in this project for carrying a predictive distribution at all.
+2. **`persistence` and `window_mean` score F1 = 0.0000 in every cell.** They never fire. The
+   skill-score denominator of the entire project is useless at the task the project exists for.
+3. **The best F1 anywhere is 0.44**, and 0.20 on `unseen_heading` under strict limits. The
+   detectors beat the nulls by a wide margin and are doing real work, but this is not a solved
+   problem.
+4. **The false-alarm rate is what the F1 hides.** For the best-F1 model in each row above it runs
+   **2.6–41.7 per minute on the point rule** and **0.3–5.6 on the interval rule**. Across all
+   models and all scorable cells the medians are 16.7 and 2.8 per minute, with maxima of 117.0 and
+   60.0. A detector firing 40 times a minute cannot be acted on, and the point rule exceeds 20 per
+   minute in four of the eight rows.
 
-| model | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` |
-|---|---:|---:|---:|---:|
-| `dlinear_quantile` | 0.903 | 0.620 | 0.939 | 0.943 |
-| `dlinear_gaussian` | 0.925 | 0.660 | 0.960 | 0.963 |
-| `tcn_quantile` | 0.969 | 0.706 | 0.244 | 0.663 |
-| `tcn_gaussian` | 0.958 | 0.689 | 0.405 | 0.548 |
-| `lstm_quantile` | 0.958 | 0.390 | 0.206 | 0.325 |
-| `lstm_gaussian` | 0.951 | 0.534 | 0.189 | 0.433 |
+**Scorability is a property of the cell, not of the sea state.** On `id` at permissive thresholds,
+54 of 288 cell-rows have nothing to detect — the deck never leaves limits, base rate 1.0, zero
+onsets. All 54 are SS3. Those render `not scorable`, never F1 = 0 (which reads as model failure)
+and never F1 = 1 (which reads as a perfect detector). An earlier version of this analysis pooled
+them into a sea-state roll-up and was retracted whole; F1 is never pooled across sea states
+anywhere in this project.
 
-**Withholding a sea state breaks every model.** Only **5 of 216** `unseen_seastate` cells stay in
-band. At the gate cell `lstm_quantile` reads 0.912 against **0.399** -- an interval sold as 90%
-covering 40% of the time.
+![Lead-time distribution, SS5 beam seas, strict limits](results/quiescence_lead_time_hist.png)
 
-Read that as a contrast between **two separately trained models**, not one model evaluated off
-its distribution: `build_split` gives the `id` model seeds 0-31 of every cell *including* SS6,
-while the `unseen_seastate` model trains on SS3-SS5 only. The training corpus changed as well as
-the test set. Precisely: a model trained without SS6 covers 0.40-0.66 on SS6, against 0.86-0.92
-for a model trained with it.
+Lead time — how far ahead of a true onset the model flagged it — is what decides whether a
+detection is actionable at all: a correct call issued 0.2 s before touchdown gives the controller
+nothing to work with. For the best-F1 model in each row above, the per-cell median lead averaged
+over that row's scorable cells runs **0.49–3.02 s on the interval rule** and **0.53–7.70 s on the
+point rule** (these are means of per-cell medians, not medians of the pooled distribution) — the point rule buys its longer leads
+with the precision and false-alarm rates above, which is not a trade a landing decision can make.
 
-The mechanism is visible only in the sharpness column. Absolute widths mostly *grow* under shift,
-which looks like adaptation. Measured against the scored partition's own spread (`width_ratio`,
-where 1.0 is an unconditional interval matched to that spread), they do not: `lstm_quantile`
-0.034 -> 0.044, and `dlinear_quantile` actually *falls*, 0.319 -> 0.110. SS6 motion is far larger
-than the SS3-SS5 the heads were fitted on and the learned width does not scale with it. **The head
-memorised an amplitude rather than learning a conditional one.** This is exactly the
-coverage-under-domain-shift story that motivates split conformal calibration, which is what the
-seam in `heads.py` exists for. It is reported, not corrected.
+**And the metric could not be compared across generators at all.** Quiescence thresholds are
+absolute (3.0° / 2.0° / 0.8 m/s), and our generator runs **1.0–2.3x hot depending on channel and
+heading** — 1.01x, 1.28x and 1.32x at bow-quartering against 2.27x and 2.34x in head seas, with the
+per-speed spread inside the bow-quartering roll row alone running 0.61x to 1.54x — so the same
+limits classify far more of the MSS record as landable — in head seas the MSS deck *never leaves limits*, base rate
+1.0000, nothing to detect, against a corpus base rate of 0.655 in the same cell. Skill is a ratio
+and was untouched by the amplitude gap; the operational metric was dominated by it to the point of
+becoming undefined. That is the sharpest result in Phase 8 and it is a methodological one.
 
-**DLinear is the best-calibrated family on three regimes of four.** Cells inside the band, of 36:
+## Prediction intervals: the trivial baseline wins in distribution
 
-| model | `id` | `unseen_seastate` | `unseen_heading` | `unseen_vessel` |
-|---|---:|---:|---:|---:|
-| `dlinear_quantile` | **21** | 0 | **19** | **19** |
-| `dlinear_gaussian` | 19 | 0 | 15 | 11 |
-| `lstm_gaussian` | 18 | 0 | 0 | 2 |
-| `lstm_quantile` | 16 | 0 | 0 | 0 |
-| `tcn_gaussian` | 15 | **2** | 3 | 4 |
-| `tcn_quantile` | 13 | **3** | 0 | 5 |
+Six learned interval heads — quantile (nine levels, pinball loss, post-hoc sorting) and Gaussian
+(mean and log-variance, NLL) — on three backbones. **Gate 5 passes at its pre-registered cell**
+(PICP@90 within [0.85, 0.95] at pitch / 10 s on `id`, 6 of 6) and **does not pass across the
+surrounding table** (102 of 216). Both readings are reported; the second is not a footnote.
 
-**`unseen_seastate` is the exception and it is not a small one**: every family scores zero cells in
-band, and by median departure from nominal TCN is least bad (0.195 and 0.211) while
-`dlinear_quantile` is *fourth* of six at 0.280. Nothing reverses -- an earlier draft claimed the
-ordering flips out of distribution, generalising from the single gate cell -- but the corrected
-sentence was itself first written as "best in every regime" and supported by a comparison against
-`lstm_quantile` alone, the one row that is 0 everywhere out of distribution. Both are withdrawn
-(P5-D17, P5-D20), which is why all six rows are printed above rather than two.
+The comparison that matters is against a floor. `residual_interval` is an empirical-residual band
+fitted on the validation split around a closed-form point forecast — no learned width, nearly
+free. Cells inside the Gate 5 band:
 
-**Two things must travel with that count, and the second undoes most of it.**
+| regime | `residual_interval` floor | best learned head | all six heads |
+|---|---:|---:|---:|
+| `id` | **36 of 36** | `dlinear_quantile` 21 of 36 | 102 of 216 |
+| `unseen_vessel` | **26 of 36** | `dlinear_quantile` 19 of 36 | 41 of 216 |
+| `unseen_heading` | 12 of 36 | `dlinear_quantile` 19 of 36 | 37 of 216 |
+| `unseen_seastate` | **0 of 36** | — | 5 of 216 |
 
-*DLinear buys coverage with width, except where it matters most.* Its intervals are far wider
-relative to signal spread than the sharpest deep model's on `id` (median `width_ratio` 0.319
-against 0.034, **9.4x**) and on `unseen_vessel` (**13.6x**), less so on `unseen_heading`
-(**3.4x**) -- and on **`unseen_seastate` the advantage is nearly gone at 2.5x**, falling to 1.09x
-against `lstm_gaussian`. So "best calibrated" means "least badly calibrated at a sharpness the deep
-models beat by an order of magnitude" on two regimes, and much less than that on the regime where
-every family fails.
+**In distribution the trivial baseline is perfectly calibrated and every learned head is not** —
+36 of 36 against a best of 21. **And the proper score disagrees, decisively.** Median Winkler on
+`id`, which scores location and sharpness jointly (lower is better): floor 1.5897, `lstm_gaussian`
+**0.1714**, `tcn_quantile` 0.2848 — the deep heads beat the floor by roughly 9x — while
+`dlinear_gaussian` 2.1353 and `dlinear_quantile` 2.0937 *lose* to it. The floor buys its coverage
+with width. Reporting either column alone would support a confident and opposite conclusion, so
+both are printed.
 
-*The proper scoring rules rank it last.* `probabilistic.csv` also carries **Winkler** and **CRPS**,
-which score location and sharpness jointly rather than leaving the trade-off to the reader. Mean
-rank of six, by Winkler (CRPS gives the same ordering except on `unseen_vessel`, where
-`dlinear_quantile` at 2.92 and `tcn_gaussian` at 3.22 swap 2nd and 3rd):
+**Coverage collapses under sea-state shift, and the floor collapses with it.** Only the TCN family
+scores any cell in band there — 5 of 72, `tcn_quantile` 3 and `tcn_gaussian` 2 — while DLinear and
+LSTM score zero of 72, and so does the residual-interval floor, down to PICP 0.2202 on heave at
+5 s. A band fitted on SS3–SS5 residuals is the wrong width for SS6 however it
+was obtained. This is reported, not fixed.
 
-| regime | best -> worst |
-|---|---|
-| `id` | `lstm_g` 1.75, `lstm_q` 1.94, `tcn_g` 2.97, `tcn_q` 3.36, **`dlinear_q` 5.36, `dlinear_g` 5.61** |
-| `unseen_seastate` | `tcn_g` 1.61, `tcn_q` 1.64, `lstm_g` 3.78, `dlinear_g` 4.11, `dlinear_q` 4.58, `lstm_q` 5.28 |
-| `unseen_vessel` | `tcn_q` 2.06, `tcn_g` 3.00, `dlinear_q` 3.03, `lstm_g` 3.89, `dlinear_g` 3.94, `lstm_q` 5.08 |
-| `unseen_heading` | `dlinear_q` 1.22, `dlinear_g` 1.83, `tcn_g` 3.19, `tcn_q` 4.22, `lstm_q` 5.00, `lstm_g` 5.53 |
-
-**DLinear is last on `id` and mid-table out of distribution; it wins only on `unseen_heading`, the
-floored regime.** So the coverage-in-band ranking and the two proper scores disagree almost
-everywhere, and reporting only the first would have been choosing the metric that suited the
-story.
-
-### What Gate 5 does not say
-
-**The gate is read in the band where the heads look best.** Cells in band on `id`, split by lead
-time:
-
-| band | `dlinear_q` | `dlinear_g` | `tcn_q` | `tcn_g` | `lstm_q` | `lstm_g` |
-|---|---:|---:|---:|---:|---:|---:|
-| **1-5 s** (24 cells) -- the operational band this project exists to serve | **12** | 10 | 1 | 3 | 4 | 6 |
-| **10-15 s** (12 cells) -- where Gate 5 is read | 9 | 9 | **12** | **12** | **12** | **12** |
-
-The four deep rows are **perfectly calibrated at 10-15 s and systematically over-cover at 1-5 s**,
-where 18 to 23 of their 24 cells sit above 0.95 -- while being 5.9x (`tcn_quantile`) to 8.9x
-(`lstm_quantile`) sharper than `dlinear_quantile` in that band. None sits below 0.85, so the failure is
-conservative -- but it is a failure, and it is in the band the landing decision is taken in. The
-cause is P3-D1: this corpus is nearly deterministic at short lead, so the residual is tiny and the
-learned interval, though only ~3% the width of an unconditional one, is still wider than warranted.
-Reading A's cell was fixed in advance, so this is not cell-picking -- but "the heads are well
-calibrated in-distribution" is true at the gate cell and false across the operational band, and the
-band belongs next to the claim.
-
-**An advance prediction was wrong, and the correction is the more interesting result.** P5-D6
-predicted, before the sweep, that `unseen_heading` pitch would show near-perfect coverage at
-meaningless width, for the P1-D2 residual-floor reason. At that cell (pitch, 10 s) it holds exactly
-for DLinear -- **1.000** coverage at `width_ratio` 11.8 -- and is wrong for the deep heads, which
-**under**-cover at **0.500, 0.570, 0.612 and 0.832** while themselves sitting 4.3-8.5x wider than
-unconditional. Those deep figures carry very large seed spreads (`lstm_gaussian` 0.570 +/- 0.305),
-and the qualifier is pitch specifically: at the same cell DLinear covers 0.890 on roll and 0.919 on
-heave. The prediction reasoned about interval width and silently assumed the interval stays
-centred on the target. It does not: the deep models import cross-channel structure and impose a
-roll-driven amplitude on a channel that has none (point skill there is **-132.3 +/- 41.4** and
-**-337.0 +/- 121.5** against `dlinear_ols`'s +0.577, on a channel whose `signal_std` is 0.093 deg,
-i.e. the P1-D2 floor itself), and a wide interval centred in the wrong place still misses.
-Coverage depends on location and width jointly. Recorded in full as P5-D13, and the entry was
-written in advance precisely so that being wrong would be visible.
-
-That correction generalises: on the four channels the residual floor does *not* touch, the deep
-heads still cover only **17-29%** of targets on `unseen_heading` while forecasting those channels
-well (roll at 10 s: `tcn_gaussian` 0.796 skill). This is a real heading-generalisation failure of
-the intervals, not the corpus artifact.
-
-### Two smaller results
-
-**The heads carry no measurable point-accuracy cost.** Every probabilistic row also ships RMSE and
-skill against the same persistence denominator as every other row in the project. Against the
-Phase 4 point rows on `id` the quantile heads come out marginally ahead -- `lstm_quantile` in 36
-of 36 cells, `tcn_quantile` in 34 of 36, median +0.0029 and +0.0011 -- and the difference does
-exceed the combined seed spread in 33-36 of 36 cells.
-
-**That is stated as "no cost", not as "better", because three confounds all push the same way** and
-together are larger than the effect. `lstm` in Phase 4 early-stopped at 32/33/34 epochs while
-`lstm_quantile` here ran 37/60/60, so the quantile row got roughly twice the optimisation -- and
-P4-D9 measured that truncation as costing `lstm` 7.4%, an order of magnitude more than the gain
-claimed. The heads are not parameter-matched (1 246 628 against 317 828). And the point projection
-is the median of the **sorted** fan, so where the raw fan crosses it is partly an order-statistic
-smoother, which lowers RMSE by itself. The comparison is also across two separate sweeps with no
-paired resample. It is *not* across a behaviour change in the point path: `tcn` re-fitted at
-`head=point` under Phase 5 code reproduces its Phase 4 row **bitwise**, 108 of 108 cells
-(P5-D19).
-
-Not all six rows gain: **`dlinear_gaussian` loses to `dlinear` in 28 of 36 `id` cells.**
-
-**Post-hoc quantile sorting is not cosmetic.** At the gate cell the crossing rate is 5e-6 to
-0.0038, which reads as a no-op. Over the full table `dlinear_quantile`'s raw fan is inverted on a
-median 6% of elements and, in its worst cell, **96.6%**. It is a short-horizon phenomenon --
-0.563 at a 1 s lead against 0.000 at 15 s -- because the predictive spread at short lead is so
-small that nine levels squeezed into it are numerically indistinguishable. The sort does real work
-in the 1-5 s band and nowhere else.
-
-### Limitations specific to this phase
-
-- **There is no probabilistic baseline anywhere in this phase, and it is the largest gap.** All
-  five non-head rows in `e03` are point models, so `probabilistic.csv` holds six learned heads and
-  nothing else. Non-negotiable 4 -- "a result without its persistence baseline is not a result" --
-  is satisfied for the point column and **has no analogue for the coverage column**: a reader
-  cannot tell whether 102 of 216 is good, because nothing trivial was measured on that axis. An
-  empirical-residual interval around `persistence` or `dlinear_ols`, fitted on the validation
-  split, is closed-form and nearly free, and would be near-perfectly calibrated on `id` by
-  construction. Recorded, not fixed (P5-D17).
-- **Nothing here is calibrated.** `heads.py` provides the seam a `ConformalWrapper` attaches to and
-  a test proves the seam composes, but no conformal calibration is run -- that is Project 6. These
-  are **uncalibrated heads**; the project deliverable "calibrated prediction intervals" is not yet
-  met.
-- **The coverage numbers carry less certification than the skill numbers.** The shuffle control
-  refits AR(20), a *point* model, so it certifies the point pipeline the heads are built on. No
-  shuffled-target head is fitted anywhere, and the untrained control runs on a quantile model's
-  *median*. **There is no leakage control and no untrained control on an interval** (P5-D10).
-- **The degradation deltas are unpaired and carry no interval.** Two regimes score different
-  realizations, so no common bootstrap resample exists. Each side carries its own CI; the delta
-  carries none, deliberately (P5-D12).
-- **The heads are not parameter-matched.** The final projection widens with the head, so a quantile
-  row carries ~9x the head parameters of its point twin (`lstm` 317 828 -> 1 246 628). A
-  head-vs-head or head-vs-point difference is not an architecture result (P5-D5).
-- `best_val_loss` is not comparable across heads -- each model is early-stopped on its own
-  objective, named in `val_loss_name` (P5-D4).
-- **Short-horizon calibration here is not measuring wave uncertainty.** The generator has no
-  process noise, so at 1-5 s the correct predictive distribution is close to a point mass -- AR(20)
-  reaches 0.99998 skill on `id`/heave at 1 s. PICP@90 in that band scores a model's ability to
-  calibrate its own optimisation residual, not aleatoric uncertainty, and will not transfer.
-- The Phase 4 caveat that a linear forecaster is **optimal for this corpus by construction**
-  (P4-D16) applies here unchanged, and the no-process-noise ceiling makes every interval sharper
-  than one fitted to real deck motion would be.
-
-`docs/protocol.md` §Phase 5 is the full decision log: P5-D1 to P5-D8 were written *before* the
-sweep, P5-D13 to P5-D16 record what the sweep falsified.
+**These are uncalibrated heads.** `src/dmf/models/heads.py` provides the seam a split-conformal
+wrapper attaches to, and a test proves the seam composes, but **no conformal calibration is run**.
+The project deliverable "calibrated prediction intervals" is not met.
 
 ## Inference latency -- ONNX export and the CPU-versus-GPU question
 
@@ -491,88 +384,160 @@ in this section comes from anywhere but this machine; no speedup multiple is quo
 ratio of two rows in `results/latency.csv`, and `make gate7` checks that mechanically. All results
 are from **simulated** vessel motion.
 
-## Phase 8 -- cross-validation against an independent hydrodynamic model
-
-Every number above comes from one simulator, and two protocol entries already said that prejudges
-the headline: P4-D16 ("the corpus makes a linear forecaster Bayes-optimal by construction") and
-`configs/sim/vessels/s175.yaml`, which admits the held-out hull is "a reduced-order stand-in ...
-not a strip-theory computation of the S-175's actual RAOs". Phase 8 tests the models against the
-computation that file says it is not: the MSS toolbox's ShipX strip-theory motion RAOs for the same
-ITTC S-175, under a JONSWAP matched to SS5. Because the corpus already holds the S175 out as
-`unseen_vessel`, the same checkpoints, normalisation statistics and task apply to both -- only the
-generator changes.
-
-**Both sides are simulations.** MSS is another simulator, not a measurement of a real deck. This
-bounds generator-specific overfitting; it says nothing about fidelity to a real ship.
-
-### The result: one model family transfers, and it is not the one the gates favour
-
-Pitch at 10 s, the cell Gates 3-5 are read at, against the committed `unseen_vessel` rows:
-
-| model | corpus | MSS | change |
-|---|---|---|---|
-| `dlinear` | 0.4144 | **0.3935** | -0.021 |
-| `dlinear_ols` | 0.4904 | **0.3835** | -0.107 |
-| `ar20` | 0.5258 | 0.1560 | -0.370 |
-| `transformer` | 0.7654 | -0.1773 | -0.943 |
-| `ar40` | 0.5412 | **-0.7243** | -1.266 |
-| `tcn` | 0.8604 | **-0.9033** | -1.764 |
-| `lstm` | 0.8032 | **-1.5564** | -2.360 |
-
-The DLinear family loses 0.02-0.11 and everything else goes to or below persistence. In the 1-5 s
-operational band the split is the same: at 5 s in **heave**, the channel this project exists for,
-`dlinear_ols` holds 0.923 while `tcn` is at 0.011, `transformer` at -0.486 and `ar40` at -4.275.
-
-**The dividing line is not linear versus deep.** `ar40` is linear and per-channel, it *beats*
-`dlinear_ols` on the corpus, and it transfers worse than `transformer`. P3-D1 explains it, two
-phases early: this corpus has no process noise, so its motion satisfies an exact linear recursion
-and AR *identifies the system*. A system identifier transfers to that system and nothing else, and
-identifying harder is worse -- `ar40` loses 1.27 where `ar20` loses 0.37. The deep models do the
-same implicitly; DLinear is too constrained to do it at all.
-
-**This lands on the gate cell.** Gates 3, 4 and 5 are all read at pitch / 10 s. There the deep
-models beat `dlinear_ols` by 0.37 on the corpus and lose to it by 1.29 on MSS. Read together with
-the 1-5 s table above, the deep models' advantage is concentrated exactly where it does not
-transfer.
-
-### What the controls rule out
-
-The wave-field discretisation is not the cause: re-running with the corpus's own wave grid and MSS's
-RAOs moves skill by -0.04 to -0.19 for every model, same direction. Normalisation range is not the
-cause either: rescaling MSS channels to corpus RMS leaves `dlinear_ols` exactly unchanged (skill is
-scale-invariant) and moves everything else in both directions, by -13.4 to +2.3 depending on DOF.
-What remains is the hull response itself.
-
-One concrete defect was found in our simulator while building the bridge, before any model was run:
-`src/dmf/sim/response.py` applies a **real** wave-slope excitation, so roll and pitch come out in
-phase with heave where strip theory puts them in quadrature (measured 0.1 deg against 87.8 deg).
-Amplitudes are correct and every Gate 1 invariant still holds, because a common phase rotation
-within one channel does not change its spectrum. It is unfixed -- fixing it invalidates the corpus
-and Phases 2-7 -- and it is not sufficient on its own to explain the AR result.
-
-### The operational metric could not be compared at all
-
-Quiescence detection is threshold-based on absolute limits (3.0 deg / 2.0 deg / 0.8 m/s). Our
-generator runs ~2x hot, so those same limits classify far more of the MSS record as landable: at
-permissive thresholds in head seas the MSS deck **never leaves limits** -- base rate 1.0000, zero
-onsets, nothing to detect -- against a corpus base rate of 0.655 in the same cell. Two of six
-permissive cells are unscorable outright.
-
-This is the sharpest result in the phase and it is a methodological one. Skill is a ratio and was
-completely unaffected by the amplitude gap; the operational metric, the one this project exists to
-serve, was dominated by it. Where the metric *is* scorable the ordering matches the accuracy
-finding -- `dlinear`/`dlinear_ols`/`ar40` on top, the deep models below -- but chance-timing
-(`rate_matched`) beats `transformer` at four of six strict cells, so those rows are not detecting
-anything measurable.
-
-Full write-up including the statistical comparison of the two generators, the Octave parity check
-(the NumPy bridge reproduces MSS's own `waveMotionRAO.m` to 4.4e-12), and the corrections made after
-the Gate 8 review: `docs/mss_crossvalidation.md`, protocol entries P8-D1 to P8-D15.
-
-## Quickstart
+## Reproducing this
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-make lint && make test
+make lint && make test        # ruff + mypy, then the test suite -- minutes
+make all                      # the whole project from nothing -- about 7 days
 ```
+
+`make all` is the full sequence: generate the corpus, run every training sweep, re-score the
+matched-origin arms, assemble and render `results/results.md`, read Gates 4–7, run the Phase 8
+cross-validation, and regenerate the figures. It totals **about 163 hours on one RTX A4000** —
+call it a week. This is not an afternoon:
+
+| stage | target | wall clock | source |
+|---|---|---|---|
+| corpus generation (2304 realizations, 1.1 GB) | `make data` | ~15 min at 24 workers | `docs/corpus_card.md` |
+| baselines, `ideal` + `imu` | `make sweeps` | **7.15 h** | logged |
+| deep models (e02) | `make sweeps` | ~31 h | protocol prose |
+| probabilistic heads (e03) | `make sweeps` | ~66 h | protocol prose; 60.65 h traceable as summed fit time |
+| ablations, deep arms (e04) | `make sweeps` | **48.29 h** | logged |
+| ablations, cheap arms + re-score + residual floor | `make sweeps` | **1.20 h** | logged |
+| evaluation and render, end to end | `make gate6-full` | **8.76 h** | logged |
+| ONNX export, parity, two latency sweeps | `make bench` | ≥ 32 min of timed iterations | derived from `results/latency.csv` |
+| MSS cross-validation | `make mss` | not recorded | — |
+
+**Only the four bold rows are traceable from a clone.** They come from
+[`results/runtime_stages.csv`](results/runtime_stages.csv), which `scripts/collect_runtimes.py`
+derives from the stage logs; those logs live under `artifacts/`, which is gitignored, so the CSV is
+the committed record. The e02 and e03 sweeps predate that convention and their figures come from
+`docs/protocol.md` prose — and e03's wall clock is not traceable even there, because its sweep log
+was captured empty, leaving only the 60.65 h that `fit_time_s` sums to. The `make bench` figure is
+the part that can be reconstructed from a committed table (52 configurations x 2200 iterations at
+their measured mean, twice) and excludes export, parity checking, TensorRT engine builds and the
+thread sweep, so the real number is larger. `make mss` was never timed. Rather than quote figures
+nothing supports, this table says which rows are measured and which are not.
+
+Most individual pieces are far cheaper than the whole. Useful partial targets:
+
+| command | what it does | needs |
+|---|---|---|
+| `make test` / `make lint` | test suite; ruff + mypy | nothing |
+| `make figures` | re-render both figures from the committed trace and CSVs | nothing |
+| `make report` | re-render `results/latency.md` and the Pareto figure from the CSVs | nothing |
+| `make eval` | re-score from committed checkpoints and rebuild `results/results.md` | corpus + checkpoints |
+| `make gate4`, `make gate5`, `make gate7` | re-read each gate from its committed artifacts | nothing |
+| `make gate6-full` | re-score, re-render `results.md`, then read Gate 6 | corpus + checkpoints |
+
+`make figures`, `make report` and gates 4, 5 and 7 read committed artifacts only — no corpus, no
+checkpoints, no GPU. **`make gate6` is the exception and is not in that list**: predicate 1 has no
+artifact to read without an `eval` exit status, so run alone it reports 6 of 7 and overwrites the
+committed `results/gate6.csv` with that weaker verdict. Use `make gate6-full`, which runs `eval`
+first. That is deliberate: it makes "is this document a function of the committed
+tables?" a question anyone can answer in a second, and `make gate6` verifies that re-rendering
+`results/results.md` from the CSVs reproduces it byte for byte.
+
+**What is and is not in the repository.** `results/` is committed in full, including every figure
+and the 6 MB `results.md`. `artifacts/` — the 1.1 GB corpus, 335 MB of checkpoints, the ONNX
+graphs and the run logs — is gitignored and regenerated by `make data` and `make sweeps`. Seeds
+are fixed and recorded; the corpus is reproducible from `configs/sim/corpus.yaml` plus the seeding
+rule in [`docs/corpus_card.md`](docs/corpus_card.md).
+
+## Limitations
+
+Read these before reading any number above.
+
+**The simulation itself**
+
+- **Linear seakeeping throughout.** A linear RAO applied to a finite sum of sinusoids. No
+  nonlinear roll damping, no green water, no parametric resonance, no slamming.
+- **Unidirectional seas.** A single JONSWAP spectrum from one direction, with no directional
+  spreading and no swell / wind-sea bimodality. Real short-crested seas are not this.
+- **Fixed heading and speed within a realization.** No manoeuvring, no course or speed change, no
+  response to the sea state.
+- **No process noise anywhere in the generator.** This is the most consequential one. A finite sum
+  of sinusoids satisfies an exact linear recursion, so the Bayes-optimal forecaster for this corpus
+  **is linear, by construction**. "A closed-form linear model is competitive with three deep
+  architectures" is therefore a far weaker statement here than it would be on a stochastic process,
+  and says nothing about how these architectures would rank on real deck motion.
+- **A known, unfixed defect in the cross-DOF structure.** `src/dmf/sim/response.py` applies a
+  **real** wave-slope excitation, so roll and pitch come out in phase with heave where strip theory
+  puts them in quadrature — measured 0.1° against 87.8°. Per-DOF marginals are unaffected and every
+  Gate 1 invariant still holds, because a common phase rotation within one channel does not change
+  its spectrum. It is **not fixed**: fixing it invalidates the corpus and every result in Phases 2
+  through 7. The models have therefore been trained to exploit a roll/pitch/heave phase
+  relationship strip theory says is wrong by 90°, and that is carried openly rather than buried.
+- **Residual heading floors are an engineering stand-in, not a derived quantity.** The roll and
+  pitch heading factors carry a floor of 0.05, which puts an off-axis DOF about 26 dB down instead
+  of identically zero. It stands in for hull asymmetry and short-crested residual excitation. It
+  contaminates more downstream results than anything else in the project — most visibly the
+  `unseen_heading` regime, whose entire test set is beam seas.
+
+**The evaluation**
+
+- **Simulation only; no real-deck validation.** The Phase 8 cross-check is against *another
+  simulator*. It bounds generator-specific overfitting. It is not evidence about a real ship.
+- **The sea state is assumed known in the conditioning ablation.** That arm consumes privileged
+  information — at deployment the sea state is estimated online from the same motion record the
+  forecaster reads — so no row of it is a deployable result. It is also **not** an upper bound: it
+  costs mean skill on `unseen_seastate` — −0.0191 pooled over the arm, −0.0445 on `tcn` alone —
+  and a bound below the unconditioned baseline on the regime that matters bounds nothing.
+- **The intervals are not calibrated.** No conformal calibration is run anywhere.
+- **One integrity control is vacuous on one regime.** The interval shuffle control asserts on
+  222 of 432 rows; on `unseen_seastate` it asserts on **zero**. "Passed" there means nothing was
+  judged. Its tolerance was also changed after seeing the data (0.02 → 0.10) and is labelled as
+  such. Separately, the untrained-model control fails its literal criterion in 76 of 144 rows on the
+  reference arm — and in 23 to 107 rows on each of the other seven arms, worst on the
+  probabilistic one. It is **reported rather than enforced**, because the criterion is wrong for a
+  task where a zero-parameter window mean already beats persistence.
+- **Latency tails are not reproducible to the plan's own standard.** p50 is stable across two
+  independent sweeps in 52 of 52 configurations; **p99 drifts more than 10 % in 9 of 52**, worst
+  case 43.6 %. Claims in this README that depend on a tail are read as ties.
+- **Cell counts are a description of one table, not a hypothesis test.** Where this README counts
+  "wins in N of 144 cells", those cells are not independent and no multiplicity control is applied.
+- **Absolute latency does not transfer.** The GPU is a workstation RTX A4000 standing in for an
+  embedded target and the CPU is an 18-core i9-10980XE. Ratios between rows measured on the same
+  machine are the claim; the milliseconds are not.
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/findings.md`](docs/findings.md) | The phase-by-phase record, with every withdrawn claim beside the one that replaced it. Start here. |
+| [`docs/protocol.md`](docs/protocol.md) | The complete decision log, ~5200 lines. Every gate, every threshold change, every retraction, with what was measured. |
+| [`docs/corpus_card.md`](docs/corpus_card.md) | What the corpus contains, how it is generated, and how to reproduce it. |
+| [`docs/mss_crossvalidation.md`](docs/mss_crossvalidation.md) | Phase 8 in full: the Octave parity check, the two-generator comparison, and what the transfer failure does and does not show. |
+| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The original plan. Where it and the protocol disagree, the protocol is what happened. |
+| [`results/results.md`](results/results.md) | The machine-generated evaluation report — 20 tables, each naming its source CSV. **6 MB**; a reference, not a document to read front to back. |
+| [`results/latency.md`](results/latency.md) | The full deployment tables, provenance markers and environment stamp. |
+
+## Citations
+
+- **JONSWAP spectrum and sea-state parameterisation** — DNV-RP-C205, *Environmental Conditions and
+  Environmental Loads*, Det Norske Veritas. Hasselmann et al. (1973), *Measurements of wind-wave
+  growth and swell decay during the Joint North Sea Wave Project (JONSWAP)*, Deutsche
+  Hydrographische Zeitschrift A8(12).
+- **Vessel motion, RAOs and encounter frequency** — T. I. Fossen (2021), *Handbook of Marine Craft
+  Hydrodynamics and Motion Control*, 2nd ed., Wiley, chapters 10.2.1 and 10.2.3.
+- **MSS — Marine Systems Simulator** (T. I. Fossen and T. Perez), used in Phase 8 as an independent
+  strip-theory reference. Upstream is pinned at commit `98970f71a21cfe81e7e29abdcc1bb6741789cddc`
+  and is not vendored here; local modifications and their justification are documented in
+  [`mss/PATCHES.md`](mss/PATCHES.md).
+- **DLinear** — Zeng et al. (2023), *Are Transformers Effective for Time Series Forecasting?*, AAAI.
+- **TCN** — Bai, Kolter and Koltun (2018), *An Empirical Evaluation of Generic Convolutional and
+  Recurrent Networks for Sequence Modeling*, arXiv:1803.01271.
+- **Quantile regression / pinball loss** — Koenker and Bassett (1978), *Regression Quantiles*,
+  Econometrica 46(1).
+- **Winkler interval score and CRPS** — Gneiting and Raftery (2007), *Strictly Proper Scoring Rules,
+  Prediction, and Estimation*, JASA 102(477).
+
+## License
+
+MIT — see [LICENSE](LICENSE). This repository also redistributes one modified file from the
+MIT-licensed MSS toolbox, with its notice retained; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Simulated results only; no real deck data is used anywhere in this project.
