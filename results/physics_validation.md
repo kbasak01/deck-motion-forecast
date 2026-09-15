@@ -170,6 +170,16 @@ are synthesised from a **shared phase set**, so they carry genuine cross-DOF str
 rather than the 0.157 that independent phases would give. That structure is what a multivariate
 forecaster is supposed to exploit, and it exists in the corpus by construction.
 
+> **Added after Phase 8 — that cross-DOF structure is present but wrong by 90 degrees.** P8-D6
+> (`docs/protocol.md`) establishes that `src/dmf/sim/response.py` applies a **real** wave-slope
+> excitation where strip theory requires a factor of `i`, so roll and pitch come out in phase with
+> heave where an independent hydrodynamic model puts them in quadrature — measured 0.1 deg against
+> 87.8 deg. **No invariant on this page is affected**: a common phase rotation within one channel
+> does not change that channel's spectrum, and every per-DOF marginal above still holds. What is
+> wrong is the *relationship between* the channels, which is exactly what the paragraph above tells
+> a reader to rely on. The defect is unfixed — fixing it invalidates the corpus and Phases 2-7 —
+> and it is disclosed in the README's limitations.
+
 ## Reproducing
 
 ```

@@ -41,6 +41,41 @@ function [eta_WF, nu_WF, nudot_WF, waveElevation] = waveMotionRAO_seeded(...
 % Author:    Thor I. Fossen
 % Date:      2024-07-06
 % Revisions:
+%   2026-09-14, deck-motion-forecast: derived from waveMotionRAO.m. The random phases are
+%   supplied by the caller (`phasesIn`) instead of being drawn from a persistent
+%   rng(12345,"twister") seed, so that repeated calls produce independent realizations and
+%   so that the Octave and NumPy backends can be driven from an identical phase set. Three
+%   changes in total, all to the source of the phases; see mss/PATCHES.md. The patch is
+%   verified behaviour-preserving by scripts/mss_octave_check.py.
+%
+% ---------------------------------------------------------------------------------------
+% This file is a modified copy of LIBRARY/environment/waveMotionRAO.m from the Marine
+% Systems Simulator (MSS), https://github.com/cybergalactic/MSS, and is redistributed under
+% the MSS license, reproduced in full below. The modifications above are released under the
+% same terms.
+%
+% MIT License
+%
+% Copyright (c) 2004 Thor I. Fossen
+%
+% Permission is hereby granted, free of charge, to any person obtaining a copy
+% of this software and associated documentation files (the "Software"), to deal
+% in the Software without restriction, including without limitation the rights
+% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+% copies of the Software, and to permit persons to whom the Software is
+% furnished to do so, subject to the following conditions:
+%
+% The above copyright notice and this permission notice shall be included in all
+% copies or substantial portions of the Software.
+%
+% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+% SOFTWARE.
+% ---------------------------------------------------------------------------------------
 
 persistent RAO_re_values_interpolated RAO_im_values_interpolated;
 randomPhases = phasesIn;   % PATCH 2: phases from the caller, see mss/PATCHES.md
