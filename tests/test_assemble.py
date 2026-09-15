@@ -50,6 +50,7 @@ from dmf.eval.assemble import (
     build_reference_reproducibility,
     read_arm_rows,
 )
+from dmf.eval.conformal_runner import CONFORMAL_ARTIFACTS
 from dmf.eval.control_runner import CONTROL_ARTIFACTS
 from dmf.eval.report import (
     PHASE6_SUBDIR,
@@ -204,11 +205,29 @@ _PRODUCERS: dict[str, dict[str, str]] = {
     "dmf.eval.scoring": SCORING_ARTIFACTS,
     "dmf.eval.control_runner": CONTROL_ARTIFACTS,
     "dmf.eval.assemble": ASSEMBLED_ARTIFACTS,
+    "dmf.eval.conformal_runner": CONFORMAL_ARTIFACTS,
 }
 
 #: Sources that are deliberately not produced by any of them: committed audit trails, read
 #: and never regenerated. ``results/e03/probabilistic.csv`` is the Gate 5 record.
 _EXTERNAL_SOURCES: frozenset[str] = frozenset({"e03_heads"})
+
+
+#: Report sources whose candidate paths carry a directory prefix, so that matching them
+#: against a producer's bare file name needs the basename. ``conformal.csv`` is written by
+#: :mod:`dmf.eval.conformal_runner` into ``results/e05/`` and read by the renderer through
+#: ``../e05/conformal.csv``; comparing the two spellings directly would call a produced file
+#: an orphan.
+def _basenames(candidates: tuple[str, ...]) -> set[str]:
+    """Return the candidate paths reduced to bare file names.
+
+    Args:
+        candidates: Candidate paths as the renderer declares them.
+
+    Returns:
+        Their basenames.
+    """
+    return {Path(candidate).name for candidate in candidates}
 
 
 def _produced_files() -> set[str]:
@@ -219,7 +238,9 @@ def _produced_files() -> set[str]:
 def test_every_required_report_source_is_written_by_one_of_the_producers() -> None:
     produced = _produced_files()
     unproduced = [
-        spec.key for spec in REPORT_SOURCES if spec.required and not set(spec.candidates) & produced
+        spec.key
+        for spec in REPORT_SOURCES
+        if spec.required and not _basenames(spec.candidates) & produced
     ]
     # A required source with no producer is exactly the state Phase 6 was in: `make eval`
     # fails on the first missing file, which is correct behaviour and an unusable pipeline.
@@ -240,7 +261,7 @@ def test_every_rendered_source_has_a_producer_even_when_it_is_optional() -> None
         for spec in REPORT_SOURCES
         if spec.rendered
         and spec.key not in _EXTERNAL_SOURCES
-        and not set(spec.candidates) & produced
+        and not _basenames(spec.candidates) & produced
     ]
     assert not orphans, orphans
 
