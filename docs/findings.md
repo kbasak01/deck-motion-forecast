@@ -14,7 +14,12 @@ version was wrong.
 Where this file and `docs/IMPLEMENTATION_PLAN.md` disagree, the plan is the *original* plan and
 this is what happened.
 
-Status: **Phases 1–8 complete.** Gates 1, 2, 4, 6, 7 and 8 pass as written; Gate 3 failed as
+The adversarial counterpart to this document is [`docs/audit_report.md`](audit_report.md): a
+pre-release audit that returned three blocking findings, the §5 validation protocol worked through
+checkbox by checkbox, and the re-verification appended after the fixes. Two of the audit's own
+numbers did not reproduce and were not adopted; that is recorded there too.
+
+Status: **Phases 1–10 complete.** Gates 1, 2, 4, 6, 7 and 8 pass as written; Gate 3 failed as
 written and was restated at the same threshold; Gate 5 passes at its registered cell and does
 not pass across the surrounding table. Every one of those is unpacked below.
 
@@ -371,7 +376,10 @@ in the 1-5 s band and nowhere else.
 - **Nothing here is calibrated.** `heads.py` provides the seam a `ConformalWrapper` attaches to and
   a test proves the seam composes, but no conformal calibration is run -- that is Project 6. These
   are **uncalibrated heads**; the project deliverable "calibrated prediction intervals" is not yet
-  met.
+  met. *(Phase 5's reading, left as written. Phase 10 built the wrapper on that seam and closed the
+  deliverable in distribution -- and found it makes coverage worse under every shift. See
+  [Phase 10](#phase-10--split-conformal-calibration) below; the rows in this section are the
+  uncalibrated ones throughout and were never rewritten.)*
 - **The coverage numbers carry less certification than the skill numbers.** The shuffle control
   refits AR(20), a *point* model, so it certifies the point pipeline the heads are built on. No
   shuffled-target head is fitted anywhere, and the untrained control runs on a quantile model's
@@ -682,3 +690,58 @@ the Gate 8 review: `docs/mss_crossvalidation.md`, protocol entries P8-D1 to P8-D
 - [`docs/corpus_card.md`](corpus_card.md) — what the corpus contains and how to regenerate it.
 - [`results/results.md`](../results/results.md) — the machine-generated Phase 6 report. **6 MB**;
   it is the source of the tables above, not a document to read front to back.
+
+---
+
+## Phase 10 — split-conformal calibration
+
+**The deliverable that was missing.** `CLAUDE.md` listed "calibrated prediction intervals" among
+the project's deliverables and no conformal calibration was run anywhere; no phase had ever
+scheduled one. Phase 10 closes it, and the result is more interesting than the deliverable.
+
+Split conformal (CQR) fits one scale factor per (horizon, channel) on each regime's **validation**
+split and scales the head's predictive distribution about its own point forecast. Nothing is
+retrained. The arm is additive: the uncalibrated rows of Phase 5 are untouched, and Gate 10
+checks that by digest, because Gate 5 requires the out-of-distribution degradation to be reported
+rather than fixed.
+
+| regime | in-band | median PICP | cells worse | mean width | median Winkler |
+|---|---:|---:|---:|---:|---:|
+| `id` | 102 → **216**/216 | 0.9451 → 0.9001 | 1.9% | −17.5% | −3.5% |
+| `unseen_seastate` | 5 → **0**/216 | 0.6099 → 0.5118 | 87.0% | −18.5% | +11.1% |
+| `unseen_heading` | 37 → **27**/216 | 0.4940 → 0.4613 | 77.8% | −17.6% | +5.2% |
+| `unseen_vessel` | 41 → **59**/216 | 0.6910 → 0.6308 | 78.2% | −16.9% | +4.1% |
+
+**In distribution it is exact, and that is a correctness check rather than a finding.** Every one
+of 216 cells lands in band and the six heads sit within 0.0025 of nominal at the gate cell — the CQR
+guarantee arriving on schedule, which Gate 10 predicate 4 reads as a check on the implementation.
+The part that was not guaranteed is that the intervals come out 17.5% *sharper*: the uncalibrated
+heads were over-covering and paying for it in width.
+
+**Under shift it is worse than doing nothing.** Coverage moves further from nominal in 78–87% of
+cells, the proper score worsens in all three shifted regimes, and `unseen_seastate` goes to zero
+cells in band.
+
+**Why, in one column.** The width change is nearly identical in all four regimes, −16.9% to
+−18.5%. The scale is always fitted on validation data, which is always in-distribution because
+validation is carved from the complement of the held-out condition. Calibration therefore applies
+the same correction everywhere; only the test set differs. Validation says "too wide" and is
+right in distribution; the shifted test set needed "wider". The procedure narrows confidently in
+the wrong direction and cannot detect that it has done so.
+
+**A second arm was promised and never built.** P10-D1 committed to a per-level *additive* arm
+beside the multiplicative one, and said "both arms are reported". Only the multiplicative arm
+exists. That is an omission rather than a decision — no measurement argued against it — and it is
+recorded in P10-D4 so that "two of four predictions falsified" is not read as a complete accounting
+of the pre-registration.
+
+**Two of four pre-registered predictions were falsified, and a third missed its interval by one
+cell.** `unseen_seastate` was predicted to
+improve to 20–80 cells in band and instead went to 0 — the falsification criterion written in
+P10-D1 only guarded the direction where the arm worked *better* than expected, which is a defect
+in the pre-registration. `unseen_heading`'s count was predicted correctly and its stated
+mechanism was wrong. Both are recorded in P10-D2 beside the predictions they replace.
+
+**One reading needs care.** `unseen_vessel`'s in-band *count* rises while its median coverage
+falls and 78% of its cells get worse: the count and the distribution move in opposite directions,
+so the count alone would misdescribe it.

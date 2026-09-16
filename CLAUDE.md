@@ -4,8 +4,9 @@
 
 Short-horizon (1–5 s) forecasting of 6-DOF ship deck motion (roll, pitch, heave) from JONSWAP-driven
 vessel simulation, for timing a quadrotor touchdown on a heaving deck. Deliverables: a reproducible
-simulator, six forecasting models, an operational evaluation, calibrated prediction intervals, and an
-ONNX latency study.
+simulator, six forecasting models, an operational evaluation, split-conformal calibrated prediction
+intervals (exact in distribution; characterised where the calibration stops working under shift),
+and an ONNX latency study.
 
 Full spec: `docs/IMPLEMENTATION_PLAN.md`. Read the phase you are working in before writing code.
 

@@ -1415,6 +1415,18 @@ REPORT_SOURCES: tuple[ReportSource, ...] = (
         required=False,
     ),
     ReportSource(
+        key="conformal",
+        candidates=("../e05/conformal.csv", "e05/conformal.csv"),
+        what=(
+            "the split-conformal arm (Phase 10): the same six heads with one conformal "
+            "scale per (horizon, channel) fitted on each regime's validation split. Its "
+            "labels carry a `_conformal` suffix and are disjoint from the uncalibrated "
+            "ones, so section 6.5 reads the two side by side rather than replacing one "
+            "with the other"
+        ),
+        required=False,
+    ),
+    ReportSource(
         key="reproducibility",
         candidates=("reference_reproducibility.csv",),
         what="the RevIN arm's closed-form rows against results/e02/ (P6-D13)",
@@ -3475,6 +3487,105 @@ def _section_probabilistic(loaded: Mapping[str, LoadedSource], results_dir: Path
     return parts
 
 
+#: Suffix that keys a calibrated row back to the uncalibrated one it was built from. Kept in
+#: one place because the contrast below is a join on the stripped label, and a suffix that
+#: disagreed with :data:`dmf.eval.conformal_runner.CONFORMAL_SUFFIX` would silently produce an
+#: empty contrast rather than an error.
+CONFORMAL_LABEL_SUFFIX: str = "_conformal"
+
+#: Keys one calibrated row to its own uncalibrated row. Unlike the floor contrast, this join
+#: keeps ``model`` -- the comparison is a head against *itself*, not against a shared floor.
+CONFORMAL_JOIN_KEYS: tuple[str, ...] = ("model", "regime", "dof", "horizon_samples")
+
+
+def build_conformal_contrast(conformal: pd.DataFrame, heads: pd.DataFrame) -> pd.DataFrame:
+    """Difference each calibrated row against the uncalibrated row it was built from.
+
+    **This contrast is paired and the cross-regime ones are not.** P5-D12 records why
+    ``coverage_degradation`` ships its deltas without an interval: ``id`` and
+    ``unseen_seastate`` score different realizations, so there is no common resample to draw.
+    Here both sides are the *same model* on the *same test partition* -- only the
+    post-processing differs -- so the difference is a within-cell quantity and reading it as
+    one is correct rather than the P3-D13 error in new clothes.
+
+    Args:
+        conformal: The aggregated calibrated table (``results/e05/conformal.csv``).
+        heads: The aggregated uncalibrated table (``results/e03/probabilistic.csv``).
+
+    Returns:
+        One row per calibrated row, carrying the uncalibrated coverage and width beside the
+        calibrated ones and their differences. A calibrated row with no uncalibrated partner
+        is **kept** with NaN differences, so the join cannot narrow the comparison silently.
+
+    Raises:
+        ValueError: If either side lacks a column the contrast is defined by, or if the
+            uncalibrated table is not unique on the join keys.
+    """
+    needed = ("model", "regime", "dof", "horizon_samples", "picp_mean", "width_ratio_mean")
+    for name, frame in (("the conformal table", conformal), ("the heads table", heads)):
+        missing = [column for column in needed if column not in frame.columns]
+        if missing:
+            raise ValueError(f"{name} is missing {missing}, so no conformal contrast is defined")
+    keys = list(CONFORMAL_JOIN_KEYS)
+    left = conformal.copy()
+    left["model"] = left["model"].astype(str).str.removesuffix(CONFORMAL_LABEL_SUFFIX)
+    if bool(heads.duplicated(subset=keys).any()):
+        raise ValueError(
+            f"the uncalibrated table is not unique on {keys}; each calibrated row must have "
+            f"exactly one row it was built from, or the difference is against an average of "
+            f"two runs rather than against its own base"
+        )
+    right = heads[[*keys, "picp_mean", "width_ratio_mean", "mean_interval_width_mean"]].rename(
+        columns={
+            "picp_mean": "uncalibrated_picp",
+            "width_ratio_mean": "uncalibrated_width_ratio",
+            "mean_interval_width_mean": "uncalibrated_mean_interval_width",
+        }
+    )
+    merged = left.merge(right, on=keys, how="left", validate="one_to_one")
+    merged["picp_diff"] = merged["picp_mean"] - merged["uncalibrated_picp"]
+    merged["width_ratio_diff"] = merged["width_ratio_mean"] - merged["uncalibrated_width_ratio"]
+    # The scale the calibration actually applied, recoverable from the published table alone:
+    # the construction is multiplicative about the point forecast, so the width ratio of the
+    # two rows *is* gamma. A reader can check results/e05/conformal_calibration.csv against it.
+    merged["implied_gamma"] = (
+        merged["mean_interval_width_mean"] / merged["uncalibrated_mean_interval_width"]
+    )
+    return merged
+
+
+def _conformal_contrast_display(table: pd.DataFrame) -> pd.DataFrame:
+    """Select and order the columns the conformal contrast renders.
+
+    Args:
+        table: The joined contrast.
+
+    Returns:
+        The display projection, both sides of every difference beside it.
+    """
+    columns = [
+        "model",
+        "regime",
+        "dof",
+        "horizon_s",
+        "band",
+        "uncalibrated_picp",
+        "picp_mean",
+        "picp_diff",
+        "uncalibrated_width_ratio",
+        "width_ratio_mean",
+        "width_ratio_diff",
+        "implied_gamma",
+        "winkler_mean",
+        "crps_mean",
+        "n_seeds",
+    ]
+    present = [column for column in columns if column in table.columns]
+    return table[present].sort_values(
+        [c for c in ("regime", "dof", "horizon_s", "model") if c in present]
+    )
+
+
 #: Why a **point** control row is reported but not asserted on: the P6-D11/P6-D12
 #: floored-cell narrowing, which is the only reason a point row is ever unasserted.
 POINT_REPORTED_ONLY_REASON: str = (
@@ -3536,6 +3647,83 @@ def _unjudged_groups_note(frame: pd.DataFrame, asserted: pd.DataFrame) -> list[s
         f"rows are in the reported-only table below with their real numbers.",
         "",
     ]
+
+
+def _section_conformal(loaded: Mapping[str, LoadedSource]) -> list[str]:
+    """Render section 6.5: split-conformal calibration, beside the uncalibrated rows.
+
+    Its own section rather than more rows in 6.4, for a structural reason:
+    :func:`build_probabilistic_view` refuses a frame carrying more than one experiment, and
+    :func:`build_floor_contrast` narrows the floor table to ``residual_interval``, so
+    calibrated rows dropped into either committed file would be present in the file and
+    absent from the table -- which is the failure mode the ``NOT_AN_ARM`` marker exists to
+    prevent.
+
+    Args:
+        loaded: The loaded report sources.
+
+    Returns:
+        Markdown lines, or a short note when the arm has not been run.
+    """
+    source = loaded.get("conformal")
+    parts = ["## 6.5 Split-conformal calibration", ""]
+    if source is None or source.frame.empty:
+        return parts + [
+            "Not run. `make conformal` writes `results/e05/conformal.csv`; until it does, "
+            "this project's intervals are uncalibrated and the `CLAUDE.md` deliverable "
+            '"calibrated prediction intervals" is not met.',
+            "",
+        ]
+    conformal = build_probabilistic_view(source.frame, source=source.display)
+    parts += [
+        "The same six heads, each scaled about its own point forecast by one conformal "
+        "factor per (horizon, channel), fitted on that regime's **validation** split "
+        "(P10-D1). The uncalibrated rows in section 6.4 are untouched: this arm is "
+        "additive, because Gate 5 requires the out-of-distribution degradation to be "
+        "reported rather than fixed (P5-D2).",
+        "",
+        "**Two things this table does not say.** The `crossing_rate` of every row here is "
+        "structurally 0.0 -- the wrapper sorts the base fan before scaling it, so the "
+        "measurement is removed rather than the crossing; the uncalibrated rows carry the "
+        "real number. And calibration is exchangeable with the test split in `id` **only**, "
+        "since validation is carved from the complement of each regime's held-out "
+        "condition, so the guarantee applies to one of the four regimes and the other three "
+        "measure what happens when it does not.",
+        "",
+    ]
+    parts += _table_block(
+        "probabilistic_conformal",
+        "6.5",
+        source,
+        _probabilistic_display(conformal),
+        select="every calibrated row, aggregated over seeds, with the horizon band labelled",
+    )
+    heads = loaded.get("e03_heads")
+    if heads is not None and not heads.frame.empty:
+        head_table = build_probabilistic_view(heads.frame, source=heads.display)
+        parts += [
+            "### 6.5.1 Calibrated minus uncalibrated",
+            "",
+            "**A paired contrast, unlike the cross-regime deltas of section 6.4.** Both "
+            "sides are the same model on the same test partition and differ only in the "
+            "post-processing, so the difference is a within-cell quantity; P5-D12 records "
+            "why the *regime-to-regime* deltas cannot be read that way. `implied_gamma` is "
+            "the ratio of the two printed widths, which is what the construction applied, "
+            "and it is checkable against `results/e05/conformal_calibration.csv`.",
+            "",
+        ]
+        contrast = build_conformal_contrast(conformal, head_table)
+        parts += _table_block(
+            "probabilistic_conformal_minus_uncalibrated",
+            "6.5",
+            source,
+            _conformal_contrast_display(contrast),
+            select=(
+                f"every row of {source.display}, joined to its own uncalibrated row in "
+                f"{heads.display} on ({', '.join(CONFORMAL_JOIN_KEYS)}) and differenced"
+            ),
+        )
+    return parts
 
 
 def _section_controls(loaded: Mapping[str, LoadedSource], results_dir: Path) -> list[str]:
@@ -3836,6 +4024,7 @@ def build_results_report(results_dir: Path, out_path: Path, *, strict: bool = Tr
     parts += _section_quiescence(loaded, results_dir)
     parts += _section_ablations(loaded, results_dir)
     parts += _section_probabilistic(loaded, results_dir)
+    parts += _section_conformal(loaded)
     parts += _section_controls(loaded, results_dir)
     parts += ["## Caveats", ""]
     parts += [f"- {caveat}" for caveat in results_report_caveats()]

@@ -5467,3 +5467,357 @@ surrounding paragraph states the exception.
 **Not a defect in any result.** No number in `results/` changed, nothing was re-run, and no
 threshold moved. What changed is seven sentences and three tables that had drifted from artifacts
 that were correct all along.
+
+### P9-D10 — The audit's verdict was stale for a day, because its own exit condition was never executed. RECORDED 2026-09-15
+
+`docs/audit_report.md` ended **NOT RELEASE READY — 3 blocking findings** and, in the same verdict,
+wrote the condition under which that would change: "Re-run this audit's §5.6 and §5.5 sections after
+those and the verdict flips." All three findings were fixed on 2026-09-14 and the Resolution section
+recorded the fixes. **The re-run was not done.** So §5.5 and §5.6 kept FAIL rows citing B1 and B3,
+and the verdict line kept describing a repository that no longer existed.
+
+That is a fourth instance of this project's most persistent defect shape — P8-D15 (a gate predicate
+reading a gitignored file), P7-D14 (a documentation checker whose clause never read a table cell),
+P9-D8 (an audit checkbox citing a section that was never written), and now a verdict whose own
+refutation condition was met and unexecuted. In every case the reference was correct when written and
+stopped being correct when the thing it pointed at changed.
+
+**Re-run, and appended rather than edited in place.** The audit's body, tables and verdict are left
+exactly as written, per the Resolution's own rule; the re-verification is a new section beneath it
+with its own verdict. Both §5.5 rows that were FAIL and all three §5.6 rows that were FAIL now pass,
+each against a fact measured on 2026-09-15: the committed `all:` recipe, `git ls-files` over every
+file the README asserts is present, an empty `git ls-files --others results/`, and a byte-identical
+re-render from `make figures` and `make report`.
+
+**The new verdict is RELEASE READY, and it says what it does not cover**: no fresh `make all` was
+run (~160 h), and the `CLAUDE.md` deliverable "calibrated prediction intervals" remains **unmet** —
+no conformal calibration is run anywhere. A release-readiness verdict that quietly implied a complete
+deliverable list would be the same defect in a new place.
+
+> **Superseded later the same day by P10-D1 through P10-D3.** Phase 10 built the calibration, so the
+> deliverable is now met in distribution and not met under shift. The paragraph above is left as
+> written because it was accurate when recorded and the protocol is a chronological log, but the
+> claim it makes about the deliverable is the one this entry is itself about: a statement that was
+> true when written and stopped being true when the thing it described changed.
+
+**Two line-number citations in §5.6 were stale and are deliberately not repaired in place.** The
+simulation-only caveat was cited at `README.md:322`, `:403`, `:460`; after the Phase 9 restructure it
+sits at `:6-7`, `:172`, `:385`, `:481`, `:543`. The correction is recorded in the re-verification
+section with the reason, because the stale citation is itself the evidence for the paragraph above
+it, and silently fixing it would delete the example.
+
+**The audit was linked from nothing.** It is a release-readiness verdict that neither the README nor
+`docs/findings.md` pointed at, so the only way to reach it was to already know it existed. Both now
+link it. A document nobody can find cannot be the document that clears a repository for release.
+
+## Phase 10 — split-conformal calibration
+
+All results in this project are from **simulated** vessel motion. No real deck data is used.
+
+Everything in P10-D1 below was written and committed **before the first calibration run**, which is
+checkable from `git log`: the commit carrying this entry precedes the first commit of
+`results/e05/`. Gate 10 predicate 6 checks exactly that.
+
+### P10-D1 — PRE-REGISTRATION: what is being calibrated, what is predicted, and what would falsify it. RECORDED 2026-09-15
+
+**Why this phase exists.** `CLAUDE.md` lists "calibrated prediction intervals" among the
+deliverables and no conformal calibration is run anywhere; `docs/IMPLEMENTATION_PLAN.md` §Phase 5
+only requires that `heads.py` be *structured* so a `ConformalWrapper` can be added later, and §7
+item 2 lists split conformal as an extension. So no phase ever scheduled it, no gate ever caught
+it, and the README has said in three places that the deliverable is unmet. This phase closes it.
+
+**The shift, and where the guarantee does and does not hold.** `src/dmf/data/splits.py` carves the
+validation partition from the **complement of the test condition**. Calibration and test are
+therefore exchangeable in `id` and in no other regime:
+
+| regime | calibration set | windows | exchangeable with test? |
+|---|---|---:|---|
+| `id` | all 48 frigate cells, seeds 27-31 | 271 440 | **yes** — same distribution, different seeds |
+| `unseen_seastate` | SS3-SS5 only, 36 cells | 244 296 | no — test is SS6 |
+| `unseen_heading` | 180/135/45 deg only, 36 cells | 244 296 | no — test is beam seas |
+| `unseen_vessel` | frigate only, 48 cells | 325 728 | no — test is the S175 hull |
+
+`assert_seed_disjoint` *enforces* that the held-out axis value never appears in train or val, so
+this is structural rather than incidental. **Split conformal has a coverage guarantee in one of the
+four regimes**, and the point of the phase is to measure how badly that bites in the other three.
+
+**Construction, fixed in advance.** Width-normalised CQR (Romano, Patterson & Candes 2019; Sesia &
+Candes 2020 for the ratio form). Per `(horizon sample, target channel)`, on the calibration split,
+in normalised space, with `m` the point forecast and `(lo, hi)` the 0.05/0.95 fan members:
+
+```
+s_i   = max( (m_i - y_i) / (m_i - lo_i),  (y_i - m_i) / (hi_i - m_i) )
+gamma = the ceil((n+1)(1-alpha))-th ORDER STATISTIC of ascending {s_i}
+```
+
+and the calibrated distribution is the base scaled about its own point forecast by `gamma`:
+`c_k = m + gamma*(f_k - m)` for a quantile head, `log_var + 2*log(gamma)` for a Gaussian head,
+which is the same operation. `y_i` is covered iff `s_i <= gamma`, so this is split conformal with
+score `s`, and the marginal guarantee is `1-alpha <= P(Y in C(X)) <= 1-alpha + 1/(n+1)`.
+
+Four properties of that choice, each one a reason it is the construction rather than an alternative:
+
+1. **The point forecast is bitwise unchanged** (`m + gamma*(m-m) = m`), so no RMSE, MAE, skill,
+   nrmse or phase-lag number in this project can move. This is the strongest available form of the
+   additivity that Gate 5's "report, do not fix" rule (P5-D2) demands.
+2. **Conditional sharpness is preserved.** At `id`/pitch/10 s the committed `width_ratio_mean` runs
+   from 0.737 (`dlinear_quantile`) to 0.284 (`lstm_quantile`), a 2.6x spread. An *additive* offset
+   widens the sharpest and the widest window by the same absolute amount and compresses exactly the
+   structure P6-D6 built the floor contrast to measure; a multiplicative one moves only the scale,
+   so `width_ratio_calibrated / width_ratio_uncalibrated == gamma` per cell.
+3. **Monotonicity is automatic** — `gamma > 0` times a non-decreasing fan is non-decreasing — so
+   crossing is structurally impossible rather than repaired post hoc.
+4. **One code path for both head kinds**, because scaling deviations from a Gaussian mean is exactly
+   `sigma -> gamma*sigma`.
+
+The **order statistic, not `np.quantile`'s linear interpolation.** `dmf.train.closed_form` records
+that the interpolation rule "is not load-bearing" for the residual floor. That is true for a floor
+and false here: for a conformal claim the order statistic *is* the guarantee. This is also why the
+conformity score is not an absolute residual — `EmpiricalResidualInterval` (P6-D6) is already split
+conformal in all but the order statistic and the conditionality, so an additive-residual arm would
+ship the committed floor under a second label and call it a new result.
+
+A **secondary arm** applies a per-level additive CQR offset to all nine levels, sharing the same
+calibration pass. It calibrates every level marginally rather than only the 90 percent interval, so
+it is the better-specified object for the `pinball` and `crps` columns. Both arms are reported.
+
+**Setup, fixed in advance.** The committed `e03_probabilistic` checkpoints at
+`artifacts/checkpoints/probabilistic/<regime>/`, six heads x three seeds x four regimes, loaded
+through `load_or_fit` with `strict=True` and **not retrained**. `alpha = 0.1`. Calibration
+sub-sampled at a fixed stride to 25 000 windows, reusing `RESIDUAL_QUANTILE_MAX_WINDOWS` and its
+effective-sample-size rationale. Normalisation statistics stay train-fitted; the calibration split
+contributes nothing but the conformity scores (non-negotiable 3). Scored on the same four test
+partitions by the same `evaluate_probabilistic_models` at the same bootstrap settings as e03.
+
+**Baselines, measured from the committed `results/e03/probabilistic.csv` before any calibration**
+(216 cells per regime; in-band means `picp_mean` within Gate 5's `[0.85, 0.95]`):
+
+| regime | in-band now | median PICP | median width ratio |
+|---|---:|---:|---:|
+| `id` | 102 / 216 | 0.9451 | 0.103 |
+| `unseen_seastate` | 5 / 216 | 0.6099 | 0.102 |
+| `unseen_heading` | 37 / 216 | 0.4940 | 0.297 |
+| `unseen_vessel` | 41 / 216 | 0.6910 | 0.127 |
+
+**Prediction, recorded as a prediction to be scored and not as a pass condition.** Gate 10 is a
+process gate; a failure to calibrate under shift is a PASS with a negative finding
+(non-negotiable 6), in the shape Gate 8 used.
+
+| regime | predicted in-band after calibration | falsified by |
+|---|---|---|
+| `id` | **>= 205 / 216**, median PICP in [0.895, 0.905] | fewer than 180 in band, or median PICP outside [0.88, 0.92] |
+| `unseen_seastate` | improves but stays broken: **20-80 / 216**, median PICP 0.65-0.80 | >= 150 in band |
+| `unseen_heading` | **essentially unmoved, 37 +/- 25** | a move of more than +/- 60 either way |
+| `unseen_vessel` | **60-140 / 216** | < 45 (no improvement) or >= 180 |
+
+Ordering: the improvement is `id` >> `unseen_vessel` > `unseen_seastate` > `unseen_heading`.
+
+**The headline claim to be scored:** *split conformal restores nominal 90 percent coverage
+in-distribution and does not survive sea-state shift; the residual degradation is a property of the
+shift and not of the head, because the same construction is exact on `id`.*
+
+**Counter-hypothesis, and why the boring prediction is the risky one.** A multiplicative
+recalibration can fix a *scale* error and never a *location* error, and the committed table shows
+both failure modes side by side at `unseen_heading`/pitch/10 s: `dlinear_quantile` at PICP 1.0000
+with width ratio 11.78 is a pure scale error, while `lstm_quantile` at PICP 0.6115 with width ratio
+8.50 is wide *and* under-covering, which is a biased point forecast that no width scaling repairs.
+Since `gamma` is fitted on unshifted validation data it should come out near 1 on that regime, so
+"nothing moves at `unseen_heading`" is the prediction at risk: a large move in either direction
+falsifies the mechanism, not merely the number.
+
+**Known in advance, so it cannot later be an excuse.** (i) 25 000 windows at 0.5 s spacing on a
+~12 s roll period are far fewer than 25 000 independent samples, so the `1/(n+1)` finite-sample term
+advertises a precision the dependence structure does not support; the binding uncertainty on any
+reported coverage is the realization bootstrap interval `prob_runner` already computes, and a
+realization-level `gamma` is recorded beside the window-level one as a sensitivity. (ii) Both
+DLinear heads are wide and both LSTM heads are sharp, so `gamma < 1` is expected for DLinear on `id`
+and `gamma > 1` for LSTM — the arm will **narrow** some rows, and a narrowed interval that still
+covers is the intended outcome, not a suspicious one. (iii) The calibrated rows' `crossing_rate` is
+structurally 0.0, because the wrapper must sort the base fan before scaling it; that zero is the
+removal of a measurement, not the removal of crossing, and the uncalibrated rows keep the real
+number.
+
+**Excluded by construction.** No ablation arm and no sea-state conditioning (P6-D18: its one-hot is
+privileged information). No re-run of quiescence detection in this pass — the interval decision rule
+reads the same fan positions and "does calibration improve the *decision*" is the better question,
+but it is a second scoring pass over consecutive windows and is deliberately scoped out of the first
+run rather than done badly inside it.
+
+### P10-D2 — RESULT: exact in distribution, and actively harmful under every shift. Two predictions falsified. RECORDED 2026-09-15
+
+Four regimes, six heads, three seeds, no retraining. In-band means PICP@90 inside Gate 5's
+registered `[0.85, 0.95]`, out of 216 cells per regime.
+
+| regime | in-band | median PICP | cells worse | mean width | median `gamma` | median Winkler |
+|---|---|---|---:|---:|---:|---:|
+| `id` | 102 → **216** | 0.9451 → 0.9001 | 1.9% | −17.5% | 0.797 | **−3.5%** |
+| `unseen_seastate` | 5 → **0** | 0.6099 → 0.5118 | 87.0% | −18.5% | 0.774 | +11.1% |
+| `unseen_heading` | 37 → **27** | 0.4940 → 0.4613 | 77.8% | −17.6% | 0.814 | +5.2% |
+| `unseen_vessel` | 41 → **59** | 0.6910 → 0.6308 | 78.2% | −16.9% | 0.821 | +4.1% |
+
+"Cells worse" is the fraction whose PICP moved *further* from 0.90. Winkler is a proper score
+and lower is better, so its sign agrees with the coverage column in all four regimes — unlike
+Phase 5, where the proper score and the in-band count supported opposite conclusions (P5-D14).
+
+**In distribution the construction is exact.** 216 of 216 cells in band, median PICP 0.9001,
+and at the Gate 5 cell all six heads land between 0.8989 and 0.9025 with seed spreads of
+0.0001–0.0024. This is the CQR guarantee arriving on schedule and is a **correctness check on
+the implementation, not a discovery**; Gate 10 predicate 4 reads it as such.
+
+**It is also 17.5 percent sharper.** The uncalibrated heads were buying their coverage with
+width — median PICP 0.9451 against a nominal 0.90 — and 86 percent of `id` cells were
+*narrowed*. Calibration here is not a tax paid for honesty; it recovered width the heads were
+wasting. That is worth stating because the opposite is usually assumed.
+
+**Out of distribution it does not merely fail to help. It hurts.** Coverage moves further from
+nominal in 78 to 87 percent of cells in all three shifted regimes, the Winkler score worsens in
+all three, and on `unseen_seastate` the in-band count goes to **zero** — worse than doing
+nothing.
+
+**The mechanism is visible in one column.** The mean width change is nearly identical in all
+four regimes: −16.9 to −18.5 percent. `gamma` is always fitted on that regime's *validation*
+split, which is always in-distribution by construction (`splits.py` carves it from the
+complement of the test condition), so the calibration applies essentially the **same**
+correction everywhere and only the test set differs. Validation says the intervals are too
+wide, because in-distribution they are; the shifted test set needs them wider. Split conformal
+narrows confidently in exactly the wrong direction, and nothing inside the procedure can detect
+that — which is the honest statement of what exchangeability buys and what its absence costs.
+
+#### The pre-registered predictions, scored
+
+**1. `id` — CONFIRMED.** Predicted ≥ 205 of 216 and median PICP in [0.895, 0.905]. Measured
+216 and 0.9001.
+
+**2. `unseen_seastate` — FALSIFIED.** Predicted "improves but stays broken: 20–80 in band,
+median PICP 0.65–0.80". Measured **0 in band, median 0.5118** — outside the predicted range and
+on the wrong side of *no calibration at all*. The direction of the headline claim survives; the
+word "improves" does not. P10-D1's stated falsification criterion was "≥ 150 in band", which
+only guarded against the arm working better than expected and left the failure direction
+unguarded. **That is a defect in the pre-registration, not in the result**, and it is the same
+shape as the asymmetric thresholds P6-D19 recorded: a criterion written while expecting to be
+disappointed in one direction only.
+
+**3. `unseen_heading` — count CONFIRMED, mechanism FALSIFIED.** Predicted "essentially unmoved,
+37 ± 25"; measured 27, inside the band. But the reason given was "`gamma` should come out near 1
+there", and the measured median `gamma` is **0.814**, a 17.6 percent narrowing. The number was
+right and the explanation for it was wrong, which is the P9-D7 shape ("the finding was right and
+its evidence was not") in a new place. The correct explanation is the one above: `gamma` is near
+0.8 in *every* regime because it is always fitted in-distribution.
+
+**4. `unseen_vessel` — outside the predicted interval by one cell.** Predicted 60–140; measured
+**59**. By P10-D1's own stated falsification criterion ("< 45 or ≥ 180") it is not falsified;
+by the predicted interval it is outside. Both readings are recorded rather than the flattering
+one. This regime also needs care in any summary: its in-band **count rises** (41 → 59) while its
+median coverage **falls** (0.691 → 0.631) and 78 percent of cells get worse. The count and the
+distribution move in opposite directions, so quoting the count alone would misdescribe it —
+which is why the table above carries four columns and not one.
+
+**5. The ordering — CONFIRMED.** Predicted `id` ≫ `unseen_vessel` > `unseen_seastate` >
+`unseen_heading` by improvement in in-band count. Measured +114, +18, −5, −10: the same order,
+with three of the four numbers negative.
+
+**6. The secondary arm — NOT RUN, and therefore not scored.** P10-D1 committed to a per-level
+additive arm and to reporting both. It was never built. The four scores above are an accounting of
+the arm that ran and **not** of the pre-registration as a whole; P10-D4 records the omission.
+
+**Three of the six statistics in the table above are post-hoc.** Only the in-band count and the
+median PICP were pre-registered. "Cells worse", the mean width change and the Winkler change were
+chosen after seeing the run. All three cut *against* the arm, so nothing is bought by choosing
+them, but the distinction is recorded rather than left for a reader to reconstruct. CRPS and pinball
+agree in sign with Winkler in all four regimes (median `id` −1.2%, then +2.8 / +1.5 / +1.4%), so the
+conclusion does not depend on which proper score is read.
+
+**`unseen_heading` deserves one caveat the table does not carry.** Its median |ΔPICP| is 0.031
+against a median pooled seed spread of 0.034, so cell by cell the shift is within seed noise. The
+direction survives because the contrast is **paired** — the same checkpoints scored on the same
+windows, differing only in post-processing — and the cells-worse fraction is 77.3 / 72.7 / 78.2 per
+cent across the three seeds computed separately. Read as unpaired marginals these rows would not
+support a conclusion, which is the P3-D13 error this project has made twice; read paired, they do.
+
+#### Two things the calibrated rows do not say
+
+**`crossing_rate` is 0.000 on every calibrated row, and that is not a finding.** The wrapper
+sorts the base fan before scaling it, so the quantity `prob_runner` measures on the raw tensor
+is removed rather than the crossing. The uncalibrated rows keep the real number (median 6
+percent, worst cell 96.6 percent for `dlinear_quantile`). Any reader comparing the two columns
+is comparing a measurement with its own absence.
+
+**The `1/(n+1)` finite-sample term is nominal.** Calibration drew 23 267–24 677 windows at a
+fixed stride, but consecutive windows are 0.5 s apart on a ~12 s roll period, so the effective
+sample size is a small fraction of that. The realization-level sensitivity in
+`conformal_calibration.csv` certifies a different and weaker target — 90 percent of
+realizations' *median* windows — and is recorded beside `gamma` precisely so the gap is visible
+rather than assumed away. The binding uncertainty on every coverage number above is the
+realization bootstrap interval already in the table.
+
+**Gate 10: 7 of 7.** Predicate 1 verifies that the four committed Phase 5 tables carry **no
+uncommitted modification** and prints their digests; it does not compare those digests to a stored
+constant, so it would not catch a *committed* rewrite. The stronger claim — that they are
+byte-identical to `main` — is true and was checked separately with `git diff main...HEAD --
+results/e03/`, which is empty. Stating the weaker thing the predicate does, beside the stronger
+thing that is true, is the distinction P7-D14 and P9-D8 exist to enforce. Predicate 6 reads
+`git log` to confirm P10-D1 was committed at 17:20:08 against the first `conformal.csv` at
+22:07:58, and the run itself spanned 17:34-21:04 (P10-D3).
+
+### P10-D3 — What the calibration arm cost, and why its figure is prose rather than logged. RECORDED 2026-09-15
+
+`make conformal` ran the four regimes end to end in **3 h 29 m 47 s**, from 17:34:58 to 21:04:45 on
+2026-09-15: 18 committed checkpoints per regime (six heads x three seeds), one streaming calibration
+pass over each regime's validation split at a fixed stride, and one scoring pass over each test
+partition. No training. The dominant cost is the scoring pass, not the calibration: calibrating one
+model over ~25 000 windows takes 6-8 s, and the four `evaluate_probabilistic_models` passes over
+434 304-542 880 test windows with 18 models each account for essentially all of it. GPU utilisation
+sat at 4 percent throughout, so the arm is bound by the float64 metric accumulation on the CPU and
+would not go meaningfully faster on a larger card.
+
+**The figure is derived from file timestamps, and file timestamps are not a committed artifact.**
+`artifacts/` is gitignored, so a clone cannot check this number; the README's runtime table therefore
+marks the row `protocol prose` rather than `logged`, which is the same treatment the e02 and e03
+sweeps get for the same reason (P9-D7). Recording it here is what makes "prose" a real source rather
+than a euphemism for an unsourced number.
+
+**Fixed for the next run rather than left as a known gap.** `dmf.eval.conformal_runner.run_conformal`
+now appends start and end lines to `artifacts/logs/e05/status_conformal.txt` in the shape
+`scripts/run_e04.sh` writes, so `scripts/collect_runtimes.py` picks the stage up and the row can
+become `logged`. That does **not** make this run traceable and the README does not claim it does.
+
+**The `make all` total moves from about 163 hours to about 167**, because `all:` now carries
+`conformal` and `gate10` and the table that says what `make all` costs has to list what `make all`
+runs. A stage inside the target and absent from the table is the same defect as a citation pointing
+at a line that moved -- the fifth instance this project has recorded, and the reason this entry
+exists rather than a silent edit.
+
+### P10-D4 — A pre-registered arm was never run, and that is a broken commitment rather than a design choice. RECORDED 2026-09-15
+
+P10-D1 committed to two arms: the multiplicative primary, and "a **secondary arm** [that] applies a
+per-level additive CQR offset to all nine levels… it is the better-specified object for the
+`pinball` and `crps` columns. **Both arms are reported.**"
+
+**Only the primary arm exists.** `results/e05/conformal.csv` carries six labels, all
+`*_conformal`, all multiplicative; there is no additive implementation in `src/`, `scripts/` or
+`tests/`. P10-D2 scored four magnitude predictions and the ordering and **did not mention the
+missing arm at all**, so "two of four predictions falsified" reads as a complete accounting of the
+pre-registration when it is an accounting of only the part that was run.
+
+**Worse, the code cites the pre-registration as if it had argued the other way.**
+`src/dmf/models/conformal.py` heads a paragraph "**Why multiplicative and not additive**
+(`docs/protocol.md` P10-D1)". P10-D1 chose multiplicative for the *primary* arm and committed to
+running the additive one beside it; the docstring turns a dropped commitment into a decision that
+was pre-registered. That is the most misleading sentence Phase 10 produced, and it was written by
+the session that dropped the arm.
+
+**Why it was dropped, stated plainly: it was not a decision, it was an omission.** The runner was
+built for one arm, the run took 3.5 h, and the secondary arm was never implemented or scheduled.
+No measurement argued against it. The honest consequence is that `conformal.csv` ships
+`crps_mean` and `pinball_mean` columns for an arm P10-D1 itself called the wrong object for them —
+those columns are still correct for what they measure, the *fan* the primary arm emits, but the
+pre-registration promised a better-specified comparison for them and did not deliver it.
+
+**Not fixed, and not quietly dropped either.** Building the additive arm is a second scoring pass
+over four regimes, roughly another 3.5 h, and the decision recorded with the user was to ship. It
+is recorded here, in P10-D2's summary, and in the README and `docs/findings.md`, so that the
+pre-registration and what was actually run can be compared by a reader rather than only by the
+session that ran it. This is the fourth time this project has found a declared thing that never
+ran — P6-D15 (a renderer section with no caller), P8-D13 (a declared control that existed in the
+config and was never run), P9-D3 (two figures with no generator) — and the first time the
+declaration was one this session made itself.

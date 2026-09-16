@@ -16,13 +16,14 @@ WORKERS ?= 8
 RESULTS ?=
 GATE4_DIR ?= $(or $(RESULTS),results/e02)
 GATE5_DIR ?= $(or $(RESULTS),results/e03)
+CONFORMAL_DIR ?= $(or $(RESULTS),results/e05)
 # Gate 6 is read over the assembled report, which lives at the top of results/.
 GATE6_DIR ?= $(or $(RESULTS),results)
 # Gate 7 reads the deploy artifacts, which also live at the top of results/.
 GATE7_DIR ?= $(or $(RESULTS),results)
 
 .PHONY: data train eval rescore gate4 gate5 gate6 gate6-full gate7 bench report \
-        figures figures-extract test lint format all sweeps mss
+        figures figures-extract test lint format all sweeps mss conformal gate10
 
 data:   ; $(PY) scripts/generate_corpus.py --config $(SIMCFG) --out artifacts/corpus --workers $(WORKERS)
 train:  ; $(PY) scripts/train.py --config $(CFG)
@@ -87,7 +88,16 @@ sweeps:
 # one gate -- the previous recipe was `data train eval bench report gate7`, which trained
 # only e01 and left gates 4, 5, 6 and 8 unrun. Expected wall clock is about 160 h on one
 # RTX A4000; the per-stage breakdown is in the README.
-all: data sweeps gate4 gate5 gate6-full bench report gate7 mss figures-extract
+all: data sweeps gate4 gate5 gate6-full conformal gate10 bench report gate7 mss figures-extract
+
+# Phase 10: split-conformal calibration. Retrains nothing -- it loads the committed Phase 5
+# checkpoints, fits one conformal scale per (horizon, channel) on each regime's VALIDATION
+# split, and re-scores on test. Writes only under results/e05/; results/e03/ is read and never
+# regenerated, which is how Gate 5's "report the degradation, do not fix it" survives the arm.
+conformal:
+	$(PY) scripts/conformal.py --all-regimes --out-root $(CONFORMAL_DIR)
+
+gate10: ; $(PY) scripts/gate10.py --results-dir $(CONFORMAL_DIR) --out-dir $(CONFORMAL_DIR)
 
 # Phase 8: MSS cross-validation. Needs the corpus and the deep checkpoints; the Octave
 # parity step skips cleanly when Octave is absent. Every step is idempotent.
