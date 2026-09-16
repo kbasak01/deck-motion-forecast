@@ -2,7 +2,8 @@
 
 Short-horizon (1–15 s) forecasting of 6-DOF ship deck motion — roll, pitch, heave and their
 rates — for deciding when to commit a rotorcraft to a touchdown on a heaving deck, evaluated on
-prediction intervals and on operational quiescent-window detection rather than on RMSE alone. **Every result in this repository comes
+prediction intervals — split-conformal calibrated, and characterised where that calibration
+stops working — and on operational quiescent-window detection rather than on RMSE alone. **Every result in this repository comes
 from simulated vessel motion: a JONSWAP-driven linear seakeeping model. No real deck data is used
 anywhere in this project, and no sim-to-real claim is made.**
 
@@ -11,9 +12,9 @@ stay inside landing limits long enough to get the aircraft down. That, rather th
 the metric this project is built around — and it behaves very differently from RMSE, which is
 [the sharpest finding here](#the-decision-quiescent-window-detection).
 
-**Status: Phases 1–8 complete.** Gates 1, 2, 4, 6, 7 and 8 pass as written. Gate 3 **failed** as
-written and was restated at the same threshold. Gate 5 passes at its pre-registered cell and does
-**not** pass across the surrounding table. The full phase-by-phase record, including every claim
+**Status: Phases 1–10 complete.** Gates 1, 2, 4, 6, 7, 8 and 10 pass as written. Gate 3 **failed**
+as written and was restated at the same threshold. Gate 5 passes at its pre-registered cell and
+does **not** pass across the surrounding table. The full phase-by-phase record, including every claim
 this project withdrew, is in [`docs/findings.md`](docs/findings.md).
 
 ---
@@ -271,9 +272,52 @@ LSTM score zero of 72, and so does the residual-interval floor, down to PICP 0.2
 5 s. A band fitted on SS3–SS5 residuals is the wrong width for SS6 however it
 was obtained. This is reported, not fixed.
 
-**These are uncalibrated heads.** `src/dmf/models/heads.py` provides the seam a split-conformal
-wrapper attaches to, and a test proves the seam composes, but **no conformal calibration is run**.
-The project deliverable "calibrated prediction intervals" is not met.
+## Calibration: split conformal is exact in distribution and harmful under shift
+
+Phase 10 calibrates the six heads with split conformal (CQR), fitting one scale factor per
+(horizon, channel) on each regime's **validation** split and re-scoring on test. Nothing is
+retrained. The uncalibrated rows above are untouched — this arm is additive, because Gate 5
+requires the out-of-distribution degradation to be *reported, not fixed*.
+
+In-band means PICP@90 inside Gate 5's `[0.85, 0.95]`, out of 216 cells per regime:
+
+| regime | in-band | median PICP | cells that got **worse** | mean width | median Winkler |
+|---|---:|---:|---:|---:|---:|
+| `id` | 102 → **216**/216 | 0.9451 → **0.9001** | 1.9% | −17.5% | **−3.5%** |
+| `unseen_seastate` | 5 → **0**/216 | 0.6099 → 0.5118 | 87.0% | −18.5% | +11.1% |
+| `unseen_heading` | 37 → **27**/216 | 0.4940 → 0.4613 | 77.8% | −17.6% | +5.2% |
+| `unseen_vessel` | 41 → **59**/216 | 0.6910 → 0.6308 | 78.2% | −16.9% | +4.1% |
+
+**In distribution it works exactly, and for free.** All 216 cells land in band; at the gate cell
+the six heads sit between 0.8989 and 0.9025. And the intervals get **17.5% sharper** — the
+uncalibrated heads were over-covering (median 0.945 against a nominal 0.90) and paying for it in
+width, so calibration recovered width rather than costing it.
+
+**Out of distribution it is worse than doing nothing.** Coverage moves *further* from nominal in
+78–87% of cells in all three shifted regimes, the Winkler score worsens in all three, and on
+`unseen_seastate` the in-band count goes to **zero**.
+
+**The mechanism is one column wide.** The width change is nearly identical everywhere: −16.9% to
+−18.5%. The scale factor is always fitted on that regime's validation split, which is always
+in-distribution — validation is carved from the *complement* of the held-out condition — so
+calibration applies the same correction in every regime and only the test set differs.
+Validation says the intervals are too wide, because in-distribution they are. The shifted test
+set needs them wider. Split conformal narrows confidently in the wrong direction, and nothing
+inside the procedure can detect it.
+
+**Read `unseen_vessel` carefully**: its in-band *count* rises (41 → 59) while its median coverage
+*falls* and 78% of its cells get worse. The count and the distribution move in opposite
+directions there, which is why this table has four columns.
+
+Two things these rows do **not** say. Their `crossing_rate` is 0.000 by construction — the
+wrapper sorts the base fan before scaling, so the measurement is removed, not the crossing; the
+uncalibrated rows keep the real number. And the finite-sample term is nominal: 25 000 windows at
+0.5 s spacing on a ~12 s roll period are far fewer than 25 000 independent samples, so the
+binding uncertainty is the realization bootstrap interval, not `1/(n+1)`.
+
+Full tables: [`results/e05/`](results/e05/). Pre-registration and the scored predictions —
+**two of four were falsified** — are P10-D1 and P10-D2 in [`docs/protocol.md`](docs/protocol.md).
+Gate 10 passes 7/7, including a digest check that the uncalibrated tables were never rewritten.
 
 ## Inference latency -- ONNX export and the CPU-versus-GPU question
 
@@ -485,7 +529,12 @@ Read these before reading any number above.
   forecaster reads — so no row of it is a deployable result. It is also **not** an upper bound: it
   costs mean skill on `unseen_seastate` — −0.0191 pooled over the arm, −0.0445 on `tcn` alone —
   and a bound below the unconditioned baseline on the regime that matters bounds nothing.
-- **The intervals are not calibrated.** No conformal calibration is run anywhere.
+- **Calibration is only meaningful in distribution.** Split conformal is run (Phase 10) and is
+  exact on `id`, but the calibration split is drawn from the complement of each regime's
+  held-out condition, so under shift it applies an in-distribution correction to an
+  out-of-distribution test set and makes coverage **worse** in 78–87% of cells. The deliverable
+  "calibrated prediction intervals" is met in distribution and **not** met under shift, and no
+  procedure here can tell the two apart from the calibration data alone.
 - **One integrity control is vacuous on one regime.** The interval shuffle control asserts on
   222 of 432 rows; on `unseen_seastate` it asserts on **zero**. "Passed" there means nothing was
   judged. Its tolerance was also changed after seeing the data (0.02 → 0.10) and is labelled as
@@ -508,6 +557,7 @@ Read these before reading any number above.
 |---|---|
 | [`docs/findings.md`](docs/findings.md) | The phase-by-phase record, with every withdrawn claim beside the one that replaced it. Start here. |
 | [`docs/protocol.md`](docs/protocol.md) | The complete decision log, ~5200 lines. Every gate, every threshold change, every retraction, with what was measured. |
+| [`results/e05/`](results/e05/) | Phase 10: the calibrated tables, the fitted scale factors with their provenance, the coverage degradation, and the Gate 10 read-out. |
 | [`docs/audit_report.md`](docs/audit_report.md) | The pre-release audit: three blocking findings, ten should-fix items, the §5 validation protocol checkbox by checkbox, and the re-verification that follows it. Two of the audit's own numbers did not reproduce and were not adopted. |
 | [`docs/corpus_card.md`](docs/corpus_card.md) | What the corpus contains, how it is generated, and how to reproduce it. |
 | [`docs/mss_crossvalidation.md`](docs/mss_crossvalidation.md) | Phase 8 in full: the Octave parity check, the two-generator comparison, and what the transfer failure does and does not show. |
@@ -532,6 +582,9 @@ Read these before reading any number above.
   Recurrent Networks for Sequence Modeling*, arXiv:1803.01271.
 - **Quantile regression / pinball loss** — Koenker and Bassett (1978), *Regression Quantiles*,
   Econometrica 46(1).
+- **Split conformal prediction / CQR** — Romano, Patterson and Candès (2019), *Conformalized
+  Quantile Regression*, NeurIPS 32; Sesia and Candès (2020), *A comparison of some conformal
+  quantile regression methods*, Stat 9(1), for the width-normalised score.
 - **Winkler interval score and CRPS** — Gneiting and Raftery (2007), *Strictly Proper Scoring Rules,
   Prediction, and Estimation*, JASA 102(477).
 

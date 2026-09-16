@@ -5636,3 +5636,97 @@ privileged information). No re-run of quiescence detection in this pass — the 
 reads the same fan positions and "does calibration improve the *decision*" is the better question,
 but it is a second scoring pass over consecutive windows and is deliberately scoped out of the first
 run rather than done badly inside it.
+
+### P10-D2 — RESULT: exact in distribution, and actively harmful under every shift. Two predictions falsified. RECORDED 2026-09-15
+
+Four regimes, six heads, three seeds, no retraining. In-band means PICP@90 inside Gate 5's
+registered `[0.85, 0.95]`, out of 216 cells per regime.
+
+| regime | in-band | median PICP | cells worse | mean width | median `gamma` | median Winkler |
+|---|---|---|---:|---:|---:|---:|
+| `id` | 102 → **216** | 0.9451 → 0.9001 | 1.9% | −17.5% | 0.797 | **−3.5%** |
+| `unseen_seastate` | 5 → **0** | 0.6099 → 0.5118 | 87.0% | −18.5% | 0.774 | +11.1% |
+| `unseen_heading` | 37 → **27** | 0.4940 → 0.4613 | 77.8% | −17.6% | 0.814 | +5.2% |
+| `unseen_vessel` | 41 → **59** | 0.6910 → 0.6308 | 78.2% | −16.9% | 0.821 | +4.1% |
+
+"Cells worse" is the fraction whose PICP moved *further* from 0.90. Winkler is a proper score
+and lower is better, so its sign agrees with the coverage column in all four regimes — unlike
+Phase 5, where the proper score and the in-band count supported opposite conclusions (P5-D14).
+
+**In distribution the construction is exact.** 216 of 216 cells in band, median PICP 0.9001,
+and at the Gate 5 cell all six heads land between 0.8989 and 0.9025 with seed spreads of
+0.0001–0.0024. This is the CQR guarantee arriving on schedule and is a **correctness check on
+the implementation, not a discovery**; Gate 10 predicate 4 reads it as such.
+
+**It is also 17.5 percent sharper.** The uncalibrated heads were buying their coverage with
+width — median PICP 0.9451 against a nominal 0.90 — and 86 percent of `id` cells were
+*narrowed*. Calibration here is not a tax paid for honesty; it recovered width the heads were
+wasting. That is worth stating because the opposite is usually assumed.
+
+**Out of distribution it does not merely fail to help. It hurts.** Coverage moves further from
+nominal in 78 to 87 percent of cells in all three shifted regimes, the Winkler score worsens in
+all three, and on `unseen_seastate` the in-band count goes to **zero** — worse than doing
+nothing.
+
+**The mechanism is visible in one column.** The mean width change is nearly identical in all
+four regimes: −16.9 to −18.5 percent. `gamma` is always fitted on that regime's *validation*
+split, which is always in-distribution by construction (`splits.py` carves it from the
+complement of the test condition), so the calibration applies essentially the **same**
+correction everywhere and only the test set differs. Validation says the intervals are too
+wide, because in-distribution they are; the shifted test set needs them wider. Split conformal
+narrows confidently in exactly the wrong direction, and nothing inside the procedure can detect
+that — which is the honest statement of what exchangeability buys and what its absence costs.
+
+#### The pre-registered predictions, scored
+
+**1. `id` — CONFIRMED.** Predicted ≥ 205 of 216 and median PICP in [0.895, 0.905]. Measured
+216 and 0.9001.
+
+**2. `unseen_seastate` — FALSIFIED.** Predicted "improves but stays broken: 20–80 in band,
+median PICP 0.65–0.80". Measured **0 in band, median 0.5118** — outside the predicted range and
+on the wrong side of *no calibration at all*. The direction of the headline claim survives; the
+word "improves" does not. P10-D1's stated falsification criterion was "≥ 150 in band", which
+only guarded against the arm working better than expected and left the failure direction
+unguarded. **That is a defect in the pre-registration, not in the result**, and it is the same
+shape as the asymmetric thresholds P6-D19 recorded: a criterion written while expecting to be
+disappointed in one direction only.
+
+**3. `unseen_heading` — count CONFIRMED, mechanism FALSIFIED.** Predicted "essentially unmoved,
+37 ± 25"; measured 27, inside the band. But the reason given was "`gamma` should come out near 1
+there", and the measured median `gamma` is **0.814**, a 17.6 percent narrowing. The number was
+right and the explanation for it was wrong, which is the P9-D7 shape ("the finding was right and
+its evidence was not") in a new place. The correct explanation is the one above: `gamma` is near
+0.8 in *every* regime because it is always fitted in-distribution.
+
+**4. `unseen_vessel` — outside the predicted interval by one cell.** Predicted 60–140; measured
+**59**. By P10-D1's own stated falsification criterion ("< 45 or ≥ 180") it is not falsified;
+by the predicted interval it is outside. Both readings are recorded rather than the flattering
+one. This regime also needs care in any summary: its in-band **count rises** (41 → 59) while its
+median coverage **falls** (0.691 → 0.631) and 78 percent of cells get worse. The count and the
+distribution move in opposite directions, so quoting the count alone would misdescribe it —
+which is why the table above carries four columns and not one.
+
+**5. The ordering — CONFIRMED.** Predicted `id` ≫ `unseen_vessel` > `unseen_seastate` >
+`unseen_heading` by improvement in in-band count. Measured +114, +18, −5, −10: the same order,
+with three of the four numbers negative.
+
+#### Two things the calibrated rows do not say
+
+**`crossing_rate` is 0.000 on every calibrated row, and that is not a finding.** The wrapper
+sorts the base fan before scaling it, so the quantity `prob_runner` measures on the raw tensor
+is removed rather than the crossing. The uncalibrated rows keep the real number (median 6
+percent, worst cell 96.6 percent for `dlinear_quantile`). Any reader comparing the two columns
+is comparing a measurement with its own absence.
+
+**The `1/(n+1)` finite-sample term is nominal.** Calibration drew 23 267–24 677 windows at a
+fixed stride, but consecutive windows are 0.5 s apart on a ~12 s roll period, so the effective
+sample size is a small fraction of that. The realization-level sensitivity in
+`conformal_calibration.csv` certifies a different and weaker target — 90 percent of
+realizations' *median* windows — and is recorded beside `gamma` precisely so the gap is visible
+rather than assumed away. The binding uncertainty on every coverage number above is the
+realization bootstrap interval already in the table.
+
+**Gate 10: 7 of 7.** Including predicate 1, which verifies by digest that
+`results/e03/probabilistic.csv` and `results/e03/gate5.csv` are untouched — the arm is additive,
+so Gate 5's committed reading stands exactly as it was — and predicate 6, which reads `git log`
+to confirm P10-D1 was committed at 17:20 against the first `conformal.csv` at 22:07.
