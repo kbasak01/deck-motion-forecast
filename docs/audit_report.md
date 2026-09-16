@@ -592,8 +592,18 @@ controls the audit flagged (the untrained control's literal failure, the p99 lat
 **disclosed rather than repaired**, which is the disposition the audit itself recommended.
 
 **What this verdict does not say.** It does not say every committed number was re-derived by a fresh
-`make all` — that is ~160 h and was not run. It does not say the project's deliverables are complete:
-the README states in three places that **no conformal calibration is run anywhere**, so the
-"calibrated prediction intervals" deliverable in `CLAUDE.md` is **not met**, and that is a scope gap
-this audit never had in scope. It says that what the repository publishes is traceable to what the
-repository commits, which is the question this audit asked.
+`make all` — that is ~160 h and was not run. It says that what the repository publishes is traceable
+to what the repository commits, which is the question this audit asked.
+
+**Superseded the same day, and left visible rather than silently rewritten.** As first written, the
+paragraph above continued: *"It does not say the project's deliverables are complete: the README
+states in three places that no conformal calibration is run anywhere, so the 'calibrated prediction
+intervals' deliverable in `CLAUDE.md` is **not met**."* That was true when it was committed at
+**17:18** on 2026-09-15 and false by **21:04**, when the calibration run finished. The deliverable
+is now **met in distribution and not met under shift**: split conformal puts 216 of 216 `id` cells
+inside Gate 5's band at a median PICP of 0.9001, and makes coverage *worse* in 78–87 percent of
+cells in all three shifted regimes, because the calibration split is in-distribution by construction
+in every regime (P10-D2). The correction is
+recorded here rather than applied invisibly, because a stale sentence inside a release-readiness
+verdict is the exact defect P9-D10 recorded two paragraphs of this document ago, and the fifth
+instance of it in this project.

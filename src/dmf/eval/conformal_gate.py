@@ -8,7 +8,9 @@ negative finding** (``CLAUDE.md`` non-negotiable 6).
 
 The seven predicates:
 
-1. the committed uncalibrated tables are untouched;
+1. the committed uncalibrated tables carry no uncommitted modification (it prints their
+   digests but compares them to nothing, so a *committed* rewrite would still pass -- the
+   stronger byte-identity claim against `main` is checked outside the gate);
 2. the calibrated labels are disjoint from the committed ones and the two tables share a
    schema and a window population, so they join rather than collide;
 3. every calibration was fitted on its regime's ``val`` partition with train-fitted

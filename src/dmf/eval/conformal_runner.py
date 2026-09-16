@@ -39,6 +39,7 @@ calibrated rows' ``width_ratio`` incomparable to the uncalibrated ones for no re
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -348,6 +349,14 @@ def run_conformal(
     """
     out_root.mkdir(parents=True, exist_ok=True)
     selected = list(regimes) if regimes is not None else list(cfg.regimes)
+    # Stage status file, in the shape `scripts/run_e04.sh` writes and
+    # `scripts/collect_runtimes.py` parses, so this arm's wall clock is derivable from a log
+    # rather than from file timestamps. P10-D3 records why the first run's figure is prose:
+    # it predates this file.
+    status = Path("artifacts/logs/e05/status_conformal.txt")
+    status.parent.mkdir(parents=True, exist_ok=True)
+    with status.open("a") as handle:
+        handle.write(f"start {datetime.now().astimezone().isoformat()} n={len(selected)}\n")
     by_seed: list[pd.DataFrame] = []
     calibrations: list[pd.DataFrame] = []
     written: dict[str, Path] = {}
@@ -380,4 +389,8 @@ def run_conformal(
             written["degradation"] = write_table(
                 degradation, out_root / CONFORMAL_ARTIFACTS["degradation"]
             )
+        with status.open("a") as handle:
+            handle.write(f"DONE {regime} {datetime.now().astimezone().isoformat()}\n")
+    with status.open("a") as handle:
+        handle.write(f"end {datetime.now().astimezone().isoformat()}\n")
     return written

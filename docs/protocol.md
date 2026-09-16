@@ -5494,6 +5494,12 @@ run (~160 h), and the `CLAUDE.md` deliverable "calibrated prediction intervals" 
 no conformal calibration is run anywhere. A release-readiness verdict that quietly implied a complete
 deliverable list would be the same defect in a new place.
 
+> **Superseded later the same day by P10-D1 through P10-D3.** Phase 10 built the calibration, so the
+> deliverable is now met in distribution and not met under shift. The paragraph above is left as
+> written because it was accurate when recorded and the protocol is a chronological log, but the
+> claim it makes about the deliverable is the one this entry is itself about: a statement that was
+> true when written and stopped being true when the thing it described changed.
+
 **Two line-number citations in §5.6 were stale and are deliberately not repaired in place.** The
 simulation-only caveat was cited at `README.md:322`, `:403`, `:460`; after the Phase 9 restructure it
 sits at `:6-7`, `:172`, `:385`, `:481`, `:543`. The correction is recorded in the re-verification
@@ -5710,6 +5716,24 @@ which is why the table above carries four columns and not one.
 `unseen_heading` by improvement in in-band count. Measured +114, +18, −5, −10: the same order,
 with three of the four numbers negative.
 
+**6. The secondary arm — NOT RUN, and therefore not scored.** P10-D1 committed to a per-level
+additive arm and to reporting both. It was never built. The four scores above are an accounting of
+the arm that ran and **not** of the pre-registration as a whole; P10-D4 records the omission.
+
+**Three of the six statistics in the table above are post-hoc.** Only the in-band count and the
+median PICP were pre-registered. "Cells worse", the mean width change and the Winkler change were
+chosen after seeing the run. All three cut *against* the arm, so nothing is bought by choosing
+them, but the distinction is recorded rather than left for a reader to reconstruct. CRPS and pinball
+agree in sign with Winkler in all four regimes (median `id` −1.2%, then +2.8 / +1.5 / +1.4%), so the
+conclusion does not depend on which proper score is read.
+
+**`unseen_heading` deserves one caveat the table does not carry.** Its median |ΔPICP| is 0.031
+against a median pooled seed spread of 0.034, so cell by cell the shift is within seed noise. The
+direction survives because the contrast is **paired** — the same checkpoints scored on the same
+windows, differing only in post-processing — and the cells-worse fraction is 77.3 / 72.7 / 78.2 per
+cent across the three seeds computed separately. Read as unpaired marginals these rows would not
+support a conclusion, which is the P3-D13 error this project has made twice; read paired, they do.
+
 #### Two things the calibrated rows do not say
 
 **`crossing_rate` is 0.000 on every calibrated row, and that is not a finding.** The wrapper
@@ -5726,7 +5750,74 @@ realizations' *median* windows — and is recorded beside `gamma` precisely so t
 rather than assumed away. The binding uncertainty on every coverage number above is the
 realization bootstrap interval already in the table.
 
-**Gate 10: 7 of 7.** Including predicate 1, which verifies by digest that
-`results/e03/probabilistic.csv` and `results/e03/gate5.csv` are untouched — the arm is additive,
-so Gate 5's committed reading stands exactly as it was — and predicate 6, which reads `git log`
-to confirm P10-D1 was committed at 17:20 against the first `conformal.csv` at 22:07.
+**Gate 10: 7 of 7.** Predicate 1 verifies that the four committed Phase 5 tables carry **no
+uncommitted modification** and prints their digests; it does not compare those digests to a stored
+constant, so it would not catch a *committed* rewrite. The stronger claim — that they are
+byte-identical to `main` — is true and was checked separately with `git diff main...HEAD --
+results/e03/`, which is empty. Stating the weaker thing the predicate does, beside the stronger
+thing that is true, is the distinction P7-D14 and P9-D8 exist to enforce. Predicate 6 reads
+`git log` to confirm P10-D1 was committed at 17:20:08 against the first `conformal.csv` at
+22:07:58, and the run itself spanned 17:34-21:04 (P10-D3).
+
+### P10-D3 — What the calibration arm cost, and why its figure is prose rather than logged. RECORDED 2026-09-15
+
+`make conformal` ran the four regimes end to end in **3 h 29 m 47 s**, from 17:34:58 to 21:04:45 on
+2026-09-15: 18 committed checkpoints per regime (six heads x three seeds), one streaming calibration
+pass over each regime's validation split at a fixed stride, and one scoring pass over each test
+partition. No training. The dominant cost is the scoring pass, not the calibration: calibrating one
+model over ~25 000 windows takes 6-8 s, and the four `evaluate_probabilistic_models` passes over
+434 304-542 880 test windows with 18 models each account for essentially all of it. GPU utilisation
+sat at 4 percent throughout, so the arm is bound by the float64 metric accumulation on the CPU and
+would not go meaningfully faster on a larger card.
+
+**The figure is derived from file timestamps, and file timestamps are not a committed artifact.**
+`artifacts/` is gitignored, so a clone cannot check this number; the README's runtime table therefore
+marks the row `protocol prose` rather than `logged`, which is the same treatment the e02 and e03
+sweeps get for the same reason (P9-D7). Recording it here is what makes "prose" a real source rather
+than a euphemism for an unsourced number.
+
+**Fixed for the next run rather than left as a known gap.** `dmf.eval.conformal_runner.run_conformal`
+now appends start and end lines to `artifacts/logs/e05/status_conformal.txt` in the shape
+`scripts/run_e04.sh` writes, so `scripts/collect_runtimes.py` picks the stage up and the row can
+become `logged`. That does **not** make this run traceable and the README does not claim it does.
+
+**The `make all` total moves from about 163 hours to about 167**, because `all:` now carries
+`conformal` and `gate10` and the table that says what `make all` costs has to list what `make all`
+runs. A stage inside the target and absent from the table is the same defect as a citation pointing
+at a line that moved -- the fifth instance this project has recorded, and the reason this entry
+exists rather than a silent edit.
+
+### P10-D4 — A pre-registered arm was never run, and that is a broken commitment rather than a design choice. RECORDED 2026-09-15
+
+P10-D1 committed to two arms: the multiplicative primary, and "a **secondary arm** [that] applies a
+per-level additive CQR offset to all nine levels… it is the better-specified object for the
+`pinball` and `crps` columns. **Both arms are reported.**"
+
+**Only the primary arm exists.** `results/e05/conformal.csv` carries six labels, all
+`*_conformal`, all multiplicative; there is no additive implementation in `src/`, `scripts/` or
+`tests/`. P10-D2 scored four magnitude predictions and the ordering and **did not mention the
+missing arm at all**, so "two of four predictions falsified" reads as a complete accounting of the
+pre-registration when it is an accounting of only the part that was run.
+
+**Worse, the code cites the pre-registration as if it had argued the other way.**
+`src/dmf/models/conformal.py` heads a paragraph "**Why multiplicative and not additive**
+(`docs/protocol.md` P10-D1)". P10-D1 chose multiplicative for the *primary* arm and committed to
+running the additive one beside it; the docstring turns a dropped commitment into a decision that
+was pre-registered. That is the most misleading sentence Phase 10 produced, and it was written by
+the session that dropped the arm.
+
+**Why it was dropped, stated plainly: it was not a decision, it was an omission.** The runner was
+built for one arm, the run took 3.5 h, and the secondary arm was never implemented or scheduled.
+No measurement argued against it. The honest consequence is that `conformal.csv` ships
+`crps_mean` and `pinball_mean` columns for an arm P10-D1 itself called the wrong object for them —
+those columns are still correct for what they measure, the *fan* the primary arm emits, but the
+pre-registration promised a better-specified comparison for them and did not deliver it.
+
+**Not fixed, and not quietly dropped either.** Building the additive arm is a second scoring pass
+over four regimes, roughly another 3.5 h, and the decision recorded with the user was to ship. It
+is recorded here, in P10-D2's summary, and in the README and `docs/findings.md`, so that the
+pre-registration and what was actually run can be compared by a reader rather than only by the
+session that ran it. This is the fourth time this project has found a declared thing that never
+ran — P6-D15 (a renderer section with no caller), P8-D13 (a declared control that existed in the
+config and was never run), P9-D3 (two figures with no generator) — and the first time the
+declaration was one this session made itself.

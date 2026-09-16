@@ -37,9 +37,11 @@ the window-level ``gamma`` is what the scored rows use, because it is the defini
 realizations' *median* windows rather than 90 percent of windows. That is deliberately a
 different and weaker target -- see :func:`_realization_level_gamma` -- and the gap between the
 two says how much of the scale is set by the within-realization tail rather than by variation
-across records. Measured on ``id``/``dlinear_quantile`` the medians are 1.00 against 0.65, so
-the gap is large and the calibration table carries both. The binding uncertainty on any
-reported coverage remains the realization bootstrap interval
+across records. Measured on the committed run at ``id``/``dlinear_quantile`` the medians are
+**0.971** against **0.635**, and across all four regimes ``gamma`` runs 0.77-0.82 against a
+realization-level 0.43-0.45 -- roughly half. The gap is large and the calibration table carries
+both columns so a reader can see it rather than take this sentence for it. The binding
+uncertainty on any reported coverage remains the realization bootstrap interval
 :mod:`dmf.eval.prob_runner` already computes.
 
 **What the calibration split contributes, and what it must not.** Only the conformity scores.

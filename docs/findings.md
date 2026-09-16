@@ -376,7 +376,10 @@ in the 1-5 s band and nowhere else.
 - **Nothing here is calibrated.** `heads.py` provides the seam a `ConformalWrapper` attaches to and
   a test proves the seam composes, but no conformal calibration is run -- that is Project 6. These
   are **uncalibrated heads**; the project deliverable "calibrated prediction intervals" is not yet
-  met.
+  met. *(Phase 5's reading, left as written. Phase 10 built the wrapper on that seam and closed the
+  deliverable in distribution -- and found it makes coverage worse under every shift. See
+  [Phase 10](#phase-10--split-conformal-calibration) below; the rows in this section are the
+  uncalibrated ones throughout and were never rewritten.)*
 - **The coverage numbers carry less certification than the skill numbers.** The shuffle control
   refits AR(20), a *point* model, so it certifies the point pipeline the heads are built on. No
   shuffled-target head is fitted anywhere, and the untrained control runs on a quantile model's
@@ -709,9 +712,11 @@ rather than fixed.
 | `unseen_heading` | 37 → **27**/216 | 0.4940 → 0.4613 | 77.8% | −17.6% | +5.2% |
 | `unseen_vessel` | 41 → **59**/216 | 0.6910 → 0.6308 | 78.2% | −16.9% | +4.1% |
 
-**In distribution it is exact and it is free.** Every one of 216 cells lands in band, the six
-heads sit within 0.0025 of nominal at the gate cell, and the intervals come out 17.5% *sharper* —
-the uncalibrated heads were over-covering and paying for it in width.
+**In distribution it is exact, and that is a correctness check rather than a finding.** Every one
+of 216 cells lands in band and the six heads sit within 0.0025 of nominal at the gate cell — the CQR
+guarantee arriving on schedule, which Gate 10 predicate 4 reads as a check on the implementation.
+The part that was not guaranteed is that the intervals come out 17.5% *sharper*: the uncalibrated
+heads were over-covering and paying for it in width.
 
 **Under shift it is worse than doing nothing.** Coverage moves further from nominal in 78–87% of
 cells, the proper score worsens in all three shifted regimes, and `unseen_seastate` goes to zero
@@ -724,7 +729,14 @@ the same correction everywhere; only the test set differs. Validation says "too 
 right in distribution; the shifted test set needed "wider". The procedure narrows confidently in
 the wrong direction and cannot detect that it has done so.
 
-**Two of four pre-registered predictions were falsified.** `unseen_seastate` was predicted to
+**A second arm was promised and never built.** P10-D1 committed to a per-level *additive* arm
+beside the multiplicative one, and said "both arms are reported". Only the multiplicative arm
+exists. That is an omission rather than a decision — no measurement argued against it — and it is
+recorded in P10-D4 so that "two of four predictions falsified" is not read as a complete accounting
+of the pre-registration.
+
+**Two of four pre-registered predictions were falsified, and a third missed its interval by one
+cell.** `unseen_seastate` was predicted to
 improve to 20–80 cells in band and instead went to 0 — the falsification criterion written in
 P10-D1 only guarded the direction where the arm worked *better* than expected, which is a defect
 in the pre-registration. `unseen_heading`'s count was predicted correctly and its stated

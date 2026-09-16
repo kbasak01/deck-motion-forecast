@@ -19,7 +19,11 @@ deviations from the mean by ``gamma`` is exactly ``sigma -> gamma * sigma``. One
 two head kinds, and the Gaussian rows stay Gaussian rather than being silently materialised
 into a fan.
 
-**Why multiplicative and not additive** (``docs/protocol.md`` P10-D1). The scored quantity is
+**Why this scaling is multiplicative.** ``docs/protocol.md`` P10-D1 pre-registered this as the
+*primary* arm and committed to a per-level **additive** secondary arm beside it; that secondary arm
+was never built, which P10-D4 records as a broken commitment rather than a decision. The reasoning
+below is why the primary arm is multiplicative, not an argument that the additive one was rejected
+on evidence. The scored quantity is
 conditional sharpness: at ``id``/pitch/10 s the committed ``width_ratio_mean`` runs from
 0.737 (``dlinear_quantile``) to 0.284 (``lstm_quantile``), a 2.6x spread, and P6-D6 built the
 floor contrast specifically to measure it. An additive offset widens the sharpest window and
@@ -48,10 +52,11 @@ per cell and the sharpness ordering across heads is untouched.
 fan before scaling -- otherwise ``gamma`` multiplies deviations from something that is not
 the median -- so a calibrated row's ``crossing_rate`` is exactly 0.0 **by construction**.
 That is the removal of a measurement, not the removal of crossing. The uncalibrated row
-keeps the real number (median 6%, worst cell 96.6% for ``dlinear_quantile``), and the two
-must be read together.
+keeps the real number: 0.0 median over all uncalibrated rows, 1.5% over the quantile heads
+alone, 6.3% over ``dlinear_quantile``'s own rows, and a worst cell of 96.6%
+(``dlinear_quantile``/``unseen_seastate``/heave at 1 s). The two columns must be read together.
 
-**Not registered, deliberately** (``docs/protocol.md`` P10-D2). ``dmf.train.registry.build_model``
+**Not registered, deliberately.** ``dmf.train.registry.build_model``
 constructs a model from ``(cfg, geometry, n_in, n_out)`` and ``cfg.params`` alone; there is no
 way to hand it a *fitted base model* at a particular regime and seed. A registry entry that
 ``build_model`` cannot build would be worse than no entry, so this class is constructed by
